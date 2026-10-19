@@ -1,0 +1,18 @@
+[package]
+name = "coyote"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "bare-metal language for sovereign computation — source to silicon"
+
+[lib]
+name = "coyote"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coyote"
+path = "src/main.rs"
+
+[dependencies]
+mil_infer = { git = "https://github.com/savageAZfck/mil_spec" }
+half = "2"
