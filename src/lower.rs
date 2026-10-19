@@ -359,6 +359,7 @@ impl Lo {
                     }
                 }
             }
+            TExpr::Unary(UnOp::Not, _) => diag("`!` is host-stratum", 0, 0),
             TExpr::Bin(op, a, b) => self.binop(*op, a, b, &e.ty),
             TExpr::Transpose(_a) => {
                 // standalone .T — only survives into v1 mil inside `x @ w.T`,
@@ -741,6 +742,9 @@ impl Lo {
                 let v = self.emit_op(&adjty, format!("mul(x = {adj}, y = {neg})"), false);
                 let vn = self.named(v, &adjty)?.0;
                 self.back(a, &vn)?;
+            }
+            TExpr::Unary(UnOp::Not, _) => {
+                return diag("back: `!` is host-stratum", 0, 0)
             }
             TExpr::Bin(op, a, b) => match op {
                 BinOp::Add => {

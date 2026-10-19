@@ -181,3 +181,70 @@ coyote run   f.cy -o dir     # + execute on ANE + diff vs CPU reference
 - **M6** `cap` flow-checking (transitive net/mem/sense capabilities),
   `det`/`stoch` declared determinism, signed artifacts, `migrate`, `die`,
   `witness`, `lineage` — the organism stratum
+
+## the organism stratum (implemented)
+
+two strata share one type system. `fn` compiles to an ANE program;
+`host fn` compiles to bytecode for the organism VM. every concrete `fn`
+becomes its own program artifact (`-o dir/<name>/`).
+
+```
+decl       += 'table' ident ':' type ('@' stringlit)?
+            | 'struct' ident '{' (ident ':' hty)* '}'
+            | 'host' 'fn' ident '(' (ident ':' hty)* ')' ('->' hty)? block
+hty        := 'i64' | 'f64' | 'bool' | 'str' | 'token' | 'unit'
+            | dtype '[' int (',' int)* ']'          # literal dims only
+            | '[' hty ']' | ident                    # struct name
+            | 'ane' '(' (hty)* ')' '->' hty          # program value type
+hstmt      := 'let'|'var' ident (':' hty)? '=' expr ';'
+            | lval assign_op expr ';'
+            | 'if' expr block ('else' (block | 'if' ...))?
+            | 'while' expr block
+            | 'for' ident 'in' expr '..' expr block
+            | 'break' ';' | 'continue' ';' | 'return' expr? ';'
+expr       += boollit | stringlit | '[' expr* ']' | ident '{' field '=' expr* '}'
+            | expr '.' ident                         # struct/token field
+            | expr '&&' expr | expr '||' expr | '!' expr | expr '%' expr
+```
+
+semantics:
+
+- **programs are values.** an ane fn's name bound in host scope has type
+  `ane(argtys) -> retty`. calling it — by name or through a variable —
+  marshals tensors into surfaces, runs GraphRuntime, reads the output.
+  arg/ret shapes and dtypes must match the signature exactly.
+- **tables are host data.** `table emb: f16[V, D] @ "file::tensor"` loads
+  in declared order, is indexable (`emb[tok]` → row `f16[D]`), and is
+  unnameable inside `fn` — a 300MB lookup table can never become a
+  weight blob. rank-2 tensor indexing in host code is a row gather;
+  rank-1 indexing yields `f64`.
+- **state fields are readable** from host code as `kv.k0lo` — the on-chip
+  mirror, written back after every program call.
+- **sealed params are unnameable in host code.** the boundary is total:
+  not a lint, a missing name.
+- **`token`** carries `{id, epoch}`. `id` binds to the build manifest
+  hash; `epoch` counts witness entries. `.id`/`.epoch` are the only
+  fields.
+- **`witness(tag, val)`** appends sha256-chained `{seq, tag, val, hash}`
+  entries — the organism's ledger, written to `<out>/witness.jsonl`.
+- **`migrate(path)`** serializes stack, frames, tensors, globals, rng and
+  the witness chain. `coyote run f.cy --resume snap.bin` verifies the
+  snapshot's lineage hash matches this organism's manifest, restores the
+  chain, and continues mid-execution — the resumed body's first entry is
+  `resume`, chained to the frozen tip.
+- **`die()`** witnesses and halts.
+
+natives: `print str len push argmax i64 f64 onehot causal rope_cos
+rope_sin zeros self_token witness die migrate rand`.
+`rope_cos/sin(pos, d)` is the Qwen3 rotate-half table `θ_i = 1e6^(-2i/2d)`;
+`causal(upto, n)` is `0` below `upto`, `-1e4` above; `rand()` is
+xorshift64* seeded by lineage — deterministic per organism.
+
+the VM is the point: `die`, `migrate`, `witness` and respawn need
+inspectable, serializable execution state — an organism that can freeze
+itself mid-thought cannot be native code.
+
+- **M6 (partial, landed)**: `host fn` stratum, program values, `token`,
+  `witness` hash chain, `migrate`/`--resume`, `die`, `table`, `struct`,
+  full host control flow. remaining: `cap` transitive flow-checking,
+  `det`/`stoch`, signed artifacts, `lineage` across machines.

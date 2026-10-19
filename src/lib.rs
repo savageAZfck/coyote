@@ -6,10 +6,12 @@
 
 pub mod ast;
 pub mod eval;
+pub mod hostck;
 pub mod lexer;
 pub mod lower;
 pub mod parser;
 pub mod typeck;
+pub mod vm;
 pub mod weights;
 
 #[derive(Debug, Clone)]

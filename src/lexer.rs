@@ -11,13 +11,21 @@ pub enum Tok {
 
     // keywords
     Fn,
+    Host,
+    Struct,
     Let,
     Var,
     If,
     Else,
+    While,
     For,
     In,
+    Break,
+    Continue,
+    True,
+    False,
     Param,
+    Table,
     State,
     Io,
     Cap,
@@ -51,6 +59,10 @@ pub enum Tok {
     Minus,
     Star,
     Slash,
+    Percent,
+    And,
+    Or,
+    Not,
     Eq,
     PlusEq,
     MinusEq,
@@ -77,13 +89,21 @@ pub struct Lexed {
 fn kw(s: &str) -> Option<Tok> {
     Some(match s {
         "fn" => Tok::Fn,
+        "host" => Tok::Host,
+        "struct" => Tok::Struct,
         "let" => Tok::Let,
         "var" => Tok::Var,
         "if" => Tok::If,
         "else" => Tok::Else,
+        "while" => Tok::While,
         "for" => Tok::For,
         "in" => Tok::In,
+        "break" => Tok::Break,
+        "continue" => Tok::Continue,
+        "true" => Tok::True,
+        "false" => Tok::False,
         "param" => Tok::Param,
+        "table" => Tok::Table,
         "state" => Tok::State,
         "io" => Tok::Io,
         "cap" => Tok::Cap,
@@ -201,6 +221,18 @@ pub fn lex(src: &str) -> CResult<Vec<Lexed>> {
                     bump(&mut it, &mut line, &mut col);
                     break;
                 }
+                if c2 == '\\' {
+                    bump(&mut it, &mut line, &mut col);
+                    match it.peek() {
+                        Some('n') => s.push('\n'),
+                        Some('t') => s.push('\t'),
+                        Some('"') => s.push('"'),
+                        Some('\\') => s.push('\\'),
+                        _ => s.push('\\'),
+                    }
+                    bump(&mut it, &mut line, &mut col);
+                    continue;
+                }
                 s.push(c2);
                 bump(&mut it, &mut line, &mut col);
             }
@@ -225,11 +257,14 @@ pub fn lex(src: &str) -> CResult<Vec<Lexed>> {
                           else { Tok::Minus }),
             '*' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::StarEq } else { Tok::Star }),
             '/' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::SlashEq } else { Tok::Slash }),
+            '%' => pushat!(Tok::Percent),
+            '&' => pushat!(if it.peek() == Some(&'&') { bump(&mut it, &mut line, &mut col); Tok::And } else { return diag("unexpected '&'", l, cl) }),
+            '|' => pushat!(if it.peek() == Some(&'|') { bump(&mut it, &mut line, &mut col); Tok::Or } else { return diag("unexpected '|'", l, cl) }),
             '.' => pushat!(if it.peek() == Some(&'.') { bump(&mut it, &mut line, &mut col); Tok::DotDot }
                           else if it.peek() == Some(&'T') { bump(&mut it, &mut line, &mut col); Tok::T }
                           else { Tok::Dot }),
             '=' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::EqEq } else { Tok::Eq }),
-            '!' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::Ne } else { return diag("unexpected '!'", l, cl) }),
+            '!' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::Ne } else { Tok::Not }),
             '<' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::Le } else { Tok::Lt }),
             '>' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::Ge } else { Tok::Gt }),
             _ => return diag(format!("unexpected char {c:?}"), l, cl),

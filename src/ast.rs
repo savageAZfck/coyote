@@ -60,6 +60,27 @@ impl Ty {
     }
 }
 
+/// Host-stratum types — the organism layer. Tensor types ride through
+/// as opaque handles; everything else is CPU data.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HTy {
+    I64,
+    F64,
+    Bool,
+    Str,
+    Unit,
+    /// `token` — witnessed organism identity (id + epoch).
+    Token,
+    /// `f16[N, M]` — a handle into the tensor store.
+    Tensor(Ty),
+    /// `[T]` — a growable vec.
+    Vec(Box<HTy>),
+    /// a declared `struct` type.
+    Struct(String),
+    /// `ane(t1, t2) -> r` — a first-class compiled program value.
+    AneFn(Vec<HTy>, Box<HTy>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qual {
     Frozen,
@@ -103,7 +124,20 @@ pub enum Decl {
         name: Sp<String>,
         fields: Vec<(Sp<String>, Sp<Ty>)>,
     },
+    /// `table embed: f16[V, N] @ "file::tensor"` — a host-stratum data
+    /// source: readable, indexable, never lowered to silicon.
+    Table {
+        name: Sp<String>,
+        ty: Sp<Ty>,
+        src: Option<Sp<String>>,
+    },
+    /// `struct Point { x: f64, y: f64 }` — host-stratum data.
+    Struct {
+        name: Sp<String>,
+        fields: Vec<(Sp<String>, Sp<HTy>)>,
+    },
     Fn(Sp<Fn>),
+    HostFn(Sp<HFn>),
 }
 
 #[derive(Debug, Clone)]
@@ -116,11 +150,24 @@ pub struct Fn {
     pub body: Vec<Sp<Stmt>>,
 }
 
+/// A host-stratum function — bytecode-compiled, runs on the CPU,
+/// calls ANE programs as first-class values.
+#[derive(Debug, Clone)]
+pub struct HFn {
+    pub name: String,
+    pub args: Vec<(Sp<String>, Sp<HTy>)>,
+    pub ret: Option<Sp<HTy>>,
+    pub body: Vec<Sp<Stmt>>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let {
         name: Sp<String>,
+        /// host-stratum annotation (None on the tensor stratum)
+        hty: Option<Sp<HTy>>,
         ty: Option<Sp<Ty>>,
+        mutable: bool,
         expr: Sp<Expr>,
     },
     Assign {
@@ -134,6 +181,29 @@ pub enum Stmt {
         op: AssignOp,
         expr: Sp<Expr>,
     },
+    /// host stratum: `if c { } else { }`
+    If {
+        cond: Sp<Expr>,
+        then: Vec<Sp<Stmt>>,
+        els: Vec<Sp<Stmt>>,
+    },
+    /// host stratum: `while c { }`
+    While {
+        cond: Sp<Expr>,
+        body: Vec<Sp<Stmt>>,
+    },
+    /// host stratum: `for i in lo..hi { }`
+    For {
+        var: Sp<String>,
+        lo: Sp<Expr>,
+        hi: Sp<Expr>,
+        body: Vec<Sp<Stmt>>,
+    },
+    Break,
+    Continue,
+    /// `return e;` — real control flow on the host stratum. On the
+    /// tensor stratum it desugars to the `__ret` marker call.
+    Return(Option<Sp<Expr>>),
     Expr(Sp<Expr>),
 }
 
@@ -150,6 +220,12 @@ pub enum AssignOp {
 pub enum Expr {
     Lit(f64),
     Int(i64),
+    Bool(bool),
+    Str(String),
+    /// `[a, b, c]` — vec literal (host stratum).
+    VecLit(Vec<Sp<Expr>>),
+    /// `Name { f: e, ... }` — struct literal (host stratum).
+    StructLit(Sp<String>, Vec<(Sp<String>, Sp<Expr>)>),
     Ident(String),
     Unary(UnOp, Box<Sp<Expr>>),
     Bin(BinOp, Box<Sp<Expr>>, Box<Sp<Expr>>),
@@ -172,6 +248,7 @@ pub enum Index {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UnOp {
     Neg,
+    Not,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -180,6 +257,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Mod,
     MatMul,
     Eq,
     Ne,
@@ -187,6 +265,8 @@ pub enum BinOp {
     Gt,
     Le,
     Ge,
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone)]

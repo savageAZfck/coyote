@@ -89,6 +89,40 @@ impl SafeTensors {
         self.index.get(name).map(|(_, _, s, _)| s.as_slice())
     }
 
+    /// decode a single row of a rank-2 tensor — an embedding gather
+    /// without touching the rest of the file.
+    pub fn f32s_slice(&self, name: &str, row: usize, width: usize) -> Result<Vec<f32>, String> {
+        let (a, b, shape, dt) = self
+            .index
+            .get(name)
+            .ok_or_else(|| format!("safetensors: missing {name}"))?;
+        let cols = shape.get(1).copied().unwrap_or(1);
+        if shape.len() != 2 || width != cols || row >= shape[0] {
+            return Err(format!("safetensors {name}: row {row}/{width} of {shape:?}"));
+        }
+        let esz = match dt.as_str() {
+            "BF16" | "F16" => 2,
+            "F32" => 4,
+            other => return Err(format!("safetensors {name}: dtype {other} unsupported")),
+        };
+        let off = a + row * cols * esz;
+        let raw = &self.buf[off..(off + cols * esz).min(*b)];
+        Ok(match dt.as_str() {
+            "BF16" => raw
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect(),
+            "F16" => raw
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            _ => raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        })
+    }
+
     /// decode the tensor to f32 (BF16/F16/F32 supported)
     pub fn f32s(&self, name: &str) -> Result<Vec<f32>, String> {
         let (a, b, _, dt) = self

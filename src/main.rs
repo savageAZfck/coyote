@@ -10,7 +10,8 @@
 use coyote::eval::Evaluator;
 use coyote::lower::{init_weight_pub, lower, sha256_hex};
 use coyote::parser::parse;
-use coyote::typeck::check;
+use coyote::typeck::{check_all, TProgram};
+use coyote::vm::{AneProg, Vm};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,12 @@ fn steps_arg(args: &[String]) -> Option<usize> {
     args.windows(2)
         .find(|w| w[0] == "--steps")
         .and_then(|w| w[1].parse().ok())
+}
+
+fn resume_arg(args: &[String]) -> Option<PathBuf> {
+    args.windows(2)
+        .find(|w| w[0] == "--resume")
+        .map(|w| PathBuf::from(&w[1]))
 }
 
 fn emit(src: &str, p: &coyote::typeck::TProgram, dir: &Path) -> Result<coyote::lower::MilOut, String> {
@@ -95,22 +102,94 @@ fn main() {
     let r = (|| -> Result<(), String> {
         let src = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
         let ast = parse(&src).map_err(|d| format!("{d}"))?;
-        let prog = check(&ast).map_err(|d| format!("{d}"))?;
+        let checked = check_all(&ast).map_err(|d| format!("{d}"))?;
+        // ---- organism mode: `host fn main` drives the programs ----
+        if checked.host.is_some() && cmd != "check" {
+            let host = checked.host.as_ref().unwrap();
+            if !checked.organism {
+                return Err("host fns declared but no `host fn main` entry".into());
+            }
+            let mut progs = Vec::new();
+            for (name, tp) in &checked.ane {
+                let dir2 = dir.join(name);
+                let out = emit(&src, tp, &dir2)?;
+                let plan = mil_infer::graph::compile_graph(
+                    dir2.join("net.mil").to_str().unwrap(),
+                    dir2.to_str().unwrap(),
+                )
+                .map_err(|e| format!("compile_graph ({name}): {e}"))?;
+                println!("✓ {name} — {} program nodes", plan.nodes.len());
+                let rt = mil_infer::graph::GraphRuntime::load(plan)
+                    .map_err(|e| format!("runtime load ({name}): {e}"))?;
+                progs.push(AneProg {
+                    name: name.clone(),
+                    rt,
+                    ins: out.inputs,
+                    trainable: out
+                        .trainable
+                        .into_iter()
+                        .map(|(p, port, ty, _)| (p, port, ty))
+                        .collect(),
+                    states: out.states,
+                    param_outs: out.param_outs,
+                    state_outs: out.state_outs,
+                    output: out.output,
+                });
+            }
+            if cmd == "build" {
+                return Ok(());
+            }
+            let src_sha = sha256_hex(src.as_bytes());
+            let mut vm = Vm::new(host, progs, &src_sha).map_err(|e| e)?;
+            let ret = if let Some(snap) = resume_arg(&args[3..]) {
+                vm.resume(snap.to_str().unwrap_or(""))?;
+                vm.run_resumed()?
+            } else {
+                vm.run_main()?
+            };
+            // the witness log is part of the artifact — hash-chained,
+            // written next to the binaries like her ledger.
+            let mut wl = String::new();
+            for w in vm.witness_log() {
+                wl.push_str(&format!(
+                    "{{\"seq\":{},\"tag\":\"{}\",\"val\":\"{}\",\"hash\":\"{}\"}}\n",
+                    w.seq, w.tag, w.val, w.hash
+                ));
+            }
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            std::fs::write(dir.join("witness.jsonl"), &wl).map_err(|e| e.to_string())?;
+            println!("✓ organism returned {}", vm.stringify(&ret));
+            if !vm.witness_log().is_empty() {
+                println!("  witness: {} entries → {}", vm.witness_log().len(), dir.join("witness.jsonl").display());
+            }
+            return Ok(());
+        }
         match cmd.as_str() {
             "check" => {
                 println!("✓ {} — checked", file.display());
-                println!("  io:      {} ports", prog.ios.len());
-                println!("  params:  {}", prog.params.len());
-                println!("  ops:     {} stmts", prog.body.len());
-                if !prog.invariants.is_empty() {
-                    println!("  invariants: {}", prog.invariants.join(", "));
+                for (name, p) in &checked.ane {
+                    println!("  program {name}: {} io, {} params, {} stmts", p.ios.len(), p.params.len(), p.body.len());
                 }
-                if !prog.caps.is_empty() {
-                    println!("  caps:       {}", prog.caps.join(", "));
+                if let Some(h) = &checked.host {
+                    println!("  host:     {} fns, {} globals, {} structs", h.fns.len(), h.globals.len(), h.structs.len());
+                }
+                if let Some((_, p)) = checked.ane.first() {
+                    let p: &TProgram = p;
+                    if !p.invariants.is_empty() {
+                        println!("  invariants: {}", p.invariants.join(", "));
+                    }
+                    if !p.caps.is_empty() {
+                        println!("  caps:       {}", p.caps.join(", "));
+                    }
                 }
                 Ok(())
             }
             "build" | "run" => {
+                let prog = &checked
+                    .ane
+                    .first()
+                    .ok_or("no ane programs and no host entry — nothing to run")?
+                    .1;
                 let out = emit(&src, &prog, &dir)?;
                 println!("✓ lowered → {}", dir.join("net.mil").display());
                 println!("  mil sha256: {}", &out.mil_sha[..16]);
@@ -203,6 +282,26 @@ fn main() {
                     (n == "mask").then(|| v.len())
                 });
                 let training = !out.trainable.is_empty() || !out.states.is_empty();
+                // decode mode: an io out named `logits` means the loop
+                // argmaxes, gathers the next token's embedding row from
+                // the checkpoint (host-side table read), and feeds it
+                // back into `x`. seed: BOS.
+                let decode = prog
+                    .ios
+                    .iter()
+                    .any(|(n, d, _)| n == "logits" && *d == coyote::ast::IoDir::Out);
+                let mut embed_st = None;
+                let mut next_tok: Option<usize> = None;
+                if decode {
+                    let st_path = prog
+                        .params
+                        .iter()
+                        .filter_map(|p| p.src.as_deref())
+                        .find_map(|s| s.split_once("::").map(|(p, _)| p.to_string()))
+                        .ok_or("decode: no safetensors param source for embeddings")?;
+                    embed_st = Some(coyote::weights::SafeTensors::load(&st_path)?);
+                    next_tok = Some(151643); // BOS
+                }
                 let nsteps = steps.unwrap_or(if training { 20 } else { 1 });
                 let (oname, oty) = &out.output;
                 let n = oty.numel() as usize;
@@ -212,6 +311,29 @@ fn main() {
                 let mut cpu_w = ane_w.clone();
                 let mut cpu_s = ane_s.clone();
                 for step in 0..nsteps {
+                    // token feedback: embed the pending token's row
+                    // into x (host gather — the same split Apple's own
+                    // path uses for sampling).
+                    if let (Some(st), Some(tok)) = (&embed_st, next_tok) {
+                        let row = st
+                            .f32s_slice("model.embed_tokens.weight", tok, 1024)
+                            .map_err(|e| format!("embed {tok}: {e}"))?;
+                        let rowc = row.clone();
+                        inputs.insert("x".into(), row);
+                        rt.write_ext("x", move |b, desc| {
+                            for (i, v) in rowc.iter().enumerate() {
+                                let o = if desc.w as usize >= rowc.len() && desc.w > 1 {
+                                    desc.offset(0, 0, 0, 0, i as u64)
+                                } else {
+                                    desc.offset(0, 0, i as u64, 0, 0)
+                                };
+                                if o + 2 <= b.len() {
+                                    b[o..o + 2]
+                                        .copy_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+                                }
+                            }
+                        });
+                    }
                     // io conventions: one-hot `pos`, causal `mask`
                     if let Some(t) = pos_io {
                         let mut one = vec![0f32; t];
@@ -276,6 +398,16 @@ fn main() {
                     let desc = rt.out_desc(idx);
                     let raw = rt.output(idx).to_vec();
                     let ane = read_surface(&raw, &desc, n, 1);
+                    if decode {
+                        let (tok, logit) = ane
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                            .map(|(i, v)| (i, *v))
+                            .unwrap_or((0, 0.0));
+                        println!("  step {step:>3}  tok {tok}  (logit {logit:.3})");
+                        next_tok = Some(tok);
+                    }
                     // ---- CPU reference ----
                     let mut ev = Evaluator::new(&prog);
                     if training {

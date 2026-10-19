@@ -78,10 +78,101 @@ impl P {
         Ok(sp(Ty { dt, dims }, l, c))
     }
 
+    /// host-stratum type: `i64` `f64` `bool` `str` `token` `unit`,
+    /// `[T]` vec, `Name` struct, `f16[N]` tensor handle,
+    /// `ane(t, t) -> r` program value.
+    fn hty(&mut self) -> CResult<Sp<HTy>> {
+        let (l, c) = self.at();
+        let t = match self.bump() {
+            Tok::LBracket => {
+                let inner = self.hty()?;
+                self.expect(&Tok::RBracket)?;
+                HTy::Vec(Box::new(inner.v))
+            }
+            Tok::Ident(s) => match s.as_str() {
+                "i64" => HTy::I64,
+                "f64" => HTy::F64,
+                "bool" => HTy::Bool,
+                "str" => HTy::Str,
+                "token" => HTy::Token,
+                "unit" => HTy::Unit,
+                "ane" => {
+                    self.expect(&Tok::LParen)?;
+                    let mut args = Vec::new();
+                    if self.peek() != &Tok::RParen {
+                        loop {
+                            args.push(self.hty()?.v);
+                            if self.eat(&Tok::Comma) {
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Arrow)?;
+                    let ret = self.hty()?;
+                    HTy::AneFn(args, Box::new(ret.v))
+                }
+                _ => {
+                    if let Some(dt) = DType::parse(&s) {
+                        let mut dims = Vec::new();
+                        if self.eat(&Tok::LBracket) {
+                            loop {
+                                let (dl, dc) = self.at();
+                                let d = match self.bump() {
+                                    Tok::Int(n) => Dim::Lit(n),
+                                    Tok::Ident(dn) => Dim::Name(dn),
+                                    t => return diag(format!("expected dim, found {t:?}"), dl, dc),
+                                };
+                                dims.push(d);
+                                if self.eat(&Tok::Comma) {
+                                    continue;
+                                }
+                                break;
+                            }
+                            self.expect(&Tok::RBracket)?;
+                        }
+                        HTy::Tensor(Ty { dt, dims })
+                    } else {
+                        HTy::Struct(s)
+                    }
+                }
+            },
+            t => return diag(format!("expected host type, found {t:?}"), l, c),
+        };
+        Ok(sp(t, l, c))
+    }
+
     // ---- expressions (precedence climbing) ----
 
     fn expr(&mut self) -> CResult<Sp<Expr>> {
-        self.cmp()
+        self.or()
+    }
+    fn or(&mut self) -> CResult<Sp<Expr>> {
+        let mut a = self.and()?;
+        loop {
+            let (l, c) = self.at();
+            if self.eat(&Tok::Or) {
+                let b = self.and()?;
+                a = sp(Expr::Bin(BinOp::Or, Box::new(a), Box::new(b)), l, c);
+            } else {
+                break;
+            }
+        }
+        Ok(a)
+    }
+    fn and(&mut self) -> CResult<Sp<Expr>> {
+        let mut a = self.cmp()?;
+        loop {
+            let (l, c) = self.at();
+            if self.eat(&Tok::And) {
+                let b = self.cmp()?;
+                a = sp(Expr::Bin(BinOp::And, Box::new(a), Box::new(b)), l, c);
+            } else {
+                break;
+            }
+        }
+        Ok(a)
     }
     fn cmp(&mut self) -> CResult<Sp<Expr>> {
         let mut a = self.add()?;
@@ -124,6 +215,7 @@ impl P {
             let op = match self.peek() {
                 Tok::Star => BinOp::Mul,
                 Tok::Slash => BinOp::Div,
+                Tok::Percent => BinOp::Mod,
                 Tok::At => BinOp::MatMul,
                 _ => break,
             };
@@ -138,6 +230,10 @@ impl P {
         if self.eat(&Tok::Minus) {
             let e = self.unary()?;
             return Ok(sp(Expr::Unary(UnOp::Neg, Box::new(e)), l, c));
+        }
+        if self.eat(&Tok::Not) {
+            let e = self.unary()?;
+            return Ok(sp(Expr::Unary(UnOp::Not, Box::new(e)), l, c));
         }
         self.postfix()
     }
@@ -198,7 +294,38 @@ impl P {
         match self.bump() {
             Tok::Float(f) => Ok(sp(Expr::Lit(f), l, c)),
             Tok::Int(n) => Ok(sp(Expr::Int(n), l, c)),
+            Tok::True => Ok(sp(Expr::Bool(true), l, c)),
+            Tok::False => Ok(sp(Expr::Bool(false), l, c)),
+            Tok::Str(s) => Ok(sp(Expr::Str(s), l, c)),
+            Tok::LBracket => {
+                let mut items = Vec::new();
+                if self.peek() != &Tok::RBracket {
+                    loop {
+                        items.push(self.expr()?);
+                        if self.eat(&Tok::Comma) {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(&Tok::RBracket)?;
+                Ok(sp(Expr::VecLit(items), l, c))
+            }
             Tok::Ident(s) => {
+                if self.peek() == &Tok::LBrace {
+                    // `Name { f: e, ... }` — a struct literal
+                    self.bump();
+                    let mut fields = Vec::new();
+                    while self.peek() != &Tok::RBrace {
+                        let fname = self.ident()?;
+                        self.expect(&Tok::Colon)?;
+                        let fe = self.expr()?;
+                        fields.push((fname, fe));
+                        self.eat(&Tok::Comma);
+                    }
+                    self.expect(&Tok::RBrace)?;
+                    return Ok(sp(Expr::StructLit(sp(s, l, c), fields), l, c));
+                }
                 if self.peek() == &Tok::LParen {
                     self.bump();
                     let mut pos = Vec::new();
@@ -242,20 +369,91 @@ impl P {
 
     // ---- statements ----
 
-    fn stmt(&mut self) -> CResult<Sp<Stmt>> {
+    /// `{ stmt* }` — a block in the current stratum.
+    fn block(&mut self, host: bool) -> CResult<Vec<Sp<Stmt>>> {
+        self.expect(&Tok::LBrace)?;
+        let mut body = Vec::new();
+        while self.peek() != &Tok::RBrace && self.peek() != &Tok::Eof {
+            body.push(self.stmt(host)?);
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(body)
+    }
+
+    fn stmt(&mut self, host: bool) -> CResult<Sp<Stmt>> {
         let (l, c) = self.at();
         match self.peek().clone() {
+            Tok::If | Tok::While | Tok::For | Tok::Break | Tok::Continue if !host => {
+                diag(
+                    "control flow is host-stratum — wrap it in `host fn`",
+                    l,
+                    c,
+                )
+            }
+            Tok::If => {
+                self.bump();
+                let cond = self.expr()?;
+                let then = self.block(host)?;
+                let els = if self.eat(&Tok::Else) {
+                    if self.peek() == &Tok::If {
+                        let s = self.stmt(host)?;
+                        vec![s]
+                    } else {
+                        self.block(host)?
+                    }
+                } else {
+                    Vec::new()
+                };
+                Ok(sp(Stmt::If { cond, then, els }, l, c))
+            }
+            Tok::While => {
+                self.bump();
+                let cond = self.expr()?;
+                let body = self.block(host)?;
+                Ok(sp(Stmt::While { cond, body }, l, c))
+            }
+            Tok::For => {
+                self.bump();
+                let var = self.ident()?;
+                self.expect(&Tok::In)?;
+                let lo = self.expr()?;
+                self.expect(&Tok::DotDot)?;
+                let hi = self.expr()?;
+                let body = self.block(host)?;
+                Ok(sp(Stmt::For { var, lo, hi, body }, l, c))
+            }
+            Tok::Break => {
+                self.bump();
+                self.eat(&Tok::Semi);
+                Ok(sp(Stmt::Break, l, c))
+            }
+            Tok::Continue => {
+                self.bump();
+                self.eat(&Tok::Semi);
+                Ok(sp(Stmt::Continue, l, c))
+            }
             Tok::Let | Tok::Var => {
+                let mutable = self.peek() == &Tok::Var;
                 self.bump();
                 let name = self.ident()?;
-                let ty = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
+                let (hty, ty) = if self.eat(&Tok::Colon) {
+                    if host {
+                        (Some(self.hty()?), None)
+                    } else {
+                        (None, Some(self.ty()?))
+                    }
+                } else {
+                    (None, None)
+                };
                 self.expect(&Tok::Eq)?;
                 let e = self.expr()?;
                 self.eat(&Tok::Semi);
                 Ok(sp(
                     Stmt::Let {
                         name,
+                        hty,
                         ty,
+                        mutable,
                         expr: e,
                     },
                     l,
@@ -264,10 +462,13 @@ impl P {
             }
             Tok::Return => {
                 self.bump();
-                let e = self.expr()?;
+                let e = if self.peek() == &Tok::Semi || self.peek() == &Tok::RBrace {
+                    None
+                } else {
+                    Some(self.expr()?)
+                };
                 self.eat(&Tok::Semi);
-                // return lowers as an expression statement marking exit
-                Ok(sp(Stmt::Expr(sp(Expr::Call("__ret".into(), vec![e], vec![]), l, c)), l, c))
+                Ok(sp(Stmt::Return(e), l, c))
             }
             Tok::Ident(_) => {
                 // assignment or expression statement — lookahead through
@@ -346,13 +547,35 @@ impl P {
         }
         self.expect(&Tok::RParen)?;
         let ret = if self.eat(&Tok::Arrow) { Some(self.ty()?) } else { None };
-        self.expect(&Tok::LBrace)?;
-        let mut body = Vec::new();
-        while self.peek() != &Tok::RBrace && self.peek() != &Tok::Eof {
-            body.push(self.stmt()?);
-        }
-        self.expect(&Tok::RBrace)?;
+        let body = self.block(false)?;
         Ok(sp(Fn { name, dims, args, ret, body }, l, c))
+    }
+
+    /// `host fn name(arg: hty, ...) -> hty { stmt* }` — the organism
+    /// stratum. Full statements; calls ANE programs as values.
+    fn host_fn_decl(&mut self) -> CResult<Sp<HFn>> {
+        let (l, c) = self.at(); // at `host`
+        self.expect(&Tok::Host)?;
+        self.expect(&Tok::Fn)?;
+        let name = self.ident()?.v;
+        self.expect(&Tok::LParen)?;
+        let mut args = Vec::new();
+        if self.peek() != &Tok::RParen {
+            loop {
+                let an = self.ident()?;
+                self.expect(&Tok::Colon)?;
+                let at = self.hty()?;
+                args.push((an, at));
+                if self.eat(&Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        let ret = if self.eat(&Tok::Arrow) { Some(self.hty()?) } else { None };
+        let body = self.block(true)?;
+        Ok(sp(HFn { name, args, ret, body }, l, c))
     }
 
     pub fn program(&mut self) -> CResult<Program> {
@@ -362,6 +585,22 @@ impl P {
             match self.peek().clone() {
                 Tok::Eof => break,
                 Tok::Fn => decls.push(Decl::Fn(self.fn_decl()?)),
+                Tok::Host => decls.push(Decl::HostFn(self.host_fn_decl()?)),
+                Tok::Struct => {
+                    self.bump();
+                    let n = self.ident()?;
+                    self.expect(&Tok::LBrace)?;
+                    let mut fields = Vec::new();
+                    while self.peek() != &Tok::RBrace {
+                        let f = self.ident()?;
+                        self.expect(&Tok::Colon)?;
+                        let ft = self.hty()?;
+                        fields.push((f, ft));
+                        self.eat(&Tok::Comma);
+                    }
+                    self.expect(&Tok::RBrace)?;
+                    decls.push(Decl::Struct { name: n, fields });
+                }
                 Tok::Invariant => {
                     self.bump();
                     let n = self.ident()?;
@@ -425,6 +664,21 @@ impl P {
                         None
                     };
                     decls.push(Decl::Param { name: n, qual, ty, src });
+                }
+                Tok::Table => {
+                    self.bump();
+                    let n = self.ident()?;
+                    self.expect(&Tok::Colon)?;
+                    let ty = self.ty()?;
+                    let src = if self.eat(&Tok::At) {
+                        match self.bump() {
+                            Tok::Str(s) => Some(sp(s, l, c)),
+                            t => return diag(format!("table source must be \"file::tensor\", found {t:?}"), l, c),
+                        }
+                    } else {
+                        None
+                    };
+                    decls.push(Decl::Table { name: n, ty, src });
                 }
                 Tok::Io => {
                     self.bump();

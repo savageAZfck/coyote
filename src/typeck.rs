@@ -111,11 +111,11 @@ pub struct TProgram {
 type Env = HashMap<String, CTy>;
 type Dims = HashMap<String, i64>;
 
-struct Ck {
-    fns: HashMap<String, Sp<Fn>>,
-    params: HashMap<String, (Qual, Ty, Option<String>)>,
-    states: HashMap<String, Vec<(String, Ty)>>,
-    ios: Vec<(String, IoDir, CTy)>,
+pub(crate) struct Ck {
+    pub(crate) fns: HashMap<String, Sp<Fn>>,
+    pub(crate) params: HashMap<String, (Qual, Ty, Option<String>)>,
+    pub(crate) states: HashMap<String, Vec<(String, Ty)>>,
+    pub(crate) ios: Vec<(String, IoDir, CTy)>,
 }
 
 fn bind_dim(dims: &mut Dims, d: &Dim, v: i64, l: usize, c: usize) -> CResult<()> {
@@ -196,6 +196,9 @@ impl Ck {
                 e: TExpr::Int(*n),
                 ty: CTy::scalar(DType::I32),
             }),
+            Expr::Bool(_) | Expr::Str(_) | Expr::VecLit(_) | Expr::StructLit(..) => {
+                diag("host-stratum value — belongs inside `host fn`", l, c)
+            }
             Expr::Ident(s) => {
                 if let Some(ty) = env.get(s) {
                     Ok(Typed {
@@ -212,6 +215,9 @@ impl Ck {
                 }
             }
             Expr::Unary(op, a) => {
+                if *op == UnOp::Not {
+                    return diag("`!` is host-stratum — belongs inside `host fn`", l, c);
+                }
                 let a = self.expr(a, env, dims, depth)?;
                 if !is_numeric(a.ty.dt) {
                     return diag("unary op on non-numeric", l, c);
@@ -232,6 +238,9 @@ impl Ck {
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                         CTy::scalar(DType::I32)
+                    }
+                    BinOp::Mod | BinOp::And | BinOp::Or => {
+                        return diag("host-stratum operator — belongs inside `host fn`", l, c)
                     }
                 };
                 Ok(Typed {
@@ -662,7 +671,10 @@ impl Ck {
         for (i, s) in stmts.iter().enumerate() {
             let terminal = i + 1 == stmts.len();
             match &s.v {
-                Stmt::Let { name, ty, expr } => {
+                Stmt::Let { name, hty, ty, expr, .. } => {
+                    if hty.is_some() {
+                        return diag("host type annotation inside an ane fn", name.line, name.col);
+                    }
                     letmap.insert(name.v.clone(), expr.clone());
                     let te = self.expr(expr, env, dims, depth)?;
                     if let Some(dt) = ty {
@@ -726,6 +738,29 @@ impl Ck {
                 Stmt::Store { target, op, expr } => {
                     let ts = self.store(target, op, expr, env, dims, depth, s.line, s.col)?;
                     out.push(ts);
+                }
+                Stmt::Return(re) => {
+                    // `return e` marks the result, same as the old __ret
+                    // desugar — mid-body it evaluates and discards.
+                    let e = match re {
+                        Some(e) => e.clone(),
+                        None => return diag("bare return — ane fns end in a value", s.line, s.col),
+                    };
+                    let marker = sp(
+                        Expr::Call("__ret".into(), vec![e], vec![]),
+                        s.line,
+                        s.col,
+                    );
+                    let te = self.expr(&marker, env, dims, depth)?;
+                    if terminal {
+                        last = Some(te);
+                    } else {
+                        out.push(TStmt::Expr(te));
+                    }
+                }
+                Stmt::If { .. } | Stmt::While { .. } | Stmt::For { .. }
+                | Stmt::Break | Stmt::Continue => {
+                    return diag("control flow is host-stratum — wrap it in `host fn`", s.line, s.col)
                 }
                 Stmt::Expr(e) => {
                     let te = self.expr(e, env, dims, depth)?;
@@ -910,8 +945,28 @@ impl Ck {
     }
 }
 
-/// typecheck a whole program → concrete TProgram.
-pub fn check(p: &Program) -> CResult<TProgram> {
+/// A fully-checked file: one TProgram per compilable ane fn plus,
+/// in organism mode, the typed host stratum.
+pub struct Checked {
+    /// (name, program) — deterministic order.
+    pub ane: Vec<(String, TProgram)>,
+    /// the host stratum, present iff the file has `host fn`s.
+    pub host: Option<crate::hostck::HProgram>,
+    /// true when a `host fn main` exists — the organism entry.
+    pub organism: bool,
+}
+
+pub(crate) fn collect(
+    p: &Program,
+) -> CResult<(
+    Ck,
+    Vec<String>,
+    Vec<String>,
+    Vec<(String, String)>,
+    Vec<Sp<HFn>>,
+    Vec<(String, Vec<(String, HTy)>)>,
+    Vec<(String, Ty, Option<String>)>,
+)> {
     let mut ck = Ck {
         fns: HashMap::new(),
         params: HashMap::new(),
@@ -921,6 +976,9 @@ pub fn check(p: &Program) -> CResult<TProgram> {
     let mut invariants = Vec::new();
     let mut caps = Vec::new();
     let mut provenance = Vec::new();
+    let mut hostfns = Vec::new();
+    let mut structs = Vec::new();
+    let mut tables = Vec::new();
     for d in &p.decls {
         match d {
             Decl::Invariant(n) => invariants.push(n.v.clone()),
@@ -945,11 +1003,176 @@ pub fn check(p: &Program) -> CResult<TProgram> {
                     fields.iter().map(|(f, t)| (f.v.clone(), t.v.clone())).collect(),
                 );
             }
+            Decl::Struct { name, fields } => {
+                structs.push((
+                    name.v.clone(),
+                    fields.iter().map(|(f, t)| (f.v.clone(), t.v.clone())).collect(),
+                ));
+            }
             Decl::Fn(f) => {
                 ck.fns.insert(f.v.name.clone(), f.clone());
             }
+            Decl::HostFn(f) => {
+                hostfns.push(f.clone());
+            }
+            Decl::Table { name, ty, src } => {
+                tables.push((
+                    name.v.clone(),
+                    ty.v.clone(),
+                    src.as_ref().map(|s| s.v.clone()),
+                ));
+            }
         }
     }
+    Ok((ck, invariants, caps, provenance, hostfns, structs, tables))
+}
+
+impl Ck {
+    /// check one concrete-signature ane fn as a standalone program:
+    /// its args are the io ins, its result the io out named `out`.
+    /// Generic fns stay inline-only — a program needs literal shapes.
+    fn program_for(
+        &mut self,
+        f: &Sp<Fn>,
+        invariants: Vec<String>,
+        caps: Vec<String>,
+        provenance: Vec<(String, String)>,
+    ) -> CResult<TProgram> {
+        if !f.v.dims.is_empty() {
+            return diag(
+                format!("{} has generic dims — programs need concrete signatures", f.v.name),
+                f.line,
+                f.col,
+            );
+        }
+        let mut dims = Dims::new();
+        let mut env = Env::new();
+        let mut ios = Vec::new();
+        let mut arg_ports = Vec::new();
+        for (an, aty) in &f.v.args {
+            let ct = resolve_ty(&dims, &aty.v, aty.line, aty.col)?;
+            env.insert(an.v.clone(), ct.clone());
+            ios.push((an.v.clone(), IoDir::In, ct));
+            arg_ports.push((an.v.clone(), an.v.clone()));
+        }
+        let mut tparams = Vec::new();
+        let mut pdims = Dims::new();
+        let mut sorted: Vec<_> = self.params.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (n, (q, t, s)) in sorted {
+            let ct = resolve_ty(&mut pdims, t, 0, 0)?;
+            tparams.push(TParam { name: n.clone(), qual: *q, ty: ct, src: s.clone() });
+        }
+        for (n, (_, t, _)) in self.params.clone() {
+            if let Ok(ct) = resolve_ty(&dims, &t, 0, 0) {
+                env.insert(n, ct);
+            }
+        }
+        let mut letmap = HashMap::new();
+        let (body, last) = self.body(&f.v.body, &mut env, &mut dims, 0, &mut letmap)?;
+        let ret = last.ok_or(()).map_err(|_| Diag {
+            msg: format!("{} must end in a result expression — a program needs an output", f.v.name),
+            line: f.line,
+            col: f.col,
+        })?;
+        if let Some(rt) = &f.v.ret {
+            let want = resolve_ty(&dims, &rt.v, rt.line, rt.col)?;
+            if want.dims != ret.ty.dims {
+                return diag(
+                    format!("{} declared -> {} but returns {}", f.v.name, want.show(), ret.ty.show()),
+                    rt.line,
+                    rt.col,
+                );
+            }
+        }
+        ios.push(("out".to_string(), IoDir::Out, ret.ty.clone()));
+        let mut states = Vec::new();
+        let mut snames: Vec<_> = self.states.iter().collect();
+        snames.sort_by(|a, b| a.0.cmp(b.0));
+        for (sname, fields) in snames {
+            for (fname, fty) in fields {
+                let ct = resolve_ty(&Dims::new(), fty, 0, 0)?;
+                states.push((format!("{sname}.{fname}"), format!("{sname}_{fname}"), ct));
+            }
+        }
+        Ok(TProgram {
+            ios,
+            params: tparams,
+            invariants,
+            caps,
+            provenance,
+            arg_ports,
+            body,
+            ret,
+            states,
+        })
+    }
+}
+
+/// organism-aware entry point: every concrete ane fn becomes a
+/// program; host fns check against their signatures.
+pub fn check_all(p: &Program) -> CResult<Checked> {
+    let (mut ck, invariants, caps, provenance, hostfns, structs, tables) = collect(p)?;
+    if hostfns.is_empty() {
+        let prog = check(p)?;
+        return Ok(Checked {
+            ane: vec![("main".to_string(), prog)],
+            host: None,
+            organism: false,
+        });
+    }
+    if !ck.ios.is_empty() {
+        let d = p
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                Decl::Io { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap();
+        return diag(
+            "io decls belong to the single-program form — in an organism file an ane fn's signature IS its io",
+            d.line,
+            d.col,
+        );
+    }
+    let mut ane = Vec::new();
+    let mut fns_sorted: Vec<_> = ck.fns.values().cloned().collect();
+    fns_sorted.sort_by(|a, b| a.v.name.cmp(&b.v.name));
+    for f in &fns_sorted {
+        if !f.v.dims.is_empty() {
+            continue; // inline-only — generic fns can't be programs
+        }
+        let has_generic_ty = f
+            .v
+            .args
+            .iter()
+            .map(|(_, t)| t)
+            .chain(f.v.ret.iter())
+            .any(|t| t.v.dims.iter().any(|d| matches!(d, Dim::Name(_))));
+        if has_generic_ty {
+            continue;
+        }
+        let prog = ck.program_for(
+            f,
+            invariants.clone(),
+            caps.clone(),
+            provenance.clone(),
+        )?;
+        ane.push((f.v.name.clone(), prog));
+    }
+    let host = crate::hostck::check(p, &hostfns, &structs, &ck, &ane, &tables)?;
+    let organism = hostfns.iter().any(|f| f.v.name == "main");
+    Ok(Checked {
+        ane,
+        host: Some(host),
+        organism,
+    })
+}
+
+/// typecheck a whole program → concrete TProgram.
+pub fn check(p: &Program) -> CResult<TProgram> {
+    let (mut ck, invariants, caps, provenance, _hostfns, _structs, _tables) = collect(p)?;
     let main = ck
         .fns
         .get("main")

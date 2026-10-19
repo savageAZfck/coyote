@@ -148,6 +148,12 @@ impl<'a> Evaluator<'a> {
         };
         let v = crate::weights::resolve(name, Some(&expect), t.src.as_deref(), qw)
             .map_err(|m| Diag { msg: m, line: 0, col: 0 })?;
+        // file sources arrive f32 — the blobs are f16, so round the
+        // reference the same way (parity is vs silicon, not vs bf16).
+        let v = v
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_f32())
+            .collect();
         Ok(Val::V(v))
     }
 
@@ -190,6 +196,7 @@ impl<'a> Evaluator<'a> {
                     Val::V(v) => Val::V(v.iter().map(|x| -x).collect()),
                 })
             }
+            TExpr::Unary(UnOp::Not, _) => diag("eval: `!` is host-stratum", 0, 0),
             TExpr::Bin(op, a, b) => {
                 let n = e.ty.numel().max(1) as usize;
                 match op {
@@ -431,6 +438,9 @@ impl<'a> Evaluator<'a> {
             TExpr::Unary(UnOp::Neg, a) => {
                 let neg: Vec<f32> = adj.iter().map(|x| -x).collect();
                 self.back(a, &neg)?;
+            }
+            TExpr::Unary(UnOp::Not, _) => {
+                return diag("back: `!` is host-stratum", 0, 0)
             }
             TExpr::Bin(op, a, b) => match op {
                 BinOp::Add => {
