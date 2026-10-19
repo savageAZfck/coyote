@@ -9,9 +9,9 @@
 
 use coyote::eval::Evaluator;
 use coyote::lower::{init_weight_pub, lower, sha256_hex};
-use coyote::parser::parse;
-use coyote::typeck::{check_all, TProgram};
-use coyote::vm::{AneProg, Vm};
+use coyote::parser::parse_file;
+use coyote::typeck::check_all;
+use coyote::vm::{AneProg, ProgBackend, Vm};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -36,6 +36,10 @@ fn resume_arg(args: &[String]) -> Option<PathBuf> {
 
 fn rebuild_arg(args: &[String]) -> bool {
     args.iter().any(|a| a == "--rebuild")
+}
+
+fn cpu_arg(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--cpu")
 }
 
 fn emit(
@@ -217,10 +221,10 @@ fn main() {
     let dir = out_dir(&args[3..]);
     let steps = steps_arg(&args[3..]);
     let rebuild = rebuild_arg(&args[3..]);
+    let use_cpu = cpu_arg(&args[3..]);
 
     let r = (|| -> Result<(), String> {
-        let src = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-        let ast = parse(&src).map_err(|d| format!("{d}"))?;
+        let (src, ast) = parse_file(&file).map_err(|d| format!("{d}"))?;
         let checked = check_all(&ast).map_err(|d| format!("{d}"))?;
         // ---- organism mode: `host fn main` drives the programs ----
         if checked.host.is_some() && cmd != "check" {
@@ -234,22 +238,31 @@ fn main() {
                 let t0 = std::time::Instant::now();
                 let out = emit(&src, tp, &dir2, rebuild)?;
                 let t_emit = t0.elapsed();
-                let plan = mil_infer::graph::compile_graph(
-                    dir2.join("net.mil").to_str().unwrap(),
-                    dir2.to_str().unwrap(),
-                )
-                .map_err(|e| format!("compile_graph ({name}): {e}"))?;
-                println!(
-                    "✓ {name} — {} program nodes  (emit {:.1}s, compile {:.1}s)",
-                    plan.nodes.len(),
-                    t_emit.as_secs_f64(),
-                    t0.elapsed().as_secs_f64() - t_emit.as_secs_f64()
-                );
-                let rt = mil_infer::graph::GraphRuntime::load(plan)
-                    .map_err(|e| format!("runtime load ({name}): {e}"))?;
+                let backend = if use_cpu {
+                    println!(
+                        "✓ {name} — cpu backend  (emit {:.1}s)",
+                        t_emit.as_secs_f64()
+                    );
+                    ProgBackend::Cpu(tp.clone())
+                } else {
+                    let plan = mil_infer::graph::compile_graph(
+                        dir2.join("net.mil").to_str().unwrap(),
+                        dir2.to_str().unwrap(),
+                    )
+                    .map_err(|e| format!("compile_graph ({name}): {e}"))?;
+                    println!(
+                        "✓ {name} — {} program nodes  (emit {:.1}s, compile {:.1}s)",
+                        plan.nodes.len(),
+                        t_emit.as_secs_f64(),
+                        t0.elapsed().as_secs_f64() - t_emit.as_secs_f64()
+                    );
+                    let rt = mil_infer::graph::GraphRuntime::load(plan)
+                        .map_err(|e| format!("runtime load ({name}): {e}"))?;
+                    ProgBackend::Ane(rt)
+                };
                 progs.push(AneProg {
                     name: name.clone(),
-                    rt,
+                    backend,
                     ins: out.inputs,
                     trainable: out
                         .trainable
@@ -297,16 +310,21 @@ fn main() {
                     println!("  program {name}: {} io, {} params, {} stmts", p.ios.len(), p.params.len(), p.body.len());
                 }
                 if let Some(h) = &checked.host {
-                    println!("  host:     {} fns, {} globals, {} structs", h.fns.len(), h.globals.len(), h.structs.len());
+                    let nreflex = h.fns.iter().filter(|f| f.is_reflex).count();
+                    println!(
+                        "  host:     {} fns ({} reflex), {} globals, {} structs, {} enums",
+                        h.fns.len(),
+                        nreflex,
+                        h.globals.len(),
+                        h.structs.len(),
+                        h.enums.len()
+                    );
                 }
-                if let Some((_, p)) = checked.ane.first() {
-                    let p: &TProgram = p;
-                    if !p.invariants.is_empty() {
-                        println!("  invariants: {}", p.invariants.join(", "));
-                    }
-                    if !p.caps.is_empty() {
-                        println!("  caps:       {}", p.caps.join(", "));
-                    }
+                if !checked.invariants.is_empty() {
+                    println!("  invariants: {}", checked.invariants.join(", "));
+                }
+                if !checked.caps.is_empty() {
+                    println!("  caps:       {}", checked.caps.join(", "));
                 }
                 Ok(())
             }

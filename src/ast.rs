@@ -71,14 +71,29 @@ pub enum HTy {
     Unit,
     /// `token` — witnessed organism identity (id + epoch).
     Token,
+    /// `dfa` — compiled Aho-Corasick state machine (`macuahuitl`/`mil_machines`).
+    Dfa,
     /// `f16[N, M]` — a handle into the tensor store.
     Tensor(Ty),
     /// `[T]` — a growable vec.
     Vec(Box<HTy>),
-    /// a declared `struct` type.
+    /// `{K: V}` — an insertion-ordered map (`K` is `str` or `i64`).
+    Map(Box<HTy>, Box<HTy>),
+    /// a declared `struct` or `enum` type.
     Struct(String),
     /// `ane(t1, t2) -> r` — a first-class compiled program value.
     AneFn(Vec<HTy>, Box<HTy>),
+}
+
+/// Declared determinism mode on a host function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetMode {
+    /// Unannotated — inferred from call graph (`det` unless calling `stoch`).
+    Auto,
+    /// Explicitly `det` — calling a `stoch` fn or native is a compile error.
+    Det,
+    /// Explicitly `stoch` — non-deterministic / sampling allowed.
+    Stoch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +113,8 @@ pub enum IoDir {
 
 #[derive(Debug, Clone)]
 pub enum Decl {
+    /// `import "other.cy"` — splice another coyote module's declarations.
+    Import(Sp<String>),
     /// `invariant name` — constitutional clause, name recorded into artifact.
     Invariant(Sp<String>),
     /// `cap hear, see, net::send` — declared capabilities.
@@ -136,6 +153,11 @@ pub enum Decl {
         name: Sp<String>,
         fields: Vec<(Sp<String>, Sp<HTy>)>,
     },
+    /// `enum Decision { Permit, Hold(str), Deny(str) }` — sum type.
+    Enum {
+        name: Sp<String>,
+        variants: Vec<(Sp<String>, Vec<Sp<HTy>>)>,
+    },
     Fn(Sp<Fn>),
     HostFn(Sp<HFn>),
 }
@@ -151,13 +173,29 @@ pub struct Fn {
 }
 
 /// A host-stratum function — bytecode-compiled, runs on the CPU,
-/// calls ANE programs as first-class values.
+/// calls ANE programs as first-class values. Also represents `reflex`
+/// declarations (`is_reflex = true`), which the constitutional checker
+/// forces to be `det`, capability-free, and returning `Reflex`.
 #[derive(Debug, Clone)]
 pub struct HFn {
     pub name: String,
     pub args: Vec<(Sp<String>, Sp<HTy>)>,
     pub ret: Option<Sp<HTy>>,
+    pub det: DetMode,
+    /// Optional explicit capability bound `cap a, b` on this fn.
+    pub caps: Option<Vec<Sp<String>>>,
+    pub is_reflex: bool,
     pub body: Vec<Sp<Stmt>>,
+}
+
+/// A pattern in a `match` arm: `Enum::Variant(a, b)` or `_`.
+#[derive(Debug, Clone)]
+pub enum Pat {
+    Wildcard(usize, usize),
+    Variant {
+        name: Sp<String>,
+        binds: Vec<Sp<String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +224,11 @@ pub enum Stmt {
         cond: Sp<Expr>,
         then: Vec<Sp<Stmt>>,
         els: Vec<Sp<Stmt>>,
+    },
+    /// host stratum: `match e { Pat => { ... } }`
+    Match {
+        expr: Sp<Expr>,
+        arms: Vec<(Pat, Vec<Sp<Stmt>>)>,
     },
     /// host stratum: `while c { }`
     While {
@@ -224,6 +267,8 @@ pub enum Expr {
     Str(String),
     /// `[a, b, c]` — vec literal (host stratum).
     VecLit(Vec<Sp<Expr>>),
+    /// `{k: v, ...}` — map literal (host stratum).
+    MapLit(Vec<(Sp<Expr>, Sp<Expr>)>),
     /// `Name { f: e, ... }` — struct literal (host stratum).
     StructLit(Sp<String>, Vec<(Sp<String>, Sp<Expr>)>),
     Ident(String),

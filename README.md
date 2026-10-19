@@ -71,28 +71,60 @@ host fn main() -> i64 {
 ```
 
 - **Programs are values.** `let f = layer; f(x, ...)` dispatches to
-  silicon. A program's type is its io signature — a shape mismatch across
-  the CPU↔ANE boundary is a compile error.
-- **Host types**: `i64 f64 bool str [T] struct`, control flow
-  `if/else while for break continue return`, `% && || !`.
+  silicon (or `--cpu` reference). A program's type is its io signature —
+  a shape mismatch across the CPU↔ANE boundary is a compile error.
+- **Host types**: `i64 f64 bool str token dfa [T] {K: V} struct enum`,
+  control flow `if/else match while for break continue return`,
+  `import "file.cy"`, `% && || !`.
+- **Constitutional pass at compile time:**
+  - **Transitive `cap` checking:** capabilities (`fs`, `patch`, `erase`,
+    `cortex`, `net`, ...) propagate across the call graph; using an
+    undeclared capability is a compile error (`no cap::X → no X`).
+  - **Determinism (`det` / `stoch`):** `host det fn` and `reflex` bodies
+    reject any direct or transitive call to stochastic ops (`rand`, `cortex_ask`).
+  - **Audited reflexes (`reflex` / `axon`):** `reflex name(...) -> Reflex`
+    is statically forced to be `det`, zero-capability, and non-steering
+    (reflexes brake, never steer); every non-`Pass` firing (`Alert`,
+    `Brake`, `Quarantine`) is automatically hash-chained into `witness.jsonl`.
+- **Sovereign organ primitives built into the language:**
+  - `dfa_compile` / `dfa_scan` — streaming Aho-Corasick firewall (`macuahuitl`).
+  - `quorum` — council deliberation with structurally preserved minority dissent (`tokala`).
+  - `propose_patch` — bounded-autonomy marshal with protected-surface & blast-radius caps (`akicita`/`xipe`, requires `cap patch`).
+  - `erase` — certified erasure with verified decryption failure (`camazotz`, requires `cap erase`).
+  - `read_file` / `write_file` (`cap fs`) and `cortex_ask` (`cap cortex`, SLICKS bridge).
 - **`table`** declares host-side data (embedding tables, corpora) — it is
-  unnameable inside `fn`, so a 300MB lookup table can never become an ANE
+  unnameable inside `fn`, so a 600MB lookup table can never become an ANE
   weight blob.
 - **`self_token()`** returns the organism's witnessed identity `{id, epoch}` —
   `id` binds to the build manifest, `epoch` advances with the witness chain.
 - **`witness(tag, val)`** appends to a hash-chained log — every token,
   every decision, tamper-evident by construction.
 - **`migrate(path)`** freezes the whole organism mid-thought — stack,
-  frames, tensors, witness chain — into a snapshot. `--resume` refuses a
-  body that isn't this organism's own (lineage check on the manifest hash)
-  and continues the chain where it froze.
+  frames, tensors, maps, enums, DFAs, witness chain — into a snapshot.
+  `--resume` refuses a body that isn't this organism's own (lineage check
+  on the manifest hash) and continues the chain where it froze, even across
+  ANE ↔ `--cpu` backends.
 - **`die()`** halts with attestation.
 
-The split is deliberate: `cap`/`sealed`/`invariant` are compile-time —
-the constitution is enforced before silicon ever runs. `die`/`migrate`/
-`lineage` are runtime — identity is produced by living, not by types.
+The split is deliberate: `cap`/`sealed`/`det`/`reflex`/`invariant` are
+compile-time — the constitution is enforced before silicon ever runs.
+`die`/`migrate`/`witness` are runtime — identity is produced by living.
 
 ## receipts
+
+`examples/qwen28.cy` — a **full 28-layer Qwen3-0.6B decode** driven
+entirely from `.cy` source: 29 compiled ANE programs (17,780 program
+nodes across `l0`..`l27` + `head`), 2,942 real safetensors weight slices,
+28 independent instanced KV caches (`l0.kv`..`l27.kv`) from one `state kv`
+spec, surface pooling across ~143k dispatches, every generated token
+hash-chained into `witness.jsonl`.
+
+`examples/sovereign.cy` (+ `examples/organs.cy`) — the full sovereign
+anatomy in one `.cy` program: `import`, `enum`/`match`, `{K: V}` maps,
+`reflex` arc (`axon`), `dfa_compile`/`dfa_scan` (`macuahuitl`),
+dissenting `quorum` (`tokala`), `propose_patch` (`akicita`/`xipe`),
+certified `erase` (`camazotz`), `cap`-gated file I/O + `cortex_ask`,
+and ANE/`--cpu` execution.
 
 `examples/qwenlayer.cy` — a full Qwen3-0.6B decoder layer: 16 GQA
 attention heads, RoPE, KV cache (`state`), SwiGLU MLP, residuals. All
@@ -109,22 +141,19 @@ step   3  |ane−cpu| pred 0.002617  kv 0.179768  |kv| 9236.196
 20 steps, weights fed back each step). `examples/decode.cy` — KV-cache
 decode step. `examples/ffn.cy` — first light.
 
-`examples/qwenorg.cy` — the organism: a real Qwen3 decoder layer compiled
-to 638 ANE programs, driven by a `host fn` decode loop entirely in `.cy`
-source — embedding gather, silicon dispatch, argmax feedback, a witnessed
-token at every step. `examples/organism.cy` — the general stratum
-exercised without a checkpoint: structs, vectors, loops, recursion, a
-program passed by value.
+`examples/qwenorg.cy` — single-layer Qwen3 organism decode loop.
+`examples/organism.cy` — structs, vectors, loops, recursion, and a
+program passed by value without needing a checkpoint.
 
 ## build + run
 
 ```sh
 cargo build
-./target/debug/coyote check  examples/ffn.cy          # parse + shape-check
-./target/debug/coyote build  examples/ffn.cy -o out/ffn
-./target/debug/coyote run    examples/ffn.cy -o out/ffn
+./target/debug/coyote check  examples/sovereign.cy    # parse + shape + constitutional check
+./target/debug/coyote run    examples/sovereign.cy -o out/sovereign
+./target/debug/coyote run    examples/sovereign.cy -o out/sovereign --cpu
 ./target/debug/coyote run    examples/train.cy -o out/train --steps 20
-./target/debug/coyote run    examples/qwenlayer.cy -o out/qwenlayer --steps 8
+./target/debug/coyote run    examples/qwen28.cy -o out/qwen28
 ```
 
 The qwen examples want a real checkpoint at `models/qwen3-0.6b/` —

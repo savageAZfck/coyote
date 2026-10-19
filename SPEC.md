@@ -189,62 +189,103 @@ two strata share one type system. `fn` compiles to an ANE program;
 becomes its own program artifact (`-o dir/<name>/`).
 
 ```
-decl       += 'table' ident ':' type ('@' stringlit)?
+decl       += 'import' stringlit ';'?
+            | 'table' ident ':' type ('@' stringlit)?
             | 'struct' ident '{' (ident ':' hty)* '}'
-            | 'host' 'fn' ident '(' (ident ':' hty)* ')' ('->' hty)? block
-hty        := 'i64' | 'f64' | 'bool' | 'str' | 'token' | 'unit'
+            | 'enum' ident '{' (ident ('(' hty* ')')?)* '}'
+            | ('det'|'stoch')? 'host' ('det'|'stoch')? 'fn' ident
+              '(' (ident ':' hty)* ')' ('->' hty)? ('cap' ident (',' ident)*)? block
+            | 'reflex' ident '(' (ident ':' hty)* ')' ('->' hty)? block
+hty        := 'i64' | 'f64' | 'bool' | 'str' | 'token' | 'dfa' | 'unit'
             | dtype '[' int (',' int)* ']'          # literal dims only
-            | '[' hty ']' | ident                    # struct name
-            | 'ane' '(' (hty)* ')' '->' hty          # program value type
+            | '[' hty ']' | '{' hty ':' hty '}'     # vec and map
+            | ident                                 # struct or enum name
+            | 'ane' '(' (hty)* ')' '->' hty         # program value type
 hstmt      := 'let'|'var' ident (':' hty)? '=' expr ';'
             | lval assign_op expr ';'
             | 'if' expr block ('else' (block | 'if' ...))?
+            | 'match' expr '{' (pat '=>' (block | stmt) ','?)* '}'
             | 'while' expr block
             | 'for' ident 'in' expr '..' expr block
             | 'break' ';' | 'continue' ';' | 'return' expr? ';'
-expr       += boollit | stringlit | '[' expr* ']' | ident '{' field '=' expr* '}'
-            | expr '.' ident                         # struct/token field
+pat        := '_' | ident ('(' ident (',' ident)* ')')?
+expr       += boollit | stringlit | '[' expr* ']' | '{' (expr ':' expr)* '}'
+            | ident '{' field ':' expr* '}' | ident '::' ident ('(' expr* ')')?
+            | expr '.' ident                        # struct/token field
             | expr '&&' expr | expr '||' expr | '!' expr | expr '%' expr
 ```
 
 semantics:
 
+- **modules (`import "path.cy"`).** resolved relative to the importing file,
+  deduplicated in encounter order; the combined source text feeds the manifest
+  hash so imported modules are part of the organism's cryptographic identity.
 - **programs are values.** an ane fn's name bound in host scope has type
   `ane(argtys) -> retty`. calling it — by name or through a variable —
-  marshals tensors into surfaces, runs GraphRuntime, reads the output.
-  arg/ret shapes and dtypes must match the signature exactly.
+  marshals tensors into surfaces, runs GraphRuntime (or the CPU reference
+  evaluator under `--cpu`), reads the output. arg/ret shapes and dtypes
+  must match the signature exactly.
+- **enums & exhaustive `match`.** `enum Name { UnitVar, PayloadVar(T1, T2) }`
+  defines a sum type; `match e { ... }` checks exhaustiveness at compile time
+  (missing variants without `_` are hard errors). Built-in sovereign enums
+  `Reflex { Pass, Alert(str), Brake(str), Quarantine(str) }` and
+  `Decision { Permit, Hold(str), Deny(str) }` are always in scope.
+- **maps (`{K: V}`).** insertion-ordered deterministic maps (`K` ∈ `{str, i64}`),
+  supporting `{k: v}` literals, empty annotated `{}` literals, `m[k]`,
+  `m[k] = v`, `has(m, k)`, `keys(m)`, and `len(m)`.
 - **tables are host data.** `table emb: f16[V, D] @ "file::tensor"` loads
   in declared order, is indexable (`emb[tok]` → row `f16[D]`), and is
-  unnameable inside `fn` — a 300MB lookup table can never become a
+  unnameable inside `fn` — a 600MB lookup table can never become a
   weight blob. rank-2 tensor indexing in host code is a row gather;
   rank-1 indexing yields `f64`.
-- **state fields are readable** from host code as `kv.k0lo` — the on-chip
-  mirror, written back after every program call.
+- **state fields are per-program instances.** a `state` decl is a spec;
+  each program that references a field gets its own instance, mirrored on
+   the host as `<prog>.<state>.<field>` (with an unqualified `<state>.<field>`
+  alias when only one program uses it).
 - **sealed params are unnameable in host code.** the boundary is total:
   not a lint, a missing name.
+- **transitive capability soundness (`cap`).** capabilities (`fs`, `patch`,
+  `erase`, `cortex`, `net`, ...) propagate transitively across the call
+  graph. If a function declares an explicit `cap a, b` clause, its body may
+  only exercise capabilities in `{a, b}` and callers inherit the requirement.
+  Every capability used anywhere in the program must be granted by top-level
+  `cap` declarations (`no cap::X → no X` is a compile-time theorem).
+- **declared determinism (`det` / `stoch`).** functions declared `host det fn`
+  (and all `reflex` arcs) are statically verified to never call `stoch`
+  primitives (`rand`, `cortex_ask`) directly or transitively.
+- **audited reflexes (`reflex` / `axon`).** `reflex name(...) -> Reflex`
+  is statically verified to be `det`, capability-free (`cap` = ∅), and
+  non-steering (cannot call ANE programs, `migrate`, or `die`). In the VM,
+  every non-`Pass` firing (`Alert`, `Brake`, `Quarantine`) is automatically
+  appended to the hash-chained witness log as `reflex:<name>`.
+- **sovereign organ natives:**
+  - `dfa_compile(patterns: [str]) -> dfa` and `dfa_scan(m: dfa, text: str) -> i64`:
+    byte-level Aho-Corasick state machine (`macuahuitl` / `mil_machines`).
+  - `quorum(topic: str, votes: [Vote]) -> QuorumVerdict`: dissenting council
+    vote (`tokala`) that tallies `Vote { seat, approve, reason }`, preserves
+    minority dissent strings, and witnesses the verdict.
+  - `propose_patch(target, old, new, reason) -> Decision` (requires `cap patch`):
+    bounded autonomy marshal (`akicita` / `xipe`) enforcing protected surfaces
+    and blast-radius caps (`<=20` lines, `<=1000` bytes), witnessed into the ledger.
+  - `erase(subject: str, payload: str) -> str` (requires `cap erase`):
+    certified erasure (`camazotz`) — encrypts under per-subject key, zeroes
+    key, verifies decryption failure, witnesses and returns the certificate hash.
+  - `read_file(path)` / `write_file(path, content)` (requires `cap fs`).
+  - `cortex_ask(prompt) -> str` (requires `cap cortex`, `stoch`): SLICKS
+    socket bridge to Bad Apple's cortex.
 - **`token`** carries `{id, epoch}`. `id` binds to the build manifest
   hash; `epoch` counts witness entries. `.id`/`.epoch` are the only
   fields.
 - **`witness(tag, val)`** appends sha256-chained `{seq, tag, val, hash}`
   entries — the organism's ledger, written to `<out>/witness.jsonl`.
-- **`migrate(path)`** serializes stack, frames, tensors, globals, rng and
-  the witness chain. `coyote run f.cy --resume snap.bin` verifies the
-  snapshot's lineage hash matches this organism's manifest, restores the
-  chain, and continues mid-execution — the resumed body's first entry is
-  `resume`, chained to the frozen tip.
+- **`migrate(path)`** serializes stack, frames, tensors, globals (including
+  vecs, structs, maps, enums, DFAs), rng and the witness chain.
+  `coyote run f.cy --resume snap.bin [--cpu]` verifies the snapshot's lineage
+  hash matches this organism's manifest, restores the chain, and continues
+  mid-execution — even across ANE ↔ CPU backends.
 - **`die()`** witnesses and halts.
 
 natives: `print str len push argmax i64 f64 onehot causal rope_cos
-rope_sin zeros self_token witness die migrate rand`.
-`rope_cos/sin(pos, d)` is the Qwen3 rotate-half table `θ_i = 1e6^(-2i/2d)`;
-`causal(upto, n)` is `0` below `upto`, `-1e4` above; `rand()` is
-xorshift64* seeded by lineage — deterministic per organism.
-
-the VM is the point: `die`, `migrate`, `witness` and respawn need
-inspectable, serializable execution state — an organism that can freeze
-itself mid-thought cannot be native code.
-
-- **M6 (partial, landed)**: `host fn` stratum, program values, `token`,
-  `witness` hash chain, `migrate`/`--resume`, `die`, `table`, `struct`,
-  full host control flow. remaining: `cap` transitive flow-checking,
-  `det`/`stoch`, signed artifacts, `lineage` across machines.
+rope_sin zeros self_token witness die migrate rand has keys contains
+split slice_str dfa_compile dfa_scan quorum propose_patch erase
+read_file write_file cortex_ask`.

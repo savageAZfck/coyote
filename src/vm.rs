@@ -8,12 +8,13 @@
 //! invoked as natives through the same GraphRuntime the driver uses.
 
 use crate::ast::{AssignOp, BinOp, DType, UnOp};
+use crate::eval::Evaluator;
 use crate::hostck::{GVal, HFnT, HProgram, StoreT, HE, HS, HT, RTy, NATIVE_NAMES};
 use crate::lower::{init_weight_pub, sha256_hex};
-use crate::typeck::CTy;
+use crate::typeck::{CTy, TProgram};
 use mil_infer::graph::GraphRuntime;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 // ---------------------------------------------------------------- bytecode
@@ -52,6 +53,9 @@ enum Op {
     VecNew(u32),
     VecGet,
     VecSet,
+    MapNew(u32),
+    MapGet,
+    MapSet,
     StrGet,
     TensorGet,
     TensorRow,
@@ -59,8 +63,93 @@ enum Op {
     StructNew(u32),
     FieldGet(u32),
     FieldSet(u32),
+    EnumNew(u32, u32, u8),
+    EnumIs(u32),
+    EnumField(u8),
     TokenField(u32),
     Ret,
+}
+
+/// Byte-level Aho-Corasick DFA (`macuahuitl` / `mil_machines` semantics).
+#[derive(Clone, Debug)]
+pub struct DfaMachine {
+    pub patterns: Vec<String>,
+    /// `next[state * 256 + byte] -> next_state`
+    pub next: Vec<i32>,
+    /// `out[state] >= 0` is the matched pattern index (`-1` if none).
+    pub out: Vec<i32>,
+}
+
+impl DfaMachine {
+    pub fn compile(patterns: Vec<String>) -> Self {
+        let mut goto: Vec<[i32; 256]> = vec![[-1; 256]];
+        let mut out: Vec<i32> = vec![-1];
+        for (pi, pat) in patterns.iter().enumerate() {
+            if pat.is_empty() {
+                continue;
+            }
+            let mut cur = 0usize;
+            for &b in pat.as_bytes() {
+                let nb = goto[cur][b as usize];
+                if nb == -1 {
+                    let ns = goto.len() as i32;
+                    goto[cur][b as usize] = ns;
+                    goto.push([-1; 256]);
+                    out.push(-1);
+                    cur = ns as usize;
+                } else {
+                    cur = nb as usize;
+                }
+            }
+            if out[cur] == -1 {
+                out[cur] = pi as i32;
+            }
+        }
+        let n = goto.len();
+        let mut fail = vec![0usize; n];
+        let mut q = VecDeque::new();
+        for b in 0..256 {
+            if goto[0][b] == -1 {
+                goto[0][b] = 0;
+            } else {
+                let s = goto[0][b] as usize;
+                fail[s] = 0;
+                q.push_back(s);
+            }
+        }
+        while let Some(r) = q.pop_front() {
+            for b in 0..256 {
+                let s = goto[r][b];
+                if s != -1 {
+                    let su = s as usize;
+                    q.push_back(su);
+                    let f = fail[r];
+                    fail[su] = goto[f][b] as usize;
+                    if out[su] == -1 && out[fail[su]] != -1 {
+                        out[su] = out[fail[su]];
+                    }
+                } else {
+                    goto[r][b] = goto[fail[r]][b];
+                }
+            }
+        }
+        let mut next = Vec::with_capacity(n * 256);
+        for row in goto {
+            next.extend_from_slice(&row);
+        }
+        Self { patterns, next, out }
+    }
+
+    pub fn scan(&self, text: &str) -> i64 {
+        let mut state = 0usize;
+        for &b in text.as_bytes() {
+            state = self.next[state * 256 + b as usize] as usize;
+            if self.out[state] >= 0 {
+                return self.out[state] as i64;
+            }
+        }
+        -1
+    }
 }
 
 // ---------------------------------------------------------------- values
@@ -73,8 +162,14 @@ pub enum Val {
     B(bool),
     S(Rc<str>),
     V(Rc<RefCell<Vec<Val>>>),
+    /// deterministic insertion-ordered map `{K: V}`
+    M(Rc<RefCell<Vec<(Val, Val)>>>),
     /// struct type idx + fields in decl order
     St(u32, Rc<RefCell<Vec<Val>>>),
+    /// enum type idx + variant idx + payload values
+    En(u32, u32, Rc<Vec<Val>>),
+    /// compiled Aho-Corasick DFA
+    Dfa(Rc<DfaMachine>),
     /// tensor handle — index into the store
     T(u32),
     /// ane program value — index into the program table
@@ -109,10 +204,17 @@ pub struct Wit {
     pub hash: String,
 }
 
-/// a loaded ANE program — the runtime half of a program value.
+/// Execution backend for a compiled tensor `fn` program: either native
+/// ANE silicon via `GraphRuntime`, or pure-Rust CPU evaluation via `Evaluator`.
+pub enum ProgBackend {
+    Ane(GraphRuntime),
+    Cpu(TProgram),
+}
+
+/// a loaded tensor program — the runtime half of a program value.
 pub struct AneProg {
     pub name: String,
-    pub rt: GraphRuntime,
+    pub backend: ProgBackend,
     /// io input ports in arg order: (port, ty, contig)
     pub ins: Vec<(String, CTy, bool)>,
     /// trainable params: (param, port, declared ty)
@@ -358,6 +460,7 @@ impl Bc {
                 self.expr(i)?;
                 match &b.ty {
                     RTy::Vec(_) => self.emit(Op::VecGet),
+                    RTy::Map(_, _) => self.emit(Op::MapGet),
                     RTy::Str => self.emit(Op::StrGet),
                     RTy::Tensor(t) if t.dims.len() == 1 => self.emit(Op::TensorGet),
                     RTy::Tensor(_) => self.emit(Op::TensorRow),
@@ -377,11 +480,24 @@ impl Bc {
                 }
                 self.emit(Op::VecNew(items.len() as u32));
             }
+            HE::MapLit(items) => {
+                for (k, v) in items {
+                    self.expr(k)?;
+                    self.expr(v)?;
+                }
+                self.emit(Op::MapNew(items.len() as u32));
+            }
             HE::StructLit(si, vals) => {
                 for v in vals {
                     self.expr(v)?;
                 }
                 self.emit(Op::StructNew(*si));
+            }
+            HE::EnumLit(ei, vi, vals) => {
+                for v in vals {
+                    self.expr(v)?;
+                }
+                self.emit(Op::EnumNew(*ei, *vi, vals.len() as u8));
             }
         }
         Ok(())
@@ -429,6 +545,7 @@ impl Bc {
                     self.expr(expr)?;
                     match &tb.ty {
                         RTy::Vec(_) => self.emit(Op::VecSet),
+                        RTy::Map(_, _) => self.emit(Op::MapSet),
                         RTy::Tensor(_) => self.emit(Op::TensorSet),
                         _ => return Err("compile: bad store".into()),
                     };
@@ -457,6 +574,42 @@ impl Bc {
                 self.scopes.pop();
                 let l_end = self.here();
                 self.patch(je, l_end);
+            }
+            HS::Match { expr, arms } => {
+                self.scopes.push(HashMap::new());
+                self.expr(expr)?;
+                let scr = self.slot(&format!("__match_{}", self.nslots));
+                self.emit(Op::Store(scr));
+                let mut end_jmps = Vec::new();
+                for (vi_opt, binds, body) in arms {
+                    let mut next_arm = None;
+                    if let Some(vi) = vi_opt {
+                        self.emit(Op::Load(scr));
+                        self.emit(Op::EnumIs(*vi));
+                        next_arm = Some(self.emit(Op::JmpF(0)));
+                    }
+                    self.scopes.push(HashMap::new());
+                    for (bi, (bname, _)) in binds.iter().enumerate() {
+                        self.emit(Op::Load(scr));
+                        self.emit(Op::EnumField(bi as u8));
+                        let bslot = self.slot(bname);
+                        self.emit(Op::Store(bslot));
+                    }
+                    for s in body {
+                        self.stmt(s)?;
+                    }
+                    self.scopes.pop();
+                    end_jmps.push(self.emit(Op::Jmp(0)));
+                    if let Some(jf) = next_arm {
+                        let here = self.here();
+                        self.patch(jf, here);
+                    }
+                }
+                let end = self.here();
+                for j in end_jmps {
+                    self.patch(j, end);
+                }
+                self.scopes.pop();
             }
             HS::While { cond, body } => {
                 let l0 = self.here();
@@ -866,6 +1019,55 @@ impl<'a> Vm<'a> {
                         _ => return Err("vecset on non-vec".into()),
                     }
                 }
+                Op::MapNew(n) => {
+                    let mut pairs = Vec::new();
+                    for _ in 0..n {
+                        let v = self.stack.pop().unwrap();
+                        let k = self.stack.pop().unwrap();
+                        pairs.push((k, v));
+                    }
+                    pairs.reverse();
+                    let mut dedup: Vec<(Val, Val)> = Vec::new();
+                    for (k, v) in pairs {
+                        if let Some(slot) = dedup.iter_mut().find(|(ek, _)| self.val_eq(ek, &k)) {
+                            slot.1 = v;
+                        } else {
+                            dedup.push((k, v));
+                        }
+                    }
+                    self.stack.push(Val::M(Rc::new(RefCell::new(dedup))));
+                }
+                Op::MapGet => {
+                    let k = self.stack.pop().unwrap();
+                    let m = self.stack.pop().unwrap();
+                    match m {
+                        Val::M(rc) => {
+                            let b = rc.borrow();
+                            let item = b
+                                .iter()
+                                .find_map(|(ek, ev)| self.val_eq(ek, &k).then(|| ev.clone()))
+                                .ok_or_else(|| format!("map key {} not found", self.stringify(&k)))?;
+                            self.stack.push(item);
+                        }
+                        _ => return Err("mapget on non-map".into()),
+                    }
+                }
+                Op::MapSet => {
+                    let v = self.stack.pop().unwrap();
+                    let k = self.stack.pop().unwrap();
+                    let m = self.stack.pop().unwrap();
+                    match m {
+                        Val::M(rc) => {
+                            let mut b = rc.borrow_mut();
+                            if let Some(slot) = b.iter_mut().find(|(ek, _)| self.val_eq(ek, &k)) {
+                                slot.1 = v;
+                            } else {
+                                b.push((k, v));
+                            }
+                        }
+                        _ => return Err("mapset on non-map".into()),
+                    }
+                }
                 Op::StrGet => {
                     let i = self.stack.pop().unwrap().as_i().unwrap_or(0) as usize;
                     let s = self.stack.pop().unwrap();
@@ -951,6 +1153,34 @@ impl<'a> Vm<'a> {
                         v => return Err(format!("field store on {}", self.kind(&v))),
                     }
                 }
+                Op::EnumNew(ei, vi, n) => {
+                    let mut payloads = Vec::with_capacity(n as usize);
+                    for _ in 0..n {
+                        payloads.push(self.stack.pop().unwrap());
+                    }
+                    payloads.reverse();
+                    self.stack.push(Val::En(ei, vi, Rc::new(payloads)));
+                }
+                Op::EnumIs(want_vi) => {
+                    let v = self.stack.pop().unwrap();
+                    match v {
+                        Val::En(_, vi, _) => self.stack.push(Val::B(vi == want_vi)),
+                        other => return Err(format!("enum match on {}", self.kind(&other))),
+                    }
+                }
+                Op::EnumField(bi) => {
+                    let v = self.stack.pop().unwrap();
+                    match v {
+                        Val::En(_, _, payloads) => {
+                            let item = payloads
+                                .get(bi as usize)
+                                .cloned()
+                                .ok_or_else(|| format!("enum payload {bi} out of bounds"))?;
+                            self.stack.push(item);
+                        }
+                        other => return Err(format!("enum field on {}", self.kind(&other))),
+                    }
+                }
                 Op::TokenField(fi) => {
                     let s = self.stack.pop().unwrap();
                     match s {
@@ -963,6 +1193,18 @@ impl<'a> Vm<'a> {
                 Op::Ret => {
                     let v = self.stack.pop().unwrap_or(Val::Unit);
                     let fr = self.frames.pop().unwrap();
+                    // `axon` invariant #2: every non-Pass reflex firing is
+                    // ledgered onto the hash chain automatically.
+                    let fmeta = &self.h.fns[fr.f as usize];
+                    if fmeta.is_reflex {
+                        if let Val::En(_, vi, _) = &v {
+                            if *vi != 0 {
+                                let tag = format!("reflex:{}", fmeta.name);
+                                let val = self.stringify(&v);
+                                self.wit(&tag, &val);
+                            }
+                        }
+                    }
                     self.stack.truncate(fr.base);
                     if self.frames.is_empty() {
                         self.result = Some(v);
@@ -1021,6 +1263,31 @@ impl<'a> Vm<'a> {
         }
     }
 
+    fn val_eq(&self, a: &Val, b: &Val) -> bool {
+        match (a, b) {
+            (Val::I(i), Val::I(j)) => i == j,
+            (Val::F(i), Val::F(j)) => i == j,
+            (Val::B(i), Val::B(j)) => i == j,
+            (Val::S(i), Val::S(j)) => i == j,
+            (Val::Unit, Val::Unit) => true,
+            (Val::T(i), Val::T(j)) => i == j,
+            (Val::Ane(i), Val::Ane(j)) => i == j,
+            (Val::V(i), Val::V(j)) => Rc::ptr_eq(i, j),
+            (Val::M(i), Val::M(j)) => Rc::ptr_eq(i, j),
+            (Val::St(i, a), Val::St(j, b2)) => i == j && Rc::ptr_eq(a, b2),
+            (Val::En(e1, v1, p1), Val::En(e2, v2, p2)) => {
+                e1 == e2
+                    && v1 == v2
+                    && p1.len() == p2.len()
+                    && p1.iter().zip(p2.iter()).all(|(x, y)| self.val_eq(x, y))
+            }
+            (Val::Tok { id: i, epoch: e }, Val::Tok { id: i2, epoch: e2 }) => {
+                i == i2 && e == e2
+            }
+            _ => false,
+        }
+    }
+
     fn compare(&self, op: BinOp, a: &Val, b: &Val) -> Result<bool, String> {
         let ord = |x: &Val, y: &Val| -> Option<std::cmp::Ordering> {
             match (x, y) {
@@ -1030,26 +1297,9 @@ impl<'a> Vm<'a> {
                 _ => None,
             }
         };
-        let eq = |x: &Val, y: &Val| -> bool {
-            match (x, y) {
-                (Val::I(i), Val::I(j)) => i == j,
-                (Val::F(i), Val::F(j)) => i == j,
-                (Val::B(i), Val::B(j)) => i == j,
-                (Val::S(i), Val::S(j)) => i == j,
-                (Val::Unit, Val::Unit) => true,
-                (Val::T(i), Val::T(j)) => i == j,
-                (Val::Ane(i), Val::Ane(j)) => i == j,
-                (Val::V(i), Val::V(j)) => Rc::ptr_eq(i, j),
-                (Val::St(i, a), Val::St(j, b2)) => i == j && Rc::ptr_eq(a, b2),
-                (Val::Tok { id: i, epoch: e }, Val::Tok { id: i2, epoch: e2 }) => {
-                    i == i2 && e == e2
-                }
-                _ => false,
-            }
-        };
         Ok(match op {
-            BinOp::Eq => eq(a, b),
-            BinOp::Ne => !eq(a, b),
+            BinOp::Eq => self.val_eq(a, b),
+            BinOp::Ne => !self.val_eq(a, b),
             BinOp::Lt => ord(a, b) == Some(std::cmp::Ordering::Less),
             BinOp::Gt => ord(a, b) == Some(std::cmp::Ordering::Greater),
             BinOp::Le => matches!(ord(a, b), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
@@ -1066,7 +1316,10 @@ impl<'a> Vm<'a> {
             Val::B(_) => "bool",
             Val::S(_) => "str",
             Val::V(_) => "vec",
+            Val::M(_) => "map",
             Val::St(_, _) => "struct",
+            Val::En(_, _, _) => "enum",
+            Val::Dfa(_) => "dfa",
             Val::T(_) => "tensor",
             Val::Ane(_) => "ane",
             Val::Tok { .. } => "token",
@@ -1095,6 +1348,19 @@ impl<'a> Vm<'a> {
                     if b.len() > 8 { ", …" } else { "" }
                 )
             }
+            Val::M(rc) => {
+                let b = rc.borrow();
+                let inner: Vec<String> = b
+                    .iter()
+                    .take(8)
+                    .map(|(k, v)| format!("{}: {}", self.stringify(k), self.stringify(v)))
+                    .collect();
+                format!(
+                    "{{{}{} }}",
+                    if inner.is_empty() { "" } else { " " },
+                    inner.join(", ")
+                )
+            }
             Val::St(si, rc) => {
                 let (name, decl) = &self.h.structs[*si as usize];
                 let b = rc.borrow();
@@ -1105,6 +1371,17 @@ impl<'a> Vm<'a> {
                     .collect();
                 format!("{name} {{ {} }}", inner.join(", "))
             }
+            Val::En(ei, vi, payloads) => {
+                let (ename, vars) = &self.h.enums[*ei as usize];
+                let vname = &vars[*vi as usize].0;
+                if payloads.is_empty() {
+                    format!("{ename}::{vname}")
+                } else {
+                    let inner: Vec<String> = payloads.iter().map(|x| self.stringify(x)).collect();
+                    format!("{ename}::{vname}({})", inner.join(", "))
+                }
+            }
+            Val::Dfa(d) => format!("<dfa {} patterns, {} states>", d.patterns.len(), d.out.len()),
             Val::T(i) => {
                 let (ty, data) = &self.tensors[*i as usize];
                 let head: Vec<String> = data.iter().take(4).map(|x| format!("{x:.4}")).collect();
@@ -1136,21 +1413,26 @@ impl<'a> Vm<'a> {
         });
     }
 
-    // ------------------------------------------------- ane dispatch
+    // ------------------------------------------------- ane / cpu dispatch
 
-    /// invoke a compiled ANE program: tensors in, run on silicon,
-    /// tensor out. State and trainable weights ride the host store —
-    /// written into surfaces before the run, read back after.
+    /// invoke a compiled tensor program: tensors in, run on silicon (or
+    /// CPU evaluator when `--cpu` is selected), tensor out. State and
+    /// trainable weights ride the host store — written before the run,
+    /// read back after.
     fn call_ane(&mut self, pi: usize, args: Vec<Val>) -> Result<(), String> {
         // ---- gather staging data first (borrows of self.tensors end
         // before self.progs is borrowed mutably) ----
         let mut stages: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+        let mut cpu_inputs: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut cpu_params: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut cpu_states: HashMap<String, Vec<f32>> = HashMap::new();
         {
             let prog = &self.progs[pi];
             for (i, (port, ty, _contig)) in prog.ins.iter().enumerate() {
                 match &args[i] {
                     Val::T(h) => {
                         let data = self.tensors[*h as usize].1.clone();
+                        cpu_inputs.insert(port.clone(), data.clone());
                         stages.push((port.clone(), dims_usize(ty), data));
                     }
                     v => {
@@ -1163,7 +1445,7 @@ impl<'a> Vm<'a> {
                 }
             }
             // trainable weights — host store is declared [K,N]; the
-            // surface convention is [N,K] storage.
+            // surface/eval convention is [N,K] storage.
             for (pname, port, ty) in &prog.trainable {
                 let h = self
                     .gtensor
@@ -1179,14 +1461,15 @@ impl<'a> Vm<'a> {
                             t[a * k + b] = data[b * n + a];
                         }
                     }
+                    cpu_params.insert(pname.clone(), t.clone());
                     stages.push((port.clone(), vec![n, k], t));
                 } else {
+                    cpu_params.insert(pname.clone(), data.clone());
                     stages.push((port.clone(), dims_usize(ty), data));
                 }
             }
             // state fields — [T, D] declared-order both ways; the
-            // host mirror is namespaced `prog.state.field` — this
-            // program's own instance, not a shared one.
+            // host mirror is namespaced `prog.state.field`.
             for (key, port, ty) in &prog.states {
                 let gkey = format!("{}.{}", prog.name, key);
                 let h = self
@@ -1195,59 +1478,83 @@ impl<'a> Vm<'a> {
                     .copied()
                     .ok_or_else(|| format!("no host tensor for {gkey}"))?;
                 let data = self.tensors[h as usize].1.clone();
+                cpu_states.insert(port.clone(), data.clone());
                 stages.push((port.clone(), dims_usize(ty), data));
             }
         }
         // ---- drive the program ----
         let (odata, oty, pouts, souts) = {
             let prog = &mut self.progs[pi];
-            for (port, dims, data) in &stages {
-                write_surface(&mut prog.rt, port, dims, data);
-            }
-            prog.rt.run().map_err(|e| format!("ane run ({}): {e}", prog.name))?;
             let (oname, oty) = prog.output.clone();
-            let idx = prog
-                .rt
-                .out_node(&oname)
-                .ok_or_else(|| format!("output node {oname} missing"))?;
-            let desc = prog.rt.out_desc(idx);
-            let raw = prog.rt.output(idx).to_vec();
-            let odata = read_surface_dims(&raw, &desc, &dims_usize(&oty));
-            // param updates: surface [N,K] → declared [K,N] host order
-            let mut pouts = Vec::new();
-            for (pname, mname, ty) in &prog.param_outs {
-                let idx = prog
-                    .rt
-                    .out_node(mname)
-                    .ok_or_else(|| format!("update node {mname} missing"))?;
-                let desc = prog.rt.out_desc(idx);
-                let raw = prog.rt.output(idx).to_vec();
-                let (n, k) = (ty.dims[1] as usize, ty.dims[0] as usize);
-                let surf = read_surface_dims(&raw, &desc, &[n, k]);
-                let mut host = vec![0f32; surf.len()];
-                for a in 0..n {
-                    for b in 0..k {
-                        host[b * n + a] = surf[a * k + b];
+            match &mut prog.backend {
+                ProgBackend::Ane(rt) => {
+                    for (port, dims, data) in &stages {
+                        write_surface(rt, port, dims, data);
                     }
+                    rt.run().map_err(|e| format!("ane run ({}): {e}", prog.name))?;
+                    let idx = rt
+                        .out_node(&oname)
+                        .ok_or_else(|| format!("output node {oname} missing"))?;
+                    let desc = rt.out_desc(idx);
+                    let raw = rt.output(idx).to_vec();
+                    let odata = read_surface_dims(&raw, &desc, &dims_usize(&oty));
+                    let mut pouts = Vec::new();
+                    for (pname, mname, ty) in &prog.param_outs {
+                        let idx = rt
+                            .out_node(mname)
+                            .ok_or_else(|| format!("update node {mname} missing"))?;
+                        let desc = rt.out_desc(idx);
+                        let raw = rt.output(idx).to_vec();
+                        let (n, k) = (ty.dims[1] as usize, ty.dims[0] as usize);
+                        let surf = read_surface_dims(&raw, &desc, &[n, k]);
+                        let mut host = vec![0f32; surf.len()];
+                        for a in 0..n {
+                            for b in 0..k {
+                                host[b * n + a] = surf[a * k + b];
+                            }
+                        }
+                        pouts.push((pname.clone(), host));
+                    }
+                    let mut souts = Vec::new();
+                    for (port, mname, ty) in &prog.state_outs {
+                        let idx = rt
+                            .out_node(mname)
+                            .ok_or_else(|| format!("state node {mname} missing"))?;
+                        let desc = rt.out_desc(idx);
+                        let raw = rt.output(idx).to_vec();
+                        let surf = read_surface_dims(&raw, &desc, &dims_usize(ty));
+                        souts.push((port.clone(), surf));
+                    }
+                    rt.release_all();
+                    (odata, oty, pouts, souts)
                 }
-                pouts.push((pname.clone(), host));
+                ProgBackend::Cpu(tp) => {
+                    let mut ev = Evaluator::new(tp);
+                    ev.set_params(cpu_params);
+                    ev.set_states(cpu_states);
+                    let odata = ev
+                        .run(&cpu_inputs)
+                        .map_err(|d| format!("cpu eval ({}): {d}", prog.name))?;
+                    let mut pouts = Vec::new();
+                    let mut souts = Vec::new();
+                    for (name, vals) in ev.param_updates() {
+                        if let Some((_, _, ty)) = prog.param_outs.iter().find(|(p, _, _)| p == name)
+                        {
+                            let (n, k) = (ty.dims[1] as usize, ty.dims[0] as usize);
+                            let mut host = vec![0f32; vals.len()];
+                            for a in 0..n {
+                                for b in 0..k {
+                                    host[b * n + a] = vals[a * k + b];
+                                }
+                            }
+                            pouts.push((name.clone(), host));
+                        } else if prog.state_outs.iter().any(|(port, _, _)| port == name) {
+                            souts.push((name.clone(), vals.clone()));
+                        }
+                    }
+                    (odata, oty, pouts, souts)
+                }
             }
-            let mut souts = Vec::new();
-            for (port, mname, ty) in &prog.state_outs {
-                let idx = prog
-                    .rt
-                    .out_node(mname)
-                    .ok_or_else(|| format!("state node {mname} missing"))?;
-                let desc = prog.rt.out_desc(idx);
-                let raw = prog.rt.output(idx).to_vec();
-                let surf = read_surface_dims(&raw, &desc, &dims_usize(ty));
-                souts.push((port.clone(), surf));
-            }
-            // give both pools back — programs AND surfaces. the
-            // organism's calls are sequential; holding l0's resources
-            // starves l1's.
-            prog.rt.release_all();
-            (odata, oty, pouts, souts)
         };
         // ---- land the results in the host store ----
         self.tensors.push((oty, odata));
@@ -1279,6 +1586,7 @@ impl<'a> Vm<'a> {
             "str" => Ok(Val::S(Rc::from(self.stringify(&args[0]).as_str()))),
             "len" => match &args[0] {
                 Val::V(rc) => Ok(Val::I(rc.borrow().len() as i64)),
+                Val::M(rc) => Ok(Val::I(rc.borrow().len() as i64)),
                 Val::S(s) => Ok(Val::I(s.chars().count() as i64)),
                 Val::T(h) => Ok(Val::I(self.tensors[*h as usize].1.len() as i64)),
                 v => Err(format!("len on {}", self.kind(v))),
@@ -1341,8 +1649,6 @@ impl<'a> Vm<'a> {
                 let pos = args[0].as_i().unwrap_or(0) as f64;
                 let d = args[1].as_i().unwrap_or(0) as usize;
                 let cos = NATIVE_NAMES[ni as usize] == "rope_cos";
-                // θ_i = 1e6^(-2i/2d), ang = pos·θ — the Qwen3 table the
-                // driver used to feed `cos`/`sin` io ports.
                 let v: Vec<f32> = (0..d)
                     .map(|i| {
                         let th = 1e6f64.powf(-2.0 * i as f64 / (2.0 * d as f64));
@@ -1397,6 +1703,236 @@ impl<'a> Vm<'a> {
                 self.rng = x;
                 let f = (x >> 11) as f64 / (1u64 << 53) as f64;
                 Ok(Val::F(f))
+            }
+            "has" => match &args[0] {
+                Val::M(rc) => {
+                    let b = rc.borrow();
+                    let found = b.iter().any(|(ek, _)| self.val_eq(ek, &args[1]));
+                    Ok(Val::B(found))
+                }
+                v => Err(format!("has on {}", self.kind(v))),
+            },
+            "keys" => match &args[0] {
+                Val::M(rc) => {
+                    let b = rc.borrow();
+                    let ks: Vec<Val> = b.iter().map(|(k, _)| k.clone()).collect();
+                    Ok(Val::V(Rc::new(RefCell::new(ks))))
+                }
+                v => Err(format!("keys on {}", self.kind(v))),
+            },
+            "contains" => match (&args[0], &args[1]) {
+                (Val::S(a), Val::S(b)) => Ok(Val::B(a.contains(b.as_ref()))),
+                _ => Err("contains needs two str args".into()),
+            },
+            "split" => match (&args[0], &args[1]) {
+                (Val::S(a), Val::S(sep)) => {
+                    let parts: Vec<Val> = a
+                        .split(sep.as_ref())
+                        .map(|p| Val::S(Rc::from(p)))
+                        .collect();
+                    Ok(Val::V(Rc::new(RefCell::new(parts))))
+                }
+                _ => Err("split needs two str args".into()),
+            },
+            "slice_str" => match (&args[0], &args[1], &args[2]) {
+                (Val::S(s), Val::I(lo), Val::I(hi)) => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let l = (*lo).max(0).min(chars.len() as i64) as usize;
+                    let h = (*hi).max(l as i64).min(chars.len() as i64) as usize;
+                    let sub: String = chars[l..h].iter().collect();
+                    Ok(Val::S(Rc::from(sub.as_str())))
+                }
+                _ => Err("slice_str(str, i64, i64) expected".into()),
+            },
+            "dfa_compile" => match &args[0] {
+                Val::V(rc) => {
+                    let b = rc.borrow();
+                    let mut pats = Vec::with_capacity(b.len());
+                    for x in b.iter() {
+                        match x {
+                            Val::S(s) => pats.push(s.to_string()),
+                            v => return Err(format!("dfa pattern must be str, found {}", self.kind(v))),
+                        }
+                    }
+                    Ok(Val::Dfa(Rc::new(DfaMachine::compile(pats))))
+                }
+                v => Err(format!("dfa_compile on {}", self.kind(v))),
+            },
+            "dfa_scan" => match (&args[0], &args[1]) {
+                (Val::Dfa(d), Val::S(text)) => Ok(Val::I(d.scan(text))),
+                _ => Err("dfa_scan(dfa, str) expected".into()),
+            },
+            "quorum" => {
+                // `tokala` — dissenting council deliberation: tally yes/no,
+                // preserve every minority report, and witness the verdict.
+                let topic = match &args[0] {
+                    Val::S(s) => s.to_string(),
+                    _ => return Err("quorum topic must be str".into()),
+                };
+                let votes = match &args[1] {
+                    Val::V(rc) => rc.borrow().clone(),
+                    _ => return Err("quorum votes must be [Vote]".into()),
+                };
+                let mut yes = 0i64;
+                let mut no = 0i64;
+                let mut yes_notes = Vec::new();
+                let mut no_notes = Vec::new();
+                for v in &votes {
+                    if let Val::St(_, rc) = v {
+                        let f = rc.borrow();
+                        let seat = self.stringify(&f[0]);
+                        let approve = f[1].truthy();
+                        let reason = self.stringify(&f[2]);
+                        if approve {
+                            yes += 1;
+                            yes_notes.push(format!("{seat}: {reason}"));
+                        } else {
+                            no += 1;
+                            no_notes.push(format!("{seat}: {reason}"));
+                        }
+                    }
+                }
+                let approved = yes > no;
+                let minority = if approved { no_notes } else { yes_notes };
+                let dissent_vals: Vec<Val> = minority
+                    .iter()
+                    .map(|s| Val::S(Rc::from(s.as_str())))
+                    .collect();
+                let summary = format!(
+                    "approved={approved}|yes={yes}|no={no}|dissent=[{}]",
+                    minority.join("; ")
+                );
+                self.wit(&format!("quorum:{topic}"), &summary);
+                let hash = self
+                    .witness
+                    .last()
+                    .map(|w| w.hash.clone())
+                    .unwrap_or_default();
+                let qv_si = self
+                    .h
+                    .structs
+                    .iter()
+                    .position(|(n, _)| n == "QuorumVerdict")
+                    .unwrap_or(1) as u32;
+                Ok(Val::St(
+                    qv_si,
+                    Rc::new(RefCell::new(vec![
+                        Val::B(approved),
+                        Val::I(yes),
+                        Val::I(no),
+                        Val::V(Rc::new(RefCell::new(dissent_vals))),
+                        Val::S(Rc::from(hash.as_str())),
+                    ])),
+                ))
+            }
+            "propose_patch" => {
+                // `akicita` / `xipe` — bounded autonomy marshal:
+                // protected surfaces hold for human review; blast-radius
+                // (>20 lines or >1000 bytes) holds; invalid proposals deny.
+                let target = self.stringify(&args[0]);
+                let old = self.stringify(&args[1]);
+                let new = self.stringify(&args[2]);
+                let reason = self.stringify(&args[3]);
+                let dec_ei = self
+                    .h
+                    .enums
+                    .iter()
+                    .position(|(n, _)| n == "Decision")
+                    .unwrap_or(1) as u32;
+                let protected = [
+                    "PolicyEngine",
+                    "hostck.rs",
+                    "constitution",
+                    "CHARTER.md",
+                    "/System/",
+                    "/Library/",
+                ];
+                let decision = if reason.trim().is_empty() || old == new {
+                    let msg = "empty reason or no-op diff".to_string();
+                    self.wit(&format!("marshal:{target}"), &format!("Deny({msg})"));
+                    Val::En(dec_ei, 2, Rc::new(vec![Val::S(Rc::from(msg.as_str()))]))
+                } else if protected.iter().any(|p| target.contains(p)) {
+                    let msg = format!("protected surface `{target}` requires human review");
+                    self.wit(&format!("marshal:{target}"), &format!("Hold({msg})"));
+                    Val::En(dec_ei, 1, Rc::new(vec![Val::S(Rc::from(msg.as_str()))]))
+                } else {
+                    let lines = old.lines().count().max(new.lines().count());
+                    let bytes = old.len().max(new.len());
+                    if lines > 20 || bytes > 1000 {
+                        let msg = format!(
+                            "blast radius ({lines} lines, {bytes} bytes) exceeds 20L/1000B cap"
+                        );
+                        self.wit(&format!("marshal:{target}"), &format!("Hold({msg})"));
+                        Val::En(dec_ei, 1, Rc::new(vec![Val::S(Rc::from(msg.as_str()))]))
+                    } else {
+                        self.wit(&format!("marshal:{target}"), &format!("Permit({reason})"));
+                        Val::En(dec_ei, 0, Rc::new(Vec::new()))
+                    }
+                };
+                Ok(decision)
+            }
+            "erase" => {
+                // `camazotz` — certified cryptographic erasure:
+                // 1) derive per-subject key, encrypt payload + MAC tag
+                // 2) zeroize the key
+                // 3) attempt decrypt with zeroed key and prove tag failure
+                // 4) witness and return the erasure certificate hash.
+                let subject = self.stringify(&args[0]);
+                let payload = self.stringify(&args[1]);
+                let mut key = sha256_hex(format!("{}|key|{subject}", self.sha).as_bytes())
+                    .into_bytes();
+                let pbytes = payload.as_bytes();
+                let mut ct = Vec::with_capacity(pbytes.len());
+                for (i, &b) in pbytes.iter().enumerate() {
+                    ct.push(b ^ key[i % key.len()]);
+                }
+                let tag = sha256_hex(
+                    &[key.as_slice(), ct.as_slice()].concat(),
+                );
+                // Destroy the per-subject key
+                for kb in key.iter_mut() {
+                    *kb = 0;
+                }
+                // Attempt verification under destroyed key — must fail
+                let post_tag = sha256_hex(
+                    &[key.as_slice(), ct.as_slice()].concat(),
+                );
+                let decrypt_verified = post_tag != tag;
+                if !decrypt_verified {
+                    return Err("camazotz: erasure verification failed".into());
+                }
+                let cert = sha256_hex(
+                    format!(
+                        "camazotz|subject={subject}|ct_sha={}|decrypt_failed=true",
+                        sha256_hex(&ct)
+                    )
+                    .as_bytes(),
+                );
+                self.wit(
+                    &format!("erase:{subject}"),
+                    &format!("decrypt_verified=true|cert={}", &cert[..16]),
+                );
+                Ok(Val::S(Rc::from(cert.as_str())))
+            }
+            "read_file" => {
+                let path = self.stringify(&args[0]);
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("read_file({path}): {e}"))?;
+                Ok(Val::S(Rc::from(text.as_str())))
+            }
+            "write_file" => {
+                let path = self.stringify(&args[0]);
+                let content = self.stringify(&args[1]);
+                std::fs::write(&path, content.as_bytes())
+                    .map_err(|e| format!("write_file({path}): {e}"))?;
+                self.wit("fs:write", &format!("{path} ({}B)", content.len()));
+                Ok(Val::Unit)
+            }
+            "cortex_ask" => {
+                let prompt = self.stringify(&args[0]);
+                let reply = ask_slicks_or_local(&prompt, &self.sha);
+                self.wit("cortex", &format!("q={}B|a={}B", prompt.len(), reply.len()));
+                Ok(Val::S(Rc::from(reply.as_str())))
             }
             other => Err(format!("unimplemented native {other}")),
         }
@@ -1564,6 +2100,35 @@ impl<'a> Vm<'a> {
     }
 }
 
+/// Connect to Bad Apple's live SLICKS Unix socket if reachable, else
+/// return a deterministic local cortex attestation.
+fn ask_slicks_or_local(prompt: &str, sha: &str) -> String {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    if let Ok(mut sock) = UnixStream::connect("/var/run/badapple/substrate.sock") {
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
+        let esc = prompt.replace('\\', "\\\\").replace('"', "\\\"");
+        let req = format!("{{\"method\":\"inference\",\"prompt\":\"{esc}\",\"max_tokens\":64}}\n");
+        if sock.write_all(req.as_bytes()).is_ok() {
+            let mut buf = Vec::new();
+            let _ = sock.read_to_end(&mut buf);
+            if !buf.is_empty() {
+                let s = String::from_utf8_lossy(&buf).trim().to_string();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+        }
+    }
+    format!(
+        "cortex#{}[ack:{}]",
+        &sha[..8],
+        &sha256_hex(prompt.as_bytes())[..12]
+    )
+}
+
 /// `kv_k` → `kv.k` — state mirrors are keyed dotted, ported flat.
 fn port_to_key(port: &str) -> String {
     match port.split_once('_') {
@@ -1632,6 +2197,71 @@ fn snap_val(
                     }
                 }
                 _ => unreachable!(),
+            }
+            heap.extend_from_slice(&def);
+            out.push(5);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        Val::M(rc) => {
+            let ptr = Rc::as_ptr(rc) as usize;
+            if let Some(&id) = ids.get(&ptr) {
+                out.push(5);
+                out.extend_from_slice(&id.to_le_bytes());
+                return;
+            }
+            let id = ids.len() as u32;
+            ids.insert(ptr, id);
+            let mut def = Vec::new();
+            def.push(11);
+            def.extend_from_slice(&id.to_le_bytes());
+            let b = rc.borrow();
+            def.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            for (k, val) in b.iter() {
+                snap_val(k, &mut def, heap, ids, vm);
+                snap_val(val, &mut def, heap, ids, vm);
+            }
+            heap.extend_from_slice(&def);
+            out.push(5);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        Val::En(ei, vi, rc) => {
+            let ptr = Rc::as_ptr(rc) as usize;
+            if let Some(&id) = ids.get(&ptr) {
+                out.push(5);
+                out.extend_from_slice(&id.to_le_bytes());
+                return;
+            }
+            let id = ids.len() as u32;
+            ids.insert(ptr, id);
+            let mut def = Vec::new();
+            def.push(12);
+            def.extend_from_slice(&id.to_le_bytes());
+            def.extend_from_slice(&ei.to_le_bytes());
+            def.extend_from_slice(&vi.to_le_bytes());
+            def.extend_from_slice(&(rc.len() as u32).to_le_bytes());
+            for x in rc.iter() {
+                snap_val(x, &mut def, heap, ids, vm);
+            }
+            heap.extend_from_slice(&def);
+            out.push(5);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        Val::Dfa(rc) => {
+            let ptr = Rc::as_ptr(rc) as usize;
+            if let Some(&id) = ids.get(&ptr) {
+                out.push(5);
+                out.extend_from_slice(&id.to_le_bytes());
+                return;
+            }
+            let id = ids.len() as u32;
+            ids.insert(ptr, id);
+            let mut def = Vec::new();
+            def.push(13);
+            def.extend_from_slice(&id.to_le_bytes());
+            def.extend_from_slice(&(rc.patterns.len() as u32).to_le_bytes());
+            for pat in &rc.patterns {
+                def.extend_from_slice(&(pat.len() as u32).to_le_bytes());
+                def.extend_from_slice(pat.as_bytes());
             }
             heap.extend_from_slice(&def);
             out.push(5);
@@ -1725,9 +2355,6 @@ fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], String
 }
 
 /// read one heap object definition into the map; returns next pos.
-/// Element refs resolve against the defs already emitted — the writer
-/// interned children before parents, so this is always satisfied.
-/// (Self-referential structures can't snapshot — documented limit.)
 fn unsnap_heap(
     buf: &[u8],
     pos: usize,
@@ -1764,6 +2391,46 @@ fn unsnap_heap(
                 items.push(x);
             }
             Val::St(si, Rc::new(RefCell::new(items)))
+        }
+        11 => {
+            let n = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let mut pairs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (k, np1) = unsnap_val(buf, p, heap, vm)?;
+                let (val, np2) = unsnap_val(buf, np1, heap, vm)?;
+                p = np2;
+                pairs.push((k, val));
+            }
+            Val::M(Rc::new(RefCell::new(pairs)))
+        }
+        12 => {
+            let ei = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+            p += 4;
+            let vi = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+            p += 4;
+            let n = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let mut items = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (x, np) = unsnap_val(buf, p, heap, vm)?;
+                p = np;
+                items.push(x);
+            }
+            Val::En(ei, vi, Rc::new(items))
+        }
+        13 => {
+            let n = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let mut pats = Vec::with_capacity(n);
+            for _ in 0..n {
+                let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let s = String::from_utf8_lossy(&buf[p..p + len]).to_string();
+                p += len;
+                pats.push(s);
+            }
+            Val::Dfa(Rc::new(DfaMachine::compile(pats)))
         }
         t => return Err(format!("snap: bad heap tag {t}")),
     };

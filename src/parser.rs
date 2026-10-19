@@ -78,8 +78,8 @@ impl P {
         Ok(sp(Ty { dt, dims }, l, c))
     }
 
-    /// host-stratum type: `i64` `f64` `bool` `str` `token` `unit`,
-    /// `[T]` vec, `Name` struct, `f16[N]` tensor handle,
+    /// host-stratum type: `i64` `f64` `bool` `str` `token` `dfa` `unit`,
+    /// `[T]` vec, `{K: V}` map, `Name` struct/enum, `f16[N]` tensor handle,
     /// `ane(t, t) -> r` program value.
     fn hty(&mut self) -> CResult<Sp<HTy>> {
         let (l, c) = self.at();
@@ -89,12 +89,20 @@ impl P {
                 self.expect(&Tok::RBracket)?;
                 HTy::Vec(Box::new(inner.v))
             }
+            Tok::LBrace => {
+                let kt = self.hty()?;
+                self.expect(&Tok::Colon)?;
+                let vt = self.hty()?;
+                self.expect(&Tok::RBrace)?;
+                HTy::Map(Box::new(kt.v), Box::new(vt.v))
+            }
             Tok::Ident(s) => match s.as_str() {
                 "i64" => HTy::I64,
                 "f64" => HTy::F64,
                 "bool" => HTy::Bool,
                 "str" => HTy::Str,
                 "token" => HTy::Token,
+                "dfa" => HTy::Dfa,
                 "unit" => HTy::Unit,
                 "ane" => {
                     self.expect(&Tok::LParen)?;
@@ -311,8 +319,37 @@ impl P {
                 self.expect(&Tok::RBracket)?;
                 Ok(sp(Expr::VecLit(items), l, c))
             }
+            Tok::LBrace => {
+                let mut items = Vec::new();
+                if self.peek() != &Tok::RBrace {
+                    loop {
+                        let k = self.expr()?;
+                        self.expect(&Tok::Colon)?;
+                        let v = self.expr()?;
+                        items.push((k, v));
+                        if self.eat(&Tok::Comma) {
+                            if self.peek() == &Tok::RBrace {
+                                break;
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(&Tok::RBrace)?;
+                Ok(sp(Expr::MapLit(items), l, c))
+            }
             Tok::Ident(s) => {
-                if self.peek() == &Tok::LBrace {
+                let is_struct_lit = self.peek() == &Tok::LBrace
+                    && !s.contains("::")
+                    && matches!(
+                        (
+                            self.t.get(self.i + 1).map(|x| &x.tok),
+                            self.t.get(self.i + 2).map(|x| &x.tok),
+                        ),
+                        (Some(Tok::Ident(_)), Some(Tok::Colon))
+                    );
+                if is_struct_lit {
                     // `Name { f: e, ... }` — a struct literal
                     self.bump();
                     let mut fields = Vec::new();
@@ -383,12 +420,60 @@ impl P {
     fn stmt(&mut self, host: bool) -> CResult<Sp<Stmt>> {
         let (l, c) = self.at();
         match self.peek().clone() {
-            Tok::If | Tok::While | Tok::For | Tok::Break | Tok::Continue if !host => {
+            Tok::If | Tok::Match | Tok::While | Tok::For | Tok::Break | Tok::Continue if !host => {
                 diag(
                     "control flow is host-stratum — wrap it in `host fn`",
                     l,
                     c,
                 )
+            }
+            Tok::Match => {
+                self.bump();
+                let expr = self.expr()?;
+                self.expect(&Tok::LBrace)?;
+                let mut arms = Vec::new();
+                while self.peek() != &Tok::RBrace && self.peek() != &Tok::Eof {
+                    let (pl, pc) = self.at();
+                    let pat = match self.bump() {
+                        Tok::Ident(s) if s == "_" => Pat::Wildcard(pl, pc),
+                        Tok::Ident(s) => {
+                            let mut binds = Vec::new();
+                            if self.eat(&Tok::LParen) {
+                                if self.peek() != &Tok::RParen {
+                                    loop {
+                                        binds.push(self.ident()?);
+                                        if self.eat(&Tok::Comma) {
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                }
+                                self.expect(&Tok::RParen)?;
+                            }
+                            Pat::Variant {
+                                name: sp(s, pl, pc),
+                                binds,
+                            }
+                        }
+                        t => {
+                            return diag(
+                                format!("expected pattern (`Enum::Variant` or `_`), found {t:?}"),
+                                pl,
+                                pc,
+                            )
+                        }
+                    };
+                    self.expect(&Tok::FatArrow)?;
+                    let body = if self.peek() == &Tok::LBrace {
+                        self.block(host)?
+                    } else {
+                        vec![self.stmt(host)?]
+                    };
+                    self.eat(&Tok::Comma);
+                    arms.push((pat, body));
+                }
+                self.expect(&Tok::RBrace)?;
+                Ok(sp(Stmt::Match { expr, arms }, l, c))
             }
             Tok::If => {
                 self.bump();
@@ -551,11 +636,19 @@ impl P {
         Ok(sp(Fn { name, dims, args, ret, body }, l, c))
     }
 
-    /// `host fn name(arg: hty, ...) -> hty { stmt* }` — the organism
-    /// stratum. Full statements; calls ANE programs as values.
-    fn host_fn_decl(&mut self) -> CResult<Sp<HFn>> {
+    /// `host [det|stoch] fn name(arg: hty, ...) [-> hty] [cap c1, c2] { stmt* }`
+    fn host_fn_decl(&mut self, pre_det: DetMode) -> CResult<Sp<HFn>> {
         let (l, c) = self.at(); // at `host`
         self.expect(&Tok::Host)?;
+        let det = if pre_det != DetMode::Auto {
+            pre_det
+        } else if self.eat(&Tok::Det) {
+            DetMode::Det
+        } else if self.eat(&Tok::Stoch) {
+            DetMode::Stoch
+        } else {
+            DetMode::Auto
+        };
         self.expect(&Tok::Fn)?;
         let name = self.ident()?.v;
         self.expect(&Tok::LParen)?;
@@ -574,8 +667,82 @@ impl P {
         }
         self.expect(&Tok::RParen)?;
         let ret = if self.eat(&Tok::Arrow) { Some(self.hty()?) } else { None };
+        let caps = if self.eat(&Tok::Cap) {
+            let mut cs = Vec::new();
+            if self.peek() != &Tok::LBrace {
+                cs.push(self.ident()?);
+                while self.eat(&Tok::Comma) {
+                    cs.push(self.ident()?);
+                }
+            }
+            Some(cs)
+        } else {
+            None
+        };
         let body = self.block(true)?;
-        Ok(sp(HFn { name, args, ret, body }, l, c))
+        Ok(sp(
+            HFn {
+                name,
+                args,
+                ret,
+                det,
+                caps,
+                is_reflex: false,
+                body,
+            },
+            l,
+            c,
+        ))
+    }
+
+    /// `reflex name(arg: hty, ...) [-> Reflex] { stmt* }` — an audited
+    /// sub-deliberative reflex arc (`axon`): statically forced to be
+    /// `det`, zero-capability (`caps = Some([])`), and returning `Reflex`.
+    fn reflex_decl(&mut self) -> CResult<Sp<HFn>> {
+        let (l, c) = self.at();
+        self.expect(&Tok::Reflex)?;
+        let name = self.ident()?.v;
+        self.expect(&Tok::LParen)?;
+        let mut args = Vec::new();
+        if self.peek() != &Tok::RParen {
+            loop {
+                let an = self.ident()?;
+                self.expect(&Tok::Colon)?;
+                let at = self.hty()?;
+                args.push((an, at));
+                if self.eat(&Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        let ret = if self.eat(&Tok::Arrow) {
+            Some(self.hty()?)
+        } else {
+            Some(sp(HTy::Struct("Reflex".into()), l, c))
+        };
+        if self.peek() == &Tok::Cap {
+            return diag(
+                "reflex declarations cannot hold capabilities — reflexes brake, never steer",
+                l,
+                c,
+            );
+        }
+        let body = self.block(true)?;
+        Ok(sp(
+            HFn {
+                name,
+                args,
+                ret,
+                det: DetMode::Det,
+                caps: Some(Vec::new()),
+                is_reflex: true,
+                body,
+            },
+            l,
+            c,
+        ))
     }
 
     pub fn program(&mut self) -> CResult<Program> {
@@ -584,8 +751,27 @@ impl P {
             let (l, c) = self.at();
             match self.peek().clone() {
                 Tok::Eof => break,
+                Tok::Import => {
+                    self.bump();
+                    let (sl, sc) = self.at();
+                    let path = match self.bump() {
+                        Tok::Str(s) => sp(s, sl, sc),
+                        t => return diag(format!("import expects a path string, found {t:?}"), sl, sc),
+                    };
+                    self.eat(&Tok::Semi);
+                    decls.push(Decl::Import(path));
+                }
                 Tok::Fn => decls.push(Decl::Fn(self.fn_decl()?)),
-                Tok::Host => decls.push(Decl::HostFn(self.host_fn_decl()?)),
+                Tok::Host => decls.push(Decl::HostFn(self.host_fn_decl(DetMode::Auto)?)),
+                Tok::Det => {
+                    self.bump();
+                    decls.push(Decl::HostFn(self.host_fn_decl(DetMode::Det)?));
+                }
+                Tok::Stoch => {
+                    self.bump();
+                    decls.push(Decl::HostFn(self.host_fn_decl(DetMode::Stoch)?));
+                }
+                Tok::Reflex => decls.push(Decl::HostFn(self.reflex_decl()?)),
                 Tok::Struct => {
                     self.bump();
                     let n = self.ident()?;
@@ -600,6 +786,32 @@ impl P {
                     }
                     self.expect(&Tok::RBrace)?;
                     decls.push(Decl::Struct { name: n, fields });
+                }
+                Tok::Enum => {
+                    self.bump();
+                    let n = self.ident()?;
+                    self.expect(&Tok::LBrace)?;
+                    let mut variants = Vec::new();
+                    while self.peek() != &Tok::RBrace {
+                        let vn = self.ident()?;
+                        let mut payloads = Vec::new();
+                        if self.eat(&Tok::LParen) {
+                            if self.peek() != &Tok::RParen {
+                                loop {
+                                    payloads.push(self.hty()?);
+                                    if self.eat(&Tok::Comma) {
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                            self.expect(&Tok::RParen)?;
+                        }
+                        variants.push((vn, payloads));
+                        self.eat(&Tok::Comma);
+                    }
+                    self.expect(&Tok::RBrace)?;
+                    decls.push(Decl::Enum { name: n, variants });
                 }
                 Tok::Invariant => {
                     self.bump();
@@ -717,4 +929,46 @@ impl P {
 pub fn parse(src: &str) -> CResult<Program> {
     let toks = crate::lexer::lex(src)?;
     P::new(toks).program()
+}
+
+/// Parse a `.cy` file and recursively splice `import "other.cy"`
+/// declarations (resolved relative to the importing file's directory,
+/// deduplicated in encounter order). Returns `(combined_src, Program)`
+/// so the manifest hash covers every imported module.
+pub fn parse_file(path: &std::path::Path) -> CResult<(String, Program)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut combined = String::new();
+    let mut decls = Vec::new();
+    load_recursive(path, 0, 0, &mut seen, &mut combined, &mut decls)?;
+    Ok((combined, Program { decls }))
+}
+
+fn load_recursive(
+    path: &std::path::Path,
+    l: usize,
+    c: usize,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    combined: &mut String,
+    out: &mut Vec<Decl>,
+) -> CResult<()> {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !seen.insert(canon) {
+        return Ok(());
+    }
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| crate::Diag { msg: format!("{}: {e}", path.display()), line: l, col: c })?;
+    let prog = parse(&src)?;
+    let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    for d in prog.decls {
+        match d {
+            Decl::Import(rel) => {
+                let next = base.join(&rel.v);
+                load_recursive(&next, rel.line, rel.col, seen, combined, out)?;
+            }
+            other => out.push(other),
+        }
+    }
+    combined.push_str(&src);
+    combined.push('\n');
+    Ok(())
 }

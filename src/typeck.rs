@@ -200,7 +200,11 @@ impl Ck {
                 e: TExpr::Int(*n),
                 ty: CTy::scalar(DType::I32),
             }),
-            Expr::Bool(_) | Expr::Str(_) | Expr::VecLit(_) | Expr::StructLit(..) => {
+            Expr::Bool(_)
+            | Expr::Str(_)
+            | Expr::VecLit(_)
+            | Expr::MapLit(_)
+            | Expr::StructLit(..) => {
                 diag("host-stratum value — belongs inside `host fn`", l, c)
             }
             Expr::Ident(s) => {
@@ -763,8 +767,12 @@ impl Ck {
                         out.push(TStmt::Expr(te));
                     }
                 }
-                Stmt::If { .. } | Stmt::While { .. } | Stmt::For { .. }
-                | Stmt::Break | Stmt::Continue => {
+                Stmt::If { .. }
+                | Stmt::Match { .. }
+                | Stmt::While { .. }
+                | Stmt::For { .. }
+                | Stmt::Break
+                | Stmt::Continue => {
                     return diag("control flow is host-stratum — wrap it in `host fn`", s.line, s.col)
                 }
                 Stmt::Expr(e) => {
@@ -960,6 +968,8 @@ pub struct Checked {
     pub host: Option<crate::hostck::HProgram>,
     /// true when a `host fn main` exists — the organism entry.
     pub organism: bool,
+    pub invariants: Vec<String>,
+    pub caps: Vec<String>,
 }
 
 pub(crate) fn collect(
@@ -971,6 +981,7 @@ pub(crate) fn collect(
     Vec<(String, String)>,
     Vec<Sp<HFn>>,
     Vec<(String, Vec<(String, HTy)>)>,
+    Vec<(String, Vec<(String, Vec<HTy>)>)>,
     Vec<(String, Ty, Option<String>)>,
 )> {
     let mut ck = Ck {
@@ -985,9 +996,11 @@ pub(crate) fn collect(
     let mut provenance = Vec::new();
     let mut hostfns = Vec::new();
     let mut structs = Vec::new();
+    let mut enums = Vec::new();
     let mut tables = Vec::new();
     for d in &p.decls {
         match d {
+            Decl::Import(_) => {}
             Decl::Invariant(n) => invariants.push(n.v.clone()),
             Decl::Cap(cs) => caps.extend(cs.iter().map(|c| c.v.clone())),
             Decl::Provenance(kvs) => {
@@ -1016,6 +1029,20 @@ pub(crate) fn collect(
                     fields.iter().map(|(f, t)| (f.v.clone(), t.v.clone())).collect(),
                 ));
             }
+            Decl::Enum { name, variants } => {
+                enums.push((
+                    name.v.clone(),
+                    variants
+                        .iter()
+                        .map(|(vn, ptys)| {
+                            (
+                                vn.v.clone(),
+                                ptys.iter().map(|t| t.v.clone()).collect(),
+                            )
+                        })
+                        .collect(),
+                ));
+            }
             Decl::Fn(f) => {
                 ck.fns.insert(f.v.name.clone(), f.clone());
             }
@@ -1031,7 +1058,7 @@ pub(crate) fn collect(
             }
         }
     }
-    Ok((ck, invariants, caps, provenance, hostfns, structs, tables))
+    Ok((ck, invariants, caps, provenance, hostfns, structs, enums, tables))
 }
 
 impl Ck {
@@ -1125,13 +1152,15 @@ impl Ck {
 /// organism-aware entry point: every concrete ane fn becomes a
 /// program; host fns check against their signatures.
 pub fn check_all(p: &Program) -> CResult<Checked> {
-    let (mut ck, invariants, caps, provenance, hostfns, structs, tables) = collect(p)?;
+    let (mut ck, invariants, caps, provenance, hostfns, structs, enums, tables) = collect(p)?;
     if hostfns.is_empty() {
         let prog = check(p)?;
         return Ok(Checked {
             ane: vec![("main".to_string(), prog)],
             host: None,
             organism: false,
+            invariants,
+            caps,
         });
     }
     if !ck.ios.is_empty() {
@@ -1174,18 +1203,20 @@ pub fn check_all(p: &Program) -> CResult<Checked> {
         )?;
         ane.push((f.v.name.clone(), prog));
     }
-    let host = crate::hostck::check(p, &hostfns, &structs, &ck, &ane, &tables)?;
+    let host = crate::hostck::check(p, &hostfns, &structs, &enums, &caps, &ck, &ane, &tables)?;
     let organism = hostfns.iter().any(|f| f.v.name == "main");
     Ok(Checked {
         ane,
         host: Some(host),
         organism,
+        invariants,
+        caps,
     })
 }
 
 /// typecheck a whole program → concrete TProgram.
 pub fn check(p: &Program) -> CResult<TProgram> {
-    let (mut ck, invariants, caps, provenance, _hostfns, _structs, _tables) = collect(p)?;
+    let (mut ck, invariants, caps, provenance, _hostfns, _structs, _enums, _tables) = collect(p)?;
     let main = ck
         .fns
         .get("main")

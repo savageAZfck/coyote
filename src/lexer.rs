@@ -10,9 +10,13 @@ pub enum Tok {
     Str(String),
 
     // keywords
+    Import,
     Fn,
     Host,
+    Reflex,
     Struct,
+    Enum,
+    Match,
     Let,
     Var,
     If,
@@ -51,6 +55,7 @@ pub enum Tok {
     Colon,
     Semi,
     Arrow,
+    FatArrow,
     DotDot,
     Dot,
     T, // .T transpose
@@ -88,9 +93,13 @@ pub struct Lexed {
 
 fn kw(s: &str) -> Option<Tok> {
     Some(match s {
+        "import" => Tok::Import,
         "fn" => Tok::Fn,
         "host" => Tok::Host,
+        "reflex" => Tok::Reflex,
         "struct" => Tok::Struct,
+        "enum" => Tok::Enum,
+        "match" => Tok::Match,
         "let" => Tok::Let,
         "var" => Tok::Var,
         "if" => Tok::If,
@@ -263,7 +272,9 @@ pub fn lex(src: &str) -> CResult<Vec<Lexed>> {
             '.' => pushat!(if it.peek() == Some(&'.') { bump(&mut it, &mut line, &mut col); Tok::DotDot }
                           else if it.peek() == Some(&'T') { bump(&mut it, &mut line, &mut col); Tok::T }
                           else { Tok::Dot }),
-            '=' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::EqEq } else { Tok::Eq }),
+            '=' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::EqEq }
+                          else if it.peek() == Some(&'>') { bump(&mut it, &mut line, &mut col); Tok::FatArrow }
+                          else { Tok::Eq }),
             '!' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::Ne } else { Tok::Not }),
             '<' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::Le } else { Tok::Lt }),
             '>' => pushat!(if it.peek() == Some(&'=') { bump(&mut it, &mut line, &mut col); Tok::Ge } else { Tok::Gt }),
