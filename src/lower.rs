@@ -6,10 +6,30 @@
 //! are stored `[N, K]` and consumed with `transpose_y`.
 
 use crate::ast::{AssignOp, BinOp, DType, IoDir, Qual, UnOp};
-use crate::typeck::{CTy, TExpr, TParam, TProgram, TStmt, Typed};
+use crate::typeck::{CTy, TExpr, TIndex, TParam, TProgram, TStmt, Typed};
 use crate::{diag, CResult, Diag};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+
+/// Blockwise symmetric Q4 quantization (`block = 32`, $q \in [-7, 7]$,
+/// fp16 scale $s = \max|w_i| / 7$) followed by fp16 dequantization.
+/// Shared by `lower.rs` and `eval.rs` so CPU reference matches silicon blobs.
+pub fn q4_quantize(vals: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(vals.len());
+    for chunk in vals.chunks(32) {
+        let max_abs = chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = half::f16::from_f32(if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 }).to_f32();
+        for &v in chunk {
+            let q = if scale == 0.0 {
+                0.0
+            } else {
+                (v / scale).round().clamp(-7.0, 7.0)
+            };
+            out.push(half::f16::from_f32(q * scale).to_f32());
+        }
+    }
+    out
+}
 
 /// a lowered value: either a named mil tensor or a host scalar.
 #[derive(Debug, Clone)]
@@ -40,6 +60,10 @@ pub struct MilOut {
     pub trainable: Vec<(String, String, CTy, Option<String>)>,
     /// trainable outputs: (param name, mil value name producing the update)
     pub param_outs: Vec<(String, String, CTy)>,
+    /// trainable params updated via `adam(w, grad, lr)` instead of in-place SGD:
+    /// `param_outs` holds the raw gradient `g`, and `(param, lr)` triggers
+    /// the host/eval Adam moment step.
+    pub adam_lrs: Vec<(String, f64)>,
     /// state fields: (key `kv.k`, mil port `kv_k`, ty) — zero-init surfaces
     pub states: Vec<(String, String, CTy)>,
     /// state outputs: (mil port name, mil value producing the update, ty)
@@ -65,6 +89,8 @@ struct Lo {
     defs: HashMap<usize, String>,
     /// trainable param → mil value producing its update
     param_outs: Vec<(String, String, CTy)>,
+    /// trainable param → adam learning rate (when updated via `adam(...)`)
+    adam_lrs: Vec<(String, f64)>,
     /// state key `kv.k` → mil port `kv_k`
     state_ports: HashMap<String, String>,
     /// state port → mil value producing its update
@@ -73,6 +99,7 @@ struct Lo {
     grads: HashMap<String, V>,
     /// let-bound names → defining expr (tape for backward continuation)
     tape: HashMap<String, crate::typeck::Typed>,
+    in_grad: bool,
     scalar_blobs: usize,
     n: usize,
 }
@@ -152,6 +179,54 @@ impl Lo {
         name
     }
 
+    /// materialize a constant `[rows_n, cols_k]` fp16 matrix blob.
+    fn const_mat(&mut self, rows_n: usize, cols_k: usize, vals: &[f32]) -> String {
+        self.scalar_blobs += 1;
+        let name = format!("__cm{}", self.scalar_blobs);
+        let fname = format!("{name}.bin");
+        self.blobs.push((fname.clone(), f16_bytes(vals)));
+        let _ = writeln!(
+            self.consts,
+            "        tensor<fp16, [{rows_n}, {cols_k}]> {name} = const()[val = tensor<fp16, [{rows_n}, {cols_k}]>(BLOBFILE(path = string(\"{fname}\"), offset = uint64(0)))];"
+        );
+        name
+    }
+
+    /// emit `x @ W^T` with a synthesized `[rows_n, cols_k]` projection/reduction matrix.
+    fn proj_matmul(
+        &mut self,
+        x_name: &str,
+        rows_n: usize,
+        cols_k: usize,
+        vals: &[f32],
+        out_ty: &CTy,
+        taint: bool,
+    ) -> V {
+        let w = self.const_mat(rows_n, cols_k, vals);
+        let name = self.fresh();
+        let _ = writeln!(
+            self.ops,
+            "        tensor<fp16, [1, 1, 1, {rows_n}]> {name} = matmul(x = {x_name}, y = {w}, transpose_y = __bt)[name = string(\"{name}\")];"
+        );
+        V::Named {
+            name,
+            ty: out_ty.clone(),
+            taint,
+        }
+    }
+
+    /// sum/mean reduction broadcast to all `n` lanes via an `[n, n]` constant
+    /// matrix of `scale` (`1.0` for sum, `1.0 / n` for mean).
+    fn reduce_bcast(&mut self, x_name: &str, n: usize, scale: f32) -> CResult<String> {
+        let ty = CTy {
+            dt: DType::F16,
+            dims: vec![n as i64],
+        };
+        let mat = vec![scale; n * n];
+        let v = self.proj_matmul(x_name, n, n, &mat, &ty, false);
+        Ok(self.named(v, &ty)?.0)
+    }
+
     /// emit (or reuse) a param as a mil const; returns its mil name.
     fn param_ref(&mut self, name: &str, role: &'static str) -> CResult<(String, CTy, bool)> {
         let (qual, ty, src) = self
@@ -163,11 +238,20 @@ impl Lo {
         if let Some(n) = self.param_emitted.get(&(name.to_string(), role)) {
             return Ok((n.clone(), ty, qual == Qual::Sealed));
         }
-        let mil_name = name.to_string();
+        let mil_name = if role == "mat" || role == "vec" {
+            name.to_string()
+        } else {
+            format!("{name}_{role}")
+        };
         // real weights via `@ "file::tensor"`; deterministic init otherwise
+        let is_q4 = ty.dt == DType::Q4;
         let init = |expect: &[usize]| -> CResult<Vec<f32>> {
-            crate::weights::resolve(name, Some(expect), src.as_deref(), init_weight)
-                .map_err(|m| Diag { msg: m, line: 0, col: 0 })
+            let mut v = crate::weights::resolve(name, Some(expect), src.as_deref(), init_weight)
+                .map_err(|m| Diag { msg: m, line: 0, col: 0 })?;
+            if is_q4 {
+                v = q4_quantize(&v);
+            }
+            Ok(v)
         };
         match role {
             // [N, K] matmul weight for `x @ w` — blob is stored transposed
@@ -177,11 +261,31 @@ impl Lo {
                     return diag(format!("param {name} is not rank-2"), 0, 0);
                 }
                 let (k, n) = (ty.dims[0] as usize, ty.dims[1] as usize);
-                // file tensors are [out, in] = [N, K] row-major — the
-                // blob's storage layout exactly, no transpose needed.
                 let w = init(&[n, k])?;
-                let fname = format!("{name}.bin");
+                let fname = format!("{mil_name}.bin");
                 self.blobs.push((fname.clone(), f16_bytes(&w)));
+                let _ = writeln!(
+                    self.consts,
+                    "        tensor<fp16, [{n}, {k}]> {mil_name} = const()[val = tensor<fp16, [{n}, {k}]>(BLOBFILE(path = string(\"{fname}\"), offset = uint64(0)))];"
+                );
+            }
+            // Transposed matmul weight for `x @ w.T` where `w` is declared `[N, K]`
+            // (so `w.T` has shape `[K, N]`): file/init order is `[K, N]`, transpose
+            // to `[N, K]` so `transpose_y` contracts `K` and produces `N`.
+            "mat_t" => {
+                if ty.dims.len() != 2 {
+                    return diag(format!("param {name} is not rank-2"), 0, 0);
+                }
+                let (n, k) = (ty.dims[0] as usize, ty.dims[1] as usize);
+                let w_kn = init(&[k, n])?;
+                let mut w_nk = vec![0.0f32; n * k];
+                for r in 0..k {
+                    for c in 0..n {
+                        w_nk[c * k + r] = w_kn[r * n + c];
+                    }
+                }
+                let fname = format!("{mil_name}.bin");
+                self.blobs.push((fname.clone(), f16_bytes(&w_nk)));
                 let _ = writeln!(
                     self.consts,
                     "        tensor<fp16, [{n}, {k}]> {mil_name} = const()[val = tensor<fp16, [{n}, {k}]>(BLOBFILE(path = string(\"{fname}\"), offset = uint64(0)))];"
@@ -191,7 +295,7 @@ impl Lo {
             "vec" => {
                 let c = *ty.dims.first().unwrap_or(&1) as usize;
                 let w = init(&[c])?;
-                let fname = format!("{name}.bin");
+                let fname = format!("{mil_name}.bin");
                 self.blobs.push((fname.clone(), f16_bytes(&w)));
                 let _ = writeln!(
                     self.consts,
@@ -207,10 +311,14 @@ impl Lo {
 
     fn emit_op(&mut self, ty: &CTy, line: String, taint: bool) -> V {
         let name = self.fresh();
+        let shape = if ty.dims.len() == 2 && self.state_ports.is_empty() {
+            format!("[1, {}, 1, 1]", ty.numel())
+        } else {
+            mil_shape(ty)
+        };
         let _ = writeln!(
             self.ops,
-            "        tensor<fp16, {}> {name} = {line}[name = string(\"{name}\")];",
-            mil_shape(ty)
+            "        tensor<fp16, {shape}> {name} = {line}[name = string(\"{name}\")];",
         );
         V::Named {
             name,
@@ -361,14 +469,78 @@ impl Lo {
             }
             TExpr::Unary(UnOp::Not, _) => diag("`!` is host-stratum", 0, 0),
             TExpr::Bin(op, a, b) => self.binop(*op, a, b, &e.ty),
-            TExpr::Transpose(_a) => {
-                // standalone .T — only survives into v1 mil inside `x @ w.T`,
-                // which `binop` handles without materializing.
-                diag("`.T` is only supported as the right side of `@` in v1", 0, 0)
+            TExpr::Transpose(a) => {
+                // Standalone `.T` on rank-2 `[R, C]` -> `[C, R]`: emit the
+                // `[R*C, R*C]` transpose permutation matrix on-chip.
+                let av = self.expr(a)?;
+                let (an, taint) = self.named(av, &a.ty)?;
+                let (r, c) = (a.ty.dims[0] as usize, a.ty.dims[1] as usize);
+                let total = r * c;
+                let mut perm = vec![0.0f32; total * total];
+                for i in 0..r {
+                    for j in 0..c {
+                        let out_idx = j * r + i;
+                        let in_idx = i * c + j;
+                        perm[out_idx * total + in_idx] = 1.0;
+                    }
+                }
+                Ok(self.proj_matmul(&an, total, total, &perm, &e.ty, taint))
             }
             TExpr::Call(name, args, named) => self.call(name, args, named, &e.ty),
             TExpr::Grad { loss, wrt } => self.grad(loss, wrt),
-            TExpr::Index(..) => diag("indexing lands with state/KV in M5", 0, 0),
+            TExpr::Index(base, idxs) => {
+                let bv = self.expr(base)?;
+                let (bn, taint) = self.named(bv, &base.ty)?;
+                if base.ty.dims.len() == 1 && idxs.len() == 1 {
+                    if let TIndex::Range(lo, hi) = idxs[0] {
+                        let k = base.ty.dims[0] as usize;
+                        let lo = lo as usize;
+                        let m = (hi as usize) - lo;
+                        let mut proj = vec![0.0f32; m * k];
+                        for j in 0..m {
+                            proj[j * k + (lo + j)] = 1.0;
+                        }
+                        return Ok(self.proj_matmul(&bn, m, k, &proj, &e.ty, taint));
+                    }
+                }
+                if base.ty.dims.len() == 2 && idxs.len() == 1 {
+                    if let TIndex::Lit(row) = idxs[0] {
+                        let v_dim = base.ty.dims[0] as usize;
+                        let d_dim = base.ty.dims[1] as usize;
+                        let r = row as usize;
+                        if let TExpr::Ident(pname) = &base.e {
+                            if let Some((qual, pty, src)) = self.params.get(pname).cloned() {
+                                let mut w = crate::weights::resolve(
+                                    pname,
+                                    Some(&[d_dim, v_dim]),
+                                    src.as_deref(),
+                                    init_weight,
+                                )
+                                .map_err(|m| Diag { msg: m, line: 0, col: 0 })?;
+                                if pty.dt == DType::Q4 {
+                                    w = q4_quantize(&w);
+                                }
+                                let rvec: Vec<f32> =
+                                    (0..d_dim).map(|j| w[j * v_dim + r]).collect();
+                                self.scalar_blobs += 1;
+                                let cname = format!("__row{}", self.scalar_blobs);
+                                let fname = format!("{cname}.bin");
+                                self.blobs.push((fname.clone(), f16_bytes(&rvec)));
+                                let _ = writeln!(
+                                    self.consts,
+                                    "        tensor<fp16, [1, {d_dim}, 1, 1]> {cname} = const()[val = tensor<fp16, [1, {d_dim}, 1, 1]>(BLOBFILE(path = string(\"{fname}\"), offset = uint64(0)))];"
+                                );
+                                return Ok(V::Named {
+                                    name: cname,
+                                    ty: e.ty.clone(),
+                                    taint: qual == Qual::Sealed,
+                                });
+                            }
+                        }
+                    }
+                }
+                diag("unsupported tensor slice/index form", 0, 0)
+            }
             TExpr::Field(base, f) => {
                 // `kv.k` — bound under the dotted key; reads see the
                 // latest StateUpdate value.
@@ -382,12 +554,22 @@ impl Lo {
                 diag("field access only on state blocks", 0, 0)
             }
             TExpr::Block(stmts, ret) => {
-                self.env.push(HashMap::new());
+                if !self.in_grad {
+                    self.env.push(HashMap::new());
+                }
                 for s in stmts {
-                    self.stmt(s)?;
+                    if let TStmt::Let { name, expr } = s {
+                        let v = self.expr(expr)?;
+                        self.tape.insert(name.clone(), expr.clone());
+                        self.bind(name, v);
+                    } else {
+                        self.stmt(s)?;
+                    }
                 }
                 let v = self.expr(ret)?;
-                self.env.pop();
+                if !self.in_grad {
+                    self.env.pop();
+                }
                 Ok(v)
             }
         }
@@ -398,17 +580,70 @@ impl Lo {
             BinOp::MatMul => {
                 let av = self.expr(a)?;
                 let (an, ataint) = self.named(av, &a.ty)?;
+                // M2 batched matmul: `a: f16[M, K] @ b: [K, N] -> f16[M, N]`
+                // via block-diagonal Kronecker matrix `I_M ⊗ W` (`[M*N, M*K]`).
+                if a.ty.dims.len() == 2 {
+                    let (m, k, n) = (
+                        a.ty.dims[0] as usize,
+                        a.ty.dims[1] as usize,
+                        b.ty.dims[1] as usize,
+                    );
+                    let (pname, is_trans) = match &b.e {
+                        TExpr::Ident(s) => (s.clone(), false),
+                        TExpr::Transpose(inner) => match &inner.e {
+                            TExpr::Ident(s) => (s.clone(), true),
+                            _ => return diag("batched matmul rhs must be a param or param.T", 0, 0),
+                        },
+                        _ => return diag("batched matmul rhs must be a param or param.T", 0, 0),
+                    };
+                    let (qual, pty, src) = self
+                        .params
+                        .get(&pname)
+                        .cloned()
+                        .ok_or(())
+                        .map_err(|_| Diag { msg: format!("{pname} is not a param"), line: 0, col: 0 })?;
+                    let expect = if is_trans { vec![k, n] } else { vec![n, k] };
+                    let mut w = crate::weights::resolve(&pname, Some(&expect), src.as_deref(), init_weight)
+                        .map_err(|e| Diag { msg: e, line: 0, col: 0 })?;
+                    if pty.dt == DType::Q4 {
+                        w = q4_quantize(&w);
+                    }
+                    if is_trans {
+                        let mut wt = vec![0.0f32; n * k];
+                        for r in 0..k {
+                            for c in 0..n {
+                                wt[c * k + r] = w[r * n + c];
+                            }
+                        }
+                        w = wt;
+                    }
+                    let (rows, cols) = (m * n, m * k);
+                    let mut block_w = vec![0.0f32; rows * cols];
+                    for br in 0..m {
+                        for j in 0..n {
+                            for i in 0..k {
+                                block_w[(br * n + j) * cols + (br * k + i)] = w[j * k + i];
+                            }
+                        }
+                    }
+                    let out = CTy {
+                        dt: DType::F16,
+                        dims: vec![m as i64, n as i64],
+                    };
+                    return Ok(self.proj_matmul(
+                        &an,
+                        rows,
+                        cols,
+                        &block_w,
+                        &out,
+                        ataint || qual == Qual::Sealed,
+                    ));
+                }
                 if a.ty.dims.len() != 1 {
-                    return diag("v1 matmul: lhs must be a vector (batched lands in M2)", 0, 0);
+                    return diag("matmul: lhs must be rank-1 or rank-2", 0, 0);
                 }
                 let _k = a.ty.dims[0];
                 let n = b.ty.dims[1];
-                // rhs: `w` or `w.T` (param, [N,K] storage, transpose_y),
-                // `kv.v` (state, [T,D] packed, transpose_x — attn·V), or
-                // `kv.k.T` (state, transpose_y — avw scores over rows).
-                // (operand, flag) — flag is transpose_y for param matvecs
-                // and transposed state fields, transpose_x for cache
-                // contractions `s @ kv.v`.
                 let (wn, flag) = match &b.e {
                     TExpr::Field(base, f) => {
                         let port = match &base.e {
@@ -471,8 +706,8 @@ impl Lo {
                 let elems = ty.numel().max(1) as usize;
                 let av = self.expr(a)?;
                 if op == BinOp::Div {
-                    // only scalar divisors in v1 — `x / s` → `x * (1/s)`
-                    if let V::Scalar(s) = self.expr(b)? {
+                    let bv = self.expr(b)?;
+                    if let V::Scalar(s) = bv {
                         if s == 0.0 {
                             return diag("division by zero", 0, 0);
                         }
@@ -480,7 +715,9 @@ impl Lo {
                         let recip = self.bcast(1.0 / s, elems);
                         return Ok(self.emit_op(ty, format!("mul(x = {an}, y = {recip})"), taint));
                     }
-                    return diag("tensor ÷ tensor lands in M2 — divide by scalars only", 0, 0);
+                    let (an, at) = self.named(av, ty)?;
+                    let (bn, bt) = self.named(bv, ty)?;
+                    return Ok(self.emit_op(ty, format!("real_div(x = {an}, y = {bn})"), at || bt));
                 }
                 let bv = self.expr(b)?;
                 let (an, at) = self.named(av, ty)?;
@@ -491,7 +728,6 @@ impl Lo {
                     BinOp::Mul => "mul",
                     _ => unreachable!(),
                 };
-                // mil arg order matters for sub: (x - y)
                 Ok(self.emit_op(ty, format!("{opname}(x = {an}, y = {bn})"), at || bt))
             }
             _ => diag("comparison ops land with control flow in M4", 0, 0),
@@ -502,6 +738,10 @@ impl Lo {
         if name == "__ret" {
             return self.expr(&args[0]);
         }
+        if name == "gather" || name == "embed" {
+            // `gather(table[V, D], onehot_idx[V]) -> f16[D]` lowers to `idx @ table`.
+            return self.binop(BinOp::MatMul, &args[1], &args[0], ty);
+        }
         let vals: Vec<V> = args.iter().map(|a| self.expr(a)).collect::<CResult<_>>()?;
         let taint = vals.iter().any(|v| matches!(v, V::Named { taint: true, .. }));
         let arg = |i: usize, vals: &[V], lo: &mut Lo| -> CResult<String> {
@@ -511,9 +751,6 @@ impl Lo {
         };
         match name {
             "outer" => {
-                // packed row×col — the cache-write / weight-grad shape.
-                // `matmul(x=[1,T,1,1] strided, y=D-vec, transpose_x)` →
-                // emit_outer_t → Packed(t, d).
                 let an = arg(0, &vals, self)?;
                 let bn = arg(1, &vals, self)?;
                 let (t, d) = (args[0].ty.dims[0], args[1].ty.dims[0]);
@@ -524,21 +761,55 @@ impl Lo {
                     taint,
                 ))
             }
-            "relu" | "sigmoid" | "tanh" | "silu" | "softmax" => {
-                let x = arg(0, &vals, self)?;
-                if name == "relu" && ty.numel() != 64 {
-                    return diag(
-                        format!("relu n={} off skeleton (n=64 only in v1)", ty.numel()),
-                        0,
-                        0,
-                    );
+            "concat" => {
+                let an = arg(0, &vals, self)?;
+                let bn = arg(1, &vals, self)?;
+                let k1 = args[0].ty.dims[0] as usize;
+                let k2 = args[1].ty.dims[0] as usize;
+                let n = k1 + k2;
+                let mut p_left = vec![0.0f32; n * k1];
+                for i in 0..k1 {
+                    p_left[i * k1 + i] = 1.0;
                 }
+                let mut p_right = vec![0.0f32; n * k2];
+                for j in 0..k2 {
+                    p_right[(k1 + j) * k2 + j] = 1.0;
+                }
+                let v1 = self.proj_matmul(&an, n, k1, &p_left, ty, taint);
+                let v2 = self.proj_matmul(&bn, n, k2, &p_right, ty, taint);
+                let n1 = self.named(v1, ty)?.0;
+                let n2 = self.named(v2, ty)?.0;
+                Ok(self.emit_op(ty, format!("add(x = {n1}, y = {n2})"), taint))
+            }
+            "relu" | "sigmoid" | "tanh" | "silu" | "softmax" | "gelu" => {
+                let x = arg(0, &vals, self)?;
+                let elems = ty.numel().max(1) as usize;
                 match name {
-                    "sigmoid" if ty.numel() > 1024 => {
+                    "relu" if elems != 64 => {
+                        let z = self.bcast(0.0, elems);
+                        Ok(self.emit_op(ty, format!("maximum(x = {x}, y = {z})"), taint))
+                    }
+                    "gelu" => {
+                        // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                        let x2 = self.emit_op(ty, format!("mul(x = {x}, y = {x})"), taint).name().0;
+                        let x3 = self.emit_op(ty, format!("mul(x = {x2}, y = {x})"), taint).name().0;
+                        let c1 = self.bcast(0.044715, elems);
+                        let cx3 = self.emit_op(ty, format!("mul(x = {x3}, y = {c1})"), taint).name().0;
+                        let inner = self.emit_op(ty, format!("add(x = {x}, y = {cx3})"), taint).name().0;
+                        let c2 = self.bcast(0.7978845608028654, elems);
+                        let u = self.emit_op(ty, format!("mul(x = {inner}, y = {c2})"), taint).name().0;
+                        let th = self.emit_op(ty, format!("tanh(x = {u})"), taint).name().0;
+                        let one = self.bcast(1.0, elems);
+                        let op1 = self.emit_op(ty, format!("add(x = {th}, y = {one})"), taint).name().0;
+                        let half = self.bcast(0.5, elems);
+                        let hx = self.emit_op(ty, format!("mul(x = {x}, y = {half})"), taint).name().0;
+                        Ok(self.emit_op(ty, format!("mul(x = {hx}, y = {op1})"), taint))
+                    }
+                    "sigmoid" if elems > 1024 => {
                         let sn = self.sigmoid_of(&x, ty);
                         Ok(V::Named { name: sn, ty: ty.clone(), taint })
                     }
-                    "silu" if ty.numel() > 1024 => {
+                    "silu" if elems > 1024 => {
                         let sn = self.sigmoid_of(&x, ty);
                         Ok(self.emit_op(ty, format!("mul(x = {x}, y = {sn})"), taint))
                     }
@@ -605,7 +876,9 @@ impl Lo {
                 stmts.iter().any(|s| match s {
                     TStmt::Let { expr, .. } => self.needs_grad(expr, depth + 1),
                     TStmt::Assign { expr, .. } => self.needs_grad(expr, depth + 1),
-                    TStmt::ParamUpdate { grad, .. } => self.needs_grad(grad, depth + 1),
+                    TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => {
+                        self.needs_grad(grad, depth + 1)
+                    }
                     TStmt::StateUpdate { expr, .. } => self.needs_grad(expr, depth + 1),
                     TStmt::Expr(t) => self.needs_grad(t, depth + 1),
                 }) || self.needs_grad(ret, depth + 1)
@@ -630,6 +903,7 @@ impl Lo {
         self.env.push(HashMap::new());
         self.tape.clear();
         self.grads.clear();
+        self.in_grad = true;
         // forward: emit the loss block's lets, recording each name's
         // defining expr on the tape for backward continuation.
         let terminal: &Typed = match &loss.e {
@@ -688,6 +962,7 @@ impl Lo {
                 line: 0,
                 col: 0,
             })?;
+        self.in_grad = false;
         self.tape.clear();
         self.env.pop();
         Ok(out)
@@ -773,13 +1048,29 @@ impl Lo {
                     }
                 }
                 BinOp::Div => {
-                    // only scalar divisors survive to lowering
-                    if self.needs_grad(a, 0) {
-                        if let TExpr::Lit(s) = b.e {
-                            let r = self.bcast(1.0 / s, adjty.numel().max(1) as usize);
+                    let elems = adjty.numel().max(1) as usize;
+                    if let TExpr::Lit(s) = b.e {
+                        if self.needs_grad(a, 0) {
+                            let r = self.bcast(1.0 / s, elems);
                             let v = self.emit_op(&adjty, format!("mul(x = {adj}, y = {r})"), false);
                             let vn = self.named(v, &adjty)?.0;
                             self.back(a, &vn)?;
+                        }
+                    } else {
+                        let (bn, _) = self.fwd_name(b)?;
+                        if self.needs_grad(a, 0) {
+                            let da = self.emit_op(&adjty, format!("real_div(x = {adj}, y = {bn})"), false);
+                            let dan = self.named(da, &adjty)?.0;
+                            self.back(a, &dan)?;
+                        }
+                        if self.needs_grad(b, 0) {
+                            let (an, _) = self.fwd_name(a)?;
+                            let num = self.emit_op(&adjty, format!("mul(x = {adj}, y = {an})"), false).name().0;
+                            let b2 = self.emit_op(&adjty, format!("mul(x = {bn}, y = {bn})"), false).name().0;
+                            let q = self.emit_op(&adjty, format!("real_div(x = {num}, y = {b2})"), false).name().0;
+                            let neg = self.bcast(-1.0, elems);
+                            let db = self.emit_op(&adjty, format!("mul(x = {q}, y = {neg})"), false).name().0;
+                            self.back(b, &db)?;
                         }
                     }
                 }
@@ -876,25 +1167,168 @@ impl Lo {
                         self.back(&args[0], &dxn)?;
                     }
                     "relu" => {
-                        return diag("grad through relu needs a mask op — lands in M3b", 0, 0)
+                        // Exact indicator 1_{x > 0} across normal fp16:
+                        // pos = max(x, 0); mask = min((pos * 4096) * 4096, 1.0); dx = adj * mask
+                        let (xn, _) = self.fwd_name(x)?;
+                        let z = self.bcast(0.0, elems);
+                        let pos = self.emit_op(&dty, format!("maximum(x = {xn}, y = {z})"), false).name().0;
+                        let big = self.bcast(4096.0, elems);
+                        let s1 = self.emit_op(&dty, format!("mul(x = {pos}, y = {big})"), false).name().0;
+                        let s2 = self.emit_op(&dty, format!("mul(x = {s1}, y = {big})"), false).name().0;
+                        let one = self.bcast(1.0, elems);
+                        let mask = self.emit_op(&dty, format!("minimum(x = {s2}, y = {one})"), false).name().0;
+                        let dx = self.emit_op(&dty, format!("mul(x = {adj}, y = {mask})"), false).name().0;
+                        self.back(x, &dx)?;
+                    }
+                    "gelu" => {
+                        // d/dx [0.5 * x * (1 + tanh(u))] where u = a*(x + b*x^3)
+                        // = 0.5*(1 + t) + 0.5*x*(1 - t^2)*a*(1 + 3*b*x^2)
+                        let (xn, _) = self.fwd_name(x)?;
+                        let x2 = self.emit_op(&dty, format!("mul(x = {xn}, y = {xn})"), false).name().0;
+                        let x3 = self.emit_op(&dty, format!("mul(x = {x2}, y = {xn})"), false).name().0;
+                        let cb = self.bcast(0.044715, elems);
+                        let bx3 = self.emit_op(&dty, format!("mul(x = {x3}, y = {cb})"), false).name().0;
+                        let inner = self.emit_op(&dty, format!("add(x = {xn}, y = {bx3})"), false).name().0;
+                        let ca = self.bcast(0.7978845608028654, elems);
+                        let u = self.emit_op(&dty, format!("mul(x = {inner}, y = {ca})"), false).name().0;
+                        let t = self.emit_op(&dty, format!("tanh(x = {u})"), false).name().0;
+                        let one = self.bcast(1.0, elems);
+                        let half = self.bcast(0.5, elems);
+                        let tp1 = self.emit_op(&dty, format!("add(x = {one}, y = {t})"), false).name().0;
+                        let term1 = self.emit_op(&dty, format!("mul(x = {half}, y = {tp1})"), false).name().0;
+                        let t2 = self.emit_op(&dty, format!("mul(x = {t}, y = {t})"), false).name().0;
+                        let omt2 = self.emit_op(&dty, format!("sub(x = {one}, y = {t2})"), false).name().0;
+                        let c3b = self.bcast(3.0 * 0.044715, elems);
+                        let tbx2 = self.emit_op(&dty, format!("mul(x = {x2}, y = {c3b})"), false).name().0;
+                        let du1 = self.emit_op(&dty, format!("add(x = {one}, y = {tbx2})"), false).name().0;
+                        let du = self.emit_op(&dty, format!("mul(x = {ca}, y = {du1})"), false).name().0;
+                        let hx = self.emit_op(&dty, format!("mul(x = {half}, y = {xn})"), false).name().0;
+                        let hx_sech = self.emit_op(&dty, format!("mul(x = {hx}, y = {omt2})"), false).name().0;
+                        let term2 = self.emit_op(&dty, format!("mul(x = {hx_sech}, y = {du})"), false).name().0;
+                        let dg = self.emit_op(&dty, format!("add(x = {term1}, y = {term2})"), false).name().0;
+                        let dx = self.emit_op(&dty, format!("mul(x = {adj}, y = {dg})"), false).name().0;
+                        self.back(x, &dx)?;
                     }
                     "softmax" => {
-                        return diag("grad through softmax needs a reduce — lands in M3b", 0, 0)
+                        // dx = s * (adj - sum(adj * s))
+                        let (sn, _) = self.fwd_name(e)?;
+                        let prod = self.emit_op(&dty, format!("mul(x = {adj}, y = {sn})"), false).name().0;
+                        let dot = self.reduce_bcast(&prod, elems, 1.0)?;
+                        let diff = self.emit_op(&dty, format!("sub(x = {adj}, y = {dot})"), false).name().0;
+                        let dx = self.emit_op(&dty, format!("mul(x = {sn}, y = {diff})"), false).name().0;
+                        self.back(x, &dx)?;
                     }
                     "rmsnorm" => {
-                        return diag("grad through rmsnorm lands in M3b", 0, 0)
+                        // y = x * r * w, where r = rsqrt(mean(x^2) + eps) and xhat = x * r.
+                        // Emitting unscaled `rms_norm(x = xn, eps = ...)` produces `xhat` AND
+                        // binds `{xhat}_rvec` to `r` via `expand_rms` in `mil_infer::graph`.
+                        let (xn, _) = self.fwd_name(x)?;
+                        let w_arg = &args[1];
+                        let wn = match &w_arg.e {
+                            TExpr::Ident(s) if self.params.contains_key(s) => {
+                                self.param_ref(s, "vec")?.0
+                            }
+                            _ => self.fwd_name(w_arg)?.0,
+                        };
+                        let xhat = self
+                            .emit_op(&dty, format!("rms_norm(x = {xn}, eps = fp16(1e-5))"), false)
+                            .name()
+                            .0;
+                        let rvec = format!("{xhat}_rvec");
+                        if let TExpr::Ident(wp) = &w_arg.e {
+                            if self.params.contains_key(wp) {
+                                let dw = self.emit_op(&dty, format!("mul(x = {adj}, y = {xhat})"), false);
+                                self.acc(wp, dw)?;
+                            }
+                        }
+                        if self.needs_grad(x, 0) {
+                            let g = self.emit_op(&dty, format!("mul(x = {adj}, y = {wn})"), false).name().0;
+                            let gx = self.emit_op(&dty, format!("mul(x = {g}, y = {xhat})"), false).name().0;
+                            let m = self.reduce_bcast(&gx, elems, 1.0 / elems as f32)?;
+                            let proj = self.emit_op(&dty, format!("mul(x = {xhat}, y = {m})"), false).name().0;
+                            let diff = self.emit_op(&dty, format!("sub(x = {g}, y = {proj})"), false).name().0;
+                            let dx = self.emit_op(&dty, format!("mul(x = {diff}, y = {rvec})"), false).name().0;
+                            self.back(x, &dx)?;
+                        }
+                    }
+                    "concat" => {
+                        let a = &args[0];
+                        let b = &args[1];
+                        let k1 = a.ty.dims[0] as usize;
+                        let k2 = b.ty.dims[0] as usize;
+                        let n = k1 + k2;
+                        if self.needs_grad(a, 0) {
+                            let mut p1 = vec![0.0f32; k1 * n];
+                            for i in 0..k1 {
+                                p1[i * n + i] = 1.0;
+                            }
+                            let da = self.proj_matmul(adj, k1, n, &p1, &a.ty, false);
+                            let dan = self.named(da, &a.ty)?.0;
+                            self.back(a, &dan)?;
+                        }
+                        if self.needs_grad(b, 0) {
+                            let mut p2 = vec![0.0f32; k2 * n];
+                            for j in 0..k2 {
+                                p2[j * n + (k1 + j)] = 1.0;
+                            }
+                            let db = self.proj_matmul(adj, k2, n, &p2, &b.ty, false);
+                            let dbn = self.named(db, &b.ty)?.0;
+                            self.back(b, &dbn)?;
+                        }
+                    }
+                    "gather" | "embed" => {
+                        // `gather(w, idx)` is `idx @ w`
+                        let synthetic = Typed {
+                            e: TExpr::Bin(
+                                BinOp::MatMul,
+                                Box::new(args[1].clone()),
+                                Box::new(args[0].clone()),
+                            ),
+                            ty: e.ty.clone(),
+                        };
+                        self.back(&synthetic, adj)?;
                     }
                     _ => return diag(format!("grad: no backward rule for {name}"), 0, 0),
                 }
             }
-            TExpr::Transpose(_) => {
-                return diag("grad through .T lands in M3b", 0, 0)
+            TExpr::Transpose(inner) => {
+                if self.needs_grad(inner, 0) {
+                    let (r, c) = (inner.ty.dims[0] as usize, inner.ty.dims[1] as usize);
+                    let total = r * c;
+                    let mut perm = vec![0.0f32; total * total];
+                    for i in 0..r {
+                        for j in 0..c {
+                            let out_idx = i * c + j;
+                            let in_idx = j * r + i;
+                            perm[out_idx * total + in_idx] = 1.0;
+                        }
+                    }
+                    let dt = self.proj_matmul(adj, total, total, &perm, &inner.ty, false);
+                    let dtn = self.named(dt, &inner.ty)?.0;
+                    self.back(inner, &dtn)?;
+                }
             }
-            TExpr::Block(..) => {
-                return diag("grad: nested blocks in loss land in M3b", 0, 0)
+            TExpr::Index(base, idxs) => {
+                if self.needs_grad(base, 0) && base.ty.dims.len() == 1 && idxs.len() == 1 {
+                    if let TIndex::Range(lo, hi) = idxs[0] {
+                        let k = base.ty.dims[0] as usize;
+                        let lo = lo as usize;
+                        let m = (hi as usize) - lo;
+                        let mut pad = vec![0.0f32; k * m];
+                        for j in 0..m {
+                            pad[(lo + j) * m + j] = 1.0;
+                        }
+                        let dx = self.proj_matmul(adj, k, m, &pad, &base.ty, false);
+                        let dxn = self.named(dx, &base.ty)?.0;
+                        self.back(base, &dxn)?;
+                    }
+                }
+            }
+            TExpr::Block(_stmts, ret) => {
+                self.back(ret, adj)?;
             }
             TExpr::Grad { .. } => return diag("higher-order grad lands later", 0, 0),
-            TExpr::Index(..) | TExpr::Field(..) => {}
+            TExpr::Field(..) => {}
         }
         Ok(())
     }
@@ -912,10 +1346,23 @@ impl Lo {
                 Ok(self.param_ref(s, "mat")?.0)
             }
             TExpr::Transpose(inner) => match &inner.e {
-                TExpr::Ident(s) => Ok(self.param_ref(s, "mat")?.0),
-                _ => diag("v1 matmul rhs must be a param or param.T", 0, 0),
+                TExpr::Ident(s) => {
+                    // If `s` was declared `[N, K]` and transposed to `[K, N]`,
+                    // use `"mat_t"` when its declared dims[1] != b.ty.dims[1].
+                    let (_, pty, _) = self
+                        .params
+                        .get(s)
+                        .ok_or(())
+                        .map_err(|_| Diag { msg: format!("{s} is not a param"), line: 0, col: 0 })?;
+                    if pty.dims[0] == b.ty.dims[1] && pty.dims[1] == b.ty.dims[0] && pty.dims[0] != pty.dims[1] {
+                        Ok(self.param_ref(s, "mat_t")?.0)
+                    } else {
+                        Ok(self.param_ref(s, "mat")?.0)
+                    }
+                }
+                _ => diag("matmul rhs must be a param or param.T", 0, 0),
             },
-            _ => diag("v1 matmul rhs must be a param or param.T", 0, 0),
+            _ => diag("matmul rhs must be a param or param.T", 0, 0),
         }
     }
 
@@ -968,6 +1415,30 @@ impl Lo {
                         }
                     }
                     self.bind(param, nv);
+                }
+            }
+            TStmt::AdamUpdate { param, lr, grad } => {
+                if let TExpr::Grad { loss, wrt } = &grad.e {
+                    if wrt != param {
+                        return diag(
+                            format!("adam update for {param} takes grad w.r.t. {wrt} — they must match"),
+                            0,
+                            0,
+                        );
+                    }
+                    let dw = self.grad_scaled(loss, wrt, 1.0)?;
+                    let ty = grad.ty.clone();
+                    let (dn, _) = self.named(dw, &ty)?;
+                    if let Some(e) = self.param_outs.iter_mut().find(|(p, _, _)| p == param) {
+                        e.1 = dn.clone();
+                    } else {
+                        self.param_outs.push((param.to_string(), dn.clone(), ty));
+                    }
+                    if let Some(e) = self.adam_lrs.iter_mut().find(|(p, _)| p == param) {
+                        e.1 = *lr;
+                    } else {
+                        self.adam_lrs.push((param.to_string(), *lr));
+                    }
                 }
             }
             TStmt::StateUpdate { key, port, expr } => {
@@ -1048,7 +1519,7 @@ impl Lo {
                     AssignOp::Add => "add",
                     AssignOp::Sub => "sub",
                     AssignOp::Mul => "mul",
-                    AssignOp::Div => return diag("compound `/=` lands in M2", 0, 0),
+                    AssignOp::Div => "real_div",
                 };
                 let nv = self.emit_op(&ty, format!("{opname}(x = {cn}, y = {en})"), ct || et);
                 self.bind(name, nv);
@@ -1134,7 +1605,9 @@ fn contig_ios(p: &TProgram) -> HashMap<String, bool> {
                         TStmt::Let { expr, .. } | TStmt::Assign { expr, .. } => {
                             walk(expr, trainable, statenames, marks, p)
                         }
-                        TStmt::ParamUpdate { grad, .. } => walk(grad, trainable, statenames, marks, p),
+                        TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => {
+                            walk(grad, trainable, statenames, marks, p)
+                        }
                         TStmt::StateUpdate { expr, .. } => walk(expr, trainable, statenames, marks, p),
                         TStmt::Expr(t) => walk(t, trainable, statenames, marks, p),
                     }
@@ -1150,7 +1623,9 @@ fn contig_ios(p: &TProgram) -> HashMap<String, bool> {
             TStmt::Let { expr, .. } | TStmt::Assign { expr, .. } => {
                 walk(expr, &trainable, &statenames, &mut marks, p)
             }
-            TStmt::ParamUpdate { grad, .. } => walk(grad, &trainable, &statenames, &mut marks, p),
+            TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => {
+                walk(grad, &trainable, &statenames, &mut marks, p)
+            }
             TStmt::StateUpdate { expr, .. } => walk(expr, &trainable, &statenames, &mut marks, p),
             TStmt::Expr(t) => walk(t, &trainable, &statenames, &mut marks, p),
         }
@@ -1174,6 +1649,7 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
             .collect(),
         defs: HashMap::new(),
         param_outs: Vec::new(),
+        adam_lrs: Vec::new(),
         state_ports: p
             .states
             .iter()
@@ -1182,6 +1658,7 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
         state_outs: Vec::new(),
         grads: HashMap::new(),
         tape: HashMap::new(),
+        in_grad: false,
         scalar_blobs: 0,
         n: 0,
     };
@@ -1261,6 +1738,8 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
         let contig = arg.map(|a| marks.get(&a).copied().unwrap_or(false)).unwrap_or(false);
         let shape = if contig && t.dims.len() == 1 {
             format!("[1, 1, 1, {}]", t.dims[0])
+        } else if t.dims.len() == 2 && lo.state_ports.is_empty() {
+            format!("[1, {}, 1, 1]", t.numel())
         } else {
             mil_shape(t)
         };
@@ -1382,6 +1861,7 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
             .collect(),
         trainable,
         param_outs: lo.param_outs,
+        adam_lrs: lo.adam_lrs,
         states: p
             .states
             .iter()

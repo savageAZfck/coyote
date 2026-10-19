@@ -125,6 +125,8 @@ pub enum HE {
     Un(UnOp, Box<HT>),
     Bin(BinOp, Box<HT>, Box<HT>),
     Call(u32, Vec<HT>),
+    /// call to an `extern` FFI function bound from Rust or Swift.
+    CallExt(u32, Vec<HT>),
     /// direct call of a known program — `layer(x, pos)`.
     CallAne(u32, Vec<HT>),
     /// call through a program-typed value — `p(x)` where p: ane(...).
@@ -217,9 +219,19 @@ pub enum GVal {
     Prog { idx: u32 },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct HExtern {
+    pub name: String,
+    pub args: Vec<RTy>,
+    pub ret: RTy,
+    pub det: bool,
+    pub caps: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct HProgram {
     pub fns: Vec<HFnT>,
+    pub externs: Vec<HExtern>,
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
     /// globals in slot order — tensors and program values.
@@ -232,6 +244,8 @@ struct Hk {
     fns: HashMap<String, u32>,
     fndecl: Vec<HFn>,
     fnlocs: Vec<(usize, usize)>,
+    externs: Vec<HExtern>,
+    ext_map: HashMap<String, u32>,
     structs: Vec<StructDef>,
     enums: Vec<EnumDef>,
     /// ane program name → (index, arg types, ret type)
@@ -796,6 +810,39 @@ impl Hk {
             return Ok(HT {
                 e: HE::Call(fi, targs),
                 ty: ret,
+            });
+        }
+        // extern fn bound from Rust or Swift?
+        if let Some(&ei) = self.ext_map.get(name) {
+            let ext = self.externs[ei as usize].clone();
+            if pos.len() != ext.args.len() {
+                return diag(
+                    format!("{name} expects {} args, found {}", ext.args.len(), pos.len()),
+                    l,
+                    c,
+                );
+            }
+            for cap in &ext.caps {
+                self.direct_caps[self.cur_fn].push((cap.clone(), l, c));
+            }
+            if !ext.det && self.direct_stoch[self.cur_fn].is_none() {
+                self.direct_stoch[self.cur_fn] = Some((name.to_string(), l, c));
+            }
+            let mut targs = Vec::new();
+            for (i, (want, ae)) in ext.args.iter().zip(pos.iter()).enumerate() {
+                let t = self.expr(ae, env, loops)?;
+                if &t.ty != want {
+                    return diag(
+                        format!("{name} arg {i} wants {}, found {}", self.show(want), self.show(&t.ty)),
+                        ae.line,
+                        ae.col,
+                    );
+                }
+                targs.push(t);
+            }
+            return Ok(HT {
+                e: HE::CallExt(ei, targs),
+                ty: ext.ret,
             });
         }
         // ane program — first-class value called directly.
@@ -1522,6 +1569,7 @@ fn definitely_returns(stmts: &[HS]) -> bool {
 pub(crate) fn check(
     _p: &Program,
     hostfns: &[Sp<HFn>],
+    externs: &[Sp<ExternFn>],
     structs: &[(String, Vec<(String, HTy)>)],
     enums: &[(String, Vec<(String, Vec<HTy>)>)],
     declared_caps: &[String],
@@ -1534,6 +1582,8 @@ pub(crate) fn check(
         fns: HashMap::new(),
         fndecl: hostfns.iter().map(|f| f.v.clone()).collect(),
         fnlocs: hostfns.iter().map(|f| (f.line, f.col)).collect(),
+        externs: Vec::new(),
+        ext_map: HashMap::new(),
         structs: Vec::new(),
         enums: Vec::new(),
         progs: HashMap::new(),
@@ -1623,6 +1673,31 @@ pub(crate) fn check(
             rvars.push((vname.clone(), rptys));
         }
         hk.enums[enum_base + idx].1 = rvars;
+    }
+    // extern fn table — resolved after structs/enums so extern signatures
+    // can reference any type.
+    for ef in externs {
+        if hk.ext_map.contains_key(&ef.v.name) {
+            return diag(format!("duplicate extern fn {}", ef.v.name), ef.line, ef.col);
+        }
+        let mut rargs = Vec::new();
+        for (_, aty) in &ef.v.args {
+            rargs.push(hk.resolve(&aty.v, aty.line, aty.col)?);
+        }
+        let rret = match &ef.v.ret {
+            Some(rt) => hk.resolve(&rt.v, rt.line, rt.col)?,
+            None => RTy::Unit,
+        };
+        let caps: Vec<String> = ef.v.caps.iter().map(|c| norm_cap(&c.v)).collect();
+        let idx = hk.externs.len() as u32;
+        hk.ext_map.insert(ef.v.name.clone(), idx);
+        hk.externs.push(HExtern {
+            name: ef.v.name.clone(),
+            args: rargs,
+            ret: rret,
+            det: ef.v.det != DetMode::Stoch,
+            caps,
+        });
     }
     // ane program values — first-class, callable
     for (i, (name, prog)) in ane.iter().enumerate() {
@@ -1938,6 +2013,7 @@ pub(crate) fn check(
     let entry = hk.fns.get("main").copied().map(|i| i as usize);
     Ok(HProgram {
         fns,
+        externs: hk.externs,
         structs: hk.structs,
         enums: hk.enums,
         globals: hk.glist,

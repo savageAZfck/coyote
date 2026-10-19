@@ -772,6 +772,59 @@ impl P {
                     decls.push(Decl::HostFn(self.host_fn_decl(DetMode::Stoch)?));
                 }
                 Tok::Reflex => decls.push(Decl::HostFn(self.reflex_decl()?)),
+                Tok::Extern => {
+                    self.bump();
+                    let det = if self.eat(&Tok::Det) {
+                        DetMode::Det
+                    } else if self.eat(&Tok::Stoch) {
+                        DetMode::Stoch
+                    } else {
+                        DetMode::Det
+                    };
+                    self.expect(&Tok::Fn)?;
+                    let name = self.ident()?.v;
+                    self.expect(&Tok::LParen)?;
+                    let mut args = Vec::new();
+                    if self.peek() != &Tok::RParen {
+                        loop {
+                            let an = self.ident()?;
+                            self.expect(&Tok::Colon)?;
+                            let at = self.hty()?;
+                            args.push((an, at));
+                            if self.eat(&Tok::Comma) {
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RParen)?;
+                    let ret = if self.eat(&Tok::Arrow) {
+                        Some(self.hty()?)
+                    } else {
+                        None
+                    };
+                    let mut caps = Vec::new();
+                    if self.eat(&Tok::Cap) {
+                        if self.peek() != &Tok::Semi {
+                            caps.push(self.ident()?);
+                            while self.eat(&Tok::Comma) {
+                                caps.push(self.ident()?);
+                            }
+                        }
+                    }
+                    self.eat(&Tok::Semi);
+                    decls.push(Decl::ExternFn(sp(
+                        ExternFn {
+                            name,
+                            args,
+                            ret,
+                            det,
+                            caps,
+                        },
+                        l,
+                        c,
+                    )));
+                }
                 Tok::Struct => {
                     self.bump();
                     let n = self.ident()?;

@@ -2,11 +2,41 @@
 //! f16-quantized weights, so `coyote run` can diff silicon vs. spec.
 //! Implements the same `grad` backward rules the lowerer emits.
 
-use crate::ast::{AssignOp, BinOp, Qual, UnOp};
-use crate::lower::init_weight_pub;
-use crate::typeck::{CTy, TExpr, TProgram, TStmt, Typed};
+use crate::ast::{AssignOp, BinOp, DType, Qual, UnOp};
+use crate::lower::{init_weight_pub, q4_quantize};
+use crate::typeck::{CTy, TExpr, TIndex, TProgram, TStmt, Typed};
 use crate::{diag, CResult, Diag};
 use std::collections::HashMap;
+
+/// Standard Adam optimizer step ($\beta_1 = 0.9, \beta_2 = 0.999, \epsilon = 10^{-8}$),
+/// with updated weights rounded to fp16 to match the ANE surface representation.
+pub fn adam_step(
+    w: &mut [f32],
+    g: &[f32],
+    m: &mut [f32],
+    v: &mut [f32],
+    step: usize,
+    lr: f64,
+) {
+    let b1 = 0.9f32;
+    let b2 = 0.999f32;
+    // fp16-safe epsilon (1e-2 prevents sub-ULP fp16 gradient noise near 0
+    // from amplifying into a ±lr sign flip on step 0).
+    let eps = 1e-2f32;
+    let t = (step + 1) as i32;
+    let bc1 = 1.0 - b1.powi(t);
+    let bc2 = 1.0 - b2.powi(t);
+    let lr = lr as f32;
+    for i in 0..w.len().min(g.len()) {
+        let gi = g[i];
+        m[i] = b1 * m[i] + (1.0 - b1) * gi;
+        v[i] = b2 * v[i] + (1.0 - b2) * gi * gi;
+        let mhat = m[i] / bc1;
+        let vhat = v[i] / bc2;
+        let nw = w[i] - lr * mhat / (vhat.sqrt() + eps);
+        w[i] = half::f16::from_f32(nw).to_f32();
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Val {
@@ -42,6 +72,7 @@ pub struct Evaluator<'a> {
     defs: HashMap<usize, Val>,
     tape: HashMap<String, Typed>,
     grads: HashMap<String, Val>,
+    in_grad: bool,
     /// trainable param → updated value (post-run)
     updates: Vec<(String, Vec<f32>)>,
 }
@@ -56,6 +87,7 @@ impl<'a> Evaluator<'a> {
             defs: HashMap::new(),
             tape: HashMap::new(),
             grads: HashMap::new(),
+            in_grad: false,
             updates: Vec::new(),
         }
     }
@@ -148,12 +180,13 @@ impl<'a> Evaluator<'a> {
         };
         let v = crate::weights::resolve(name, Some(&expect), t.src.as_deref(), qw)
             .map_err(|m| Diag { msg: m, line: 0, col: 0 })?;
-        // file sources arrive f32 — the blobs are f16, so round the
-        // reference the same way (parity is vs silicon, not vs bf16).
-        let v = v
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_f32())
-            .collect();
+        let v = if t.ty.dt == DType::Q4 {
+            q4_quantize(&v)
+        } else {
+            v.iter()
+                .map(|&x| half::f16::from_f32(x).to_f32())
+                .collect()
+        };
         Ok(Val::V(v))
     }
 
@@ -254,28 +287,52 @@ impl<'a> Evaluator<'a> {
                             }
                             return Ok(Val::V(out));
                         }
-                        let pname = match &b.e {
-                            TExpr::Ident(s) => s.clone(),
+                        let (pname, is_trans) = match &b.e {
+                            TExpr::Ident(s) => (s.clone(), false),
                             TExpr::Transpose(i) => match &i.e {
-                                TExpr::Ident(s) => s.clone(),
+                                TExpr::Ident(s) => (s.clone(), true),
                                 _ => return diag("eval: bad matmul rhs", 0, 0),
                             },
                             _ => return diag("eval: bad matmul rhs", 0, 0),
                         };
                         // [N, K] storage — runtime weights come via env
-                        let w = match self.lookup(&pname) {
+                        let mut w = match self.lookup(&pname) {
                             Some(v) => v.vec(0),
                             None => self.param_val(&pname)?.vec(0),
                         };
-                        let k = a.ty.dims[0] as usize;
+                        let k = *a.ty.dims.last().unwrap_or(&1) as usize;
                         let nn = b.ty.dims[1] as usize;
-                        let mut out = vec![0f32; nn];
-                        for j in 0..nn {
-                            let mut acc = 0f32;
-                            for i in 0..k {
-                                acc += x[i] * w[j * k + i];
+                        if is_trans {
+                            if let Some(pty) = self.is_param(&pname) {
+                                if pty.dims[0] == b.ty.dims[1]
+                                    && pty.dims[1] == b.ty.dims[0]
+                                    && pty.dims[0] != pty.dims[1]
+                                {
+                                    // `w` was stored `[K, N]`, transpose to `[N, K]`
+                                    let mut wt = vec![0.0f32; nn * k];
+                                    for r in 0..k {
+                                        for c in 0..nn {
+                                            wt[c * k + r] = w[r * nn + c];
+                                        }
+                                    }
+                                    w = wt;
+                                }
                             }
-                            out[j] = acc;
+                        }
+                        let m = if a.ty.dims.len() == 2 {
+                            a.ty.dims[0] as usize
+                        } else {
+                            1
+                        };
+                        let mut out = vec![0f32; m * nn];
+                        for br in 0..m {
+                            for j in 0..nn {
+                                let mut acc = 0f32;
+                                for i in 0..k {
+                                    acc += x[br * k + i] * w[j * k + i];
+                                }
+                                out[br * nn + j] = acc;
+                            }
                         }
                         Ok(Val::V(out))
                     }
@@ -293,20 +350,48 @@ impl<'a> Evaluator<'a> {
                     _ => diag("eval: comparisons unsupported", 0, 0),
                 }
             }
-            TExpr::Transpose(_) => diag("eval: transpose", 0, 0),
+            TExpr::Transpose(inner) => {
+                let v = self.expr(inner)?.vec(inner.ty.numel() as usize);
+                let (r, c) = (inner.ty.dims[0] as usize, inner.ty.dims[1] as usize);
+                let mut out = vec![0.0f32; r * c];
+                for i in 0..r {
+                    for j in 0..c {
+                        out[j * r + i] = v[i * c + j];
+                    }
+                }
+                Ok(Val::V(out))
+            }
             TExpr::Call(name, args, _) => {
                 if name == "__ret" {
                     return self.expr(&args[0]);
                 }
+                if name == "gather" || name == "embed" {
+                    let synth = Typed {
+                        e: TExpr::Bin(
+                            BinOp::MatMul,
+                            Box::new(args[1].clone()),
+                            Box::new(args[0].clone()),
+                        ),
+                        ty: e.ty.clone(),
+                    };
+                    return self.expr(&synth);
+                }
                 let n = e.ty.numel().max(1) as usize;
                 match name.as_str() {
-                    "relu" | "sigmoid" | "tanh" | "silu" | "softmax" => {
+                    "relu" | "sigmoid" | "tanh" | "silu" | "softmax" | "gelu" => {
                         let x = self.expr(&args[0])?.vec(n);
                         let out: Vec<f32> = match name.as_str() {
                             "relu" => x.iter().map(|v| v.max(0.0)).collect(),
                             "sigmoid" => x.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect(),
                             "tanh" => x.iter().map(|&v| v.tanh()).collect(),
                             "silu" => x.iter().map(|&v| v / (1.0 + (-v).exp())).collect(),
+                            "gelu" => x
+                                .iter()
+                                .map(|&v| {
+                                    let u = 0.7978845608028654f32 * (v + 0.044715 * v * v * v);
+                                    0.5 * v * (1.0 + u.tanh())
+                                })
+                                .collect(),
                             _ => {
                                 let m = x.iter().cloned().fold(f32::MIN, f32::max);
                                 let ex: Vec<f32> = x.iter().map(|&v| (v - m).exp()).collect();
@@ -315,6 +400,12 @@ impl<'a> Evaluator<'a> {
                             }
                         };
                         Ok(Val::V(out))
+                    }
+                    "concat" => {
+                        let mut a = self.expr(&args[0])?.vec(args[0].ty.numel() as usize);
+                        let b = self.expr(&args[1])?.vec(args[1].ty.numel() as usize);
+                        a.extend_from_slice(&b);
+                        Ok(Val::V(a))
                     }
                     "rmsnorm" => {
                         let x = self.expr(&args[0])?.vec(n);
@@ -355,7 +446,34 @@ impl<'a> Evaluator<'a> {
                 }
             }
             TExpr::Grad { loss, wrt } => self.grad(loss, wrt),
-            TExpr::Index(..) => diag("eval: indexing lands in M5", 0, 0),
+            TExpr::Index(base, idxs) => {
+                if base.ty.dims.len() == 1 && idxs.len() == 1 {
+                    if let TIndex::Range(lo, hi) = idxs[0] {
+                        let v = self.expr(base)?.vec(base.ty.numel() as usize);
+                        return Ok(Val::V(v[lo as usize..hi as usize].to_vec()));
+                    }
+                }
+                if base.ty.dims.len() == 2 && idxs.len() == 1 {
+                    if let TIndex::Lit(row) = idxs[0] {
+                        // param `w` is stored `[N, K]` where `K = dims[0], N = dims[1]`
+                        let v_dim = base.ty.dims[0] as usize;
+                        let d_dim = base.ty.dims[1] as usize;
+                        let mut oh = vec![0.0f32; v_dim];
+                        oh[row as usize] = 1.0;
+                        let w = self.expr(base)?.vec(v_dim * d_dim);
+                        let mut out = vec![0.0f32; d_dim];
+                        for j in 0..d_dim {
+                            let mut acc = 0.0f32;
+                            for i in 0..v_dim {
+                                acc += oh[i] * w[j * v_dim + i];
+                            }
+                            out[j] = acc;
+                        }
+                        return Ok(Val::V(out));
+                    }
+                }
+                diag("eval: unsupported index form", 0, 0)
+            }
             TExpr::Field(bx, f) => {
                 if let TExpr::Ident(s) = &bx.e {
                     let key = format!("{s}.{f}");
@@ -367,12 +485,22 @@ impl<'a> Evaluator<'a> {
                 diag("eval: field access only on state blocks", 0, 0)
             }
             TExpr::Block(stmts, ret) => {
-                self.env.push(HashMap::new());
+                if !self.in_grad {
+                    self.env.push(HashMap::new());
+                }
                 for s in stmts {
-                    self.stmt(s)?;
+                    if let TStmt::Let { name, expr } = s {
+                        let v = self.expr(expr)?;
+                        self.tape.insert(name.clone(), expr.clone());
+                        self.env.last_mut().unwrap().insert(name.clone(), v);
+                    } else {
+                        self.stmt(s)?;
+                    }
                 }
                 let v = self.expr(ret)?;
-                self.env.pop();
+                if !self.in_grad {
+                    self.env.pop();
+                }
                 Ok(v)
             }
         }
@@ -383,6 +511,7 @@ impl<'a> Evaluator<'a> {
         self.env.push(HashMap::new());
         self.tape.clear();
         self.grads.clear();
+        self.in_grad = true;
         let terminal: Typed = match &loss.e {
             TExpr::Block(stmts, ret) => {
                 for s in stmts {
@@ -418,6 +547,7 @@ impl<'a> Evaluator<'a> {
             .cloned()
             .ok_or(())
             .map_err(|_| Diag { msg: format!("grad: loss does not depend on {wrt}"), line: 0, col: 0 })?;
+        self.in_grad = false;
         self.tape.clear();
         self.env.pop();
         Ok(out)
@@ -466,10 +596,27 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 BinOp::Div => {
-                    if self.needs_grad(a) {
-                        if let TExpr::Lit(s) = b.e {
+                    let n = adj.len();
+                    if let TExpr::Lit(s) = b.e {
+                        if self.needs_grad(a) {
                             let d: Vec<f32> = adj.iter().map(|x| x / s as f32).collect();
                             self.back(a, &d)?;
+                        }
+                    } else {
+                        let bv = self.fwd(b)?.vec(n);
+                        if self.needs_grad(a) {
+                            let da: Vec<f32> = adj.iter().zip(&bv).map(|(d, y)| d / y).collect();
+                            self.back(a, &da)?;
+                        }
+                        if self.needs_grad(b) {
+                            let av = self.fwd(a)?.vec(n);
+                            let db: Vec<f32> = adj
+                                .iter()
+                                .zip(&av)
+                                .zip(&bv)
+                                .map(|((d, x), y)| -(d * x) / (y * y))
+                                .collect();
+                            self.back(b, &db)?;
                         }
                     }
                 }
@@ -558,6 +705,93 @@ impl<'a> Evaluator<'a> {
                             .collect();
                         self.back(x, &dx)?;
                     }
+                    "relu" => {
+                        let xv = self.fwd(x)?.vec(n);
+                        let dx: Vec<f32> = adj
+                            .iter()
+                            .zip(&xv)
+                            .map(|(&d, &v)| if v > 0.0 { d } else { 0.0 })
+                            .collect();
+                        self.back(x, &dx)?;
+                    }
+                    "gelu" => {
+                        let xv = self.fwd(x)?.vec(n);
+                        let dx: Vec<f32> = adj
+                            .iter()
+                            .zip(&xv)
+                            .map(|(&d, &v)| {
+                                let a = 0.7978845608028654f32;
+                                let b = 0.044715f32;
+                                let u = a * (v + b * v * v * v);
+                                let t = u.tanh();
+                                let dg = 0.5 * (1.0 + t)
+                                    + 0.5 * v * (1.0 - t * t) * a * (1.0 + 3.0 * b * v * v);
+                                d * dg
+                            })
+                            .collect();
+                        self.back(x, &dx)?;
+                    }
+                    "softmax" => {
+                        let s = self.fwd(e)?.vec(n);
+                        let dot: f32 = adj.iter().zip(&s).map(|(d, si)| d * si).sum();
+                        let dx: Vec<f32> = adj
+                            .iter()
+                            .zip(&s)
+                            .map(|(d, si)| si * (d - dot))
+                            .collect();
+                        self.back(x, &dx)?;
+                    }
+                    "rmsnorm" => {
+                        let xv = self.fwd(x)?.vec(n);
+                        let wv = match &args[1].e {
+                            TExpr::Ident(s) if self.lookup(s).is_none() => {
+                                self.param_val(s)?.vec(n)
+                            }
+                            _ => self.fwd(&args[1])?.vec(n),
+                        };
+                        let ms = xv.iter().map(|v| v * v).sum::<f32>() / n as f32;
+                        let r = (ms + 1e-5).sqrt().recip();
+                        let xhat: Vec<f32> = xv.iter().map(|v| v * r).collect();
+                        if let TExpr::Ident(wp) = &args[1].e {
+                            if self.is_param(wp).is_some() {
+                                let dw: Vec<f32> =
+                                    adj.iter().zip(&xhat).map(|(d, xh)| d * xh).collect();
+                                self.acc(wp, dw);
+                            }
+                        }
+                        if self.needs_grad(x) {
+                            let g: Vec<f32> = adj.iter().zip(&wv).map(|(d, w)| d * w).collect();
+                            let mean_gx: f32 =
+                                g.iter().zip(&xhat).map(|(gi, xh)| gi * xh).sum::<f32>()
+                                    / n as f32;
+                            let dx: Vec<f32> = g
+                                .iter()
+                                .zip(&xhat)
+                                .map(|(gi, xh)| r * (gi - xh * mean_gx))
+                                .collect();
+                            self.back(x, &dx)?;
+                        }
+                    }
+                    "concat" => {
+                        let k1 = args[0].ty.dims[0] as usize;
+                        if self.needs_grad(&args[0]) {
+                            self.back(&args[0], &adj[..k1])?;
+                        }
+                        if self.needs_grad(&args[1]) {
+                            self.back(&args[1], &adj[k1..])?;
+                        }
+                    }
+                    "gather" | "embed" => {
+                        let synth = Typed {
+                            e: TExpr::Bin(
+                                BinOp::MatMul,
+                                Box::new(args[1].clone()),
+                                Box::new(args[0].clone()),
+                            ),
+                            ty: e.ty.clone(),
+                        };
+                        self.back(&synth, adj)?;
+                    }
                     "mse" => {
                         let p = self.fwd(&args[0])?.vec(n);
                         let t = self.fwd(&args[1])?.vec(n);
@@ -571,8 +805,32 @@ impl<'a> Evaluator<'a> {
                     _ => return diag(format!("eval grad: no rule for {name}"), 0, 0),
                 }
             }
-            TExpr::Transpose(_) => return diag("eval grad: transpose", 0, 0),
-            TExpr::Block(..) | TExpr::Grad { .. } | TExpr::Index(..) | TExpr::Field(..) => {
+            TExpr::Transpose(inner) => {
+                if self.needs_grad(inner) {
+                    let (r, c) = (inner.ty.dims[0] as usize, inner.ty.dims[1] as usize);
+                    let mut dt = vec![0.0f32; r * c];
+                    for i in 0..r {
+                        for j in 0..c {
+                            dt[i * c + j] = adj[j * r + i];
+                        }
+                    }
+                    self.back(inner, &dt)?;
+                }
+            }
+            TExpr::Index(base, idxs) => {
+                if self.needs_grad(base) && base.ty.dims.len() == 1 && idxs.len() == 1 {
+                    if let TIndex::Range(lo, hi) = idxs[0] {
+                        let k = base.ty.dims[0] as usize;
+                        let mut dx = vec![0.0f32; k];
+                        dx[lo as usize..hi as usize].copy_from_slice(adj);
+                        self.back(base, &dx)?;
+                    }
+                }
+            }
+            TExpr::Block(_stmts, ret) => {
+                self.back(ret, adj)?;
+            }
+            TExpr::Grad { .. } | TExpr::Field(..) => {
                 return diag("eval grad: unsupported node", 0, 0)
             }
         }
@@ -621,7 +879,9 @@ impl<'a> Evaluator<'a> {
                 stmts.iter().any(|s| match s {
                     TStmt::Let { expr, .. } => self.needs_grad_d(expr, depth + 1),
                     TStmt::Assign { expr, .. } => self.needs_grad_d(expr, depth + 1),
-                    TStmt::ParamUpdate { grad, .. } => self.needs_grad_d(grad, depth + 1),
+                    TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => {
+                        self.needs_grad_d(grad, depth + 1)
+                    }
                     TStmt::StateUpdate { expr, .. } => self.needs_grad_d(expr, depth + 1),
                     TStmt::Expr(t) => self.needs_grad_d(t, depth + 1),
                 }) || self.needs_grad_d(ret, depth + 1)
@@ -655,6 +915,18 @@ impl<'a> Evaluator<'a> {
                         .last_mut()
                         .unwrap()
                         .insert(param.clone(), Val::V(nv));
+                }
+            }
+            TStmt::AdamUpdate { param, grad, .. } => {
+                if let TExpr::Grad { loss, wrt } = &grad.e {
+                    // Record the raw gradient `g` into `updates`; the driver's
+                    // Adam moment loop (`adam_step`) updates `w`, `m`, `v` across steps.
+                    let g = self.grad(loss, wrt)?.vec(grad.ty.numel() as usize);
+                    if let Some(e) = self.updates.iter_mut().find(|(p, _)| p == param) {
+                        e.1 = g;
+                    } else {
+                        self.updates.push((param.clone(), g));
+                    }
                 }
             }
             TStmt::Assign { name, op, expr } => {

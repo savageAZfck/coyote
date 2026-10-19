@@ -47,6 +47,7 @@ enum Op {
     Jmp(u32),
     JmpF(u32),
     Call(u32, u8),
+    CallExt(u32, u8),
     CallDyn(u8),
     CallAne(u32, u8),
     Native(u32, u8),
@@ -436,6 +437,12 @@ impl Bc {
                 }
                 self.emit(Op::Call(*fi, args.len() as u8));
             }
+            HE::CallExt(ei, args) => {
+                for a in args {
+                    self.expr(a)?;
+                }
+                self.emit(Op::CallExt(*ei, args.len() as u8));
+            }
             HE::CallAne(pi, args) => {
                 for a in args {
                     self.expr(a)?;
@@ -715,8 +722,10 @@ fn compile_fn(f: &HFnT, arg_names: &[String]) -> Result<(Vec<Op>, u32), String> 
 
 // ---------------------------------------------------------------- the VM
 
-pub struct Vm<'a> {
-    h: &'a HProgram,
+pub type ExternCb = Box<dyn FnMut(&[Val]) -> Result<Val, String>>;
+
+pub struct Vm {
+    h: HProgram,
     code: Vec<Vec<Op>>,
     nslots: Vec<u32>,
     stack: Vec<Val>,
@@ -727,6 +736,7 @@ pub struct Vm<'a> {
     /// global name → tensor handle (params, tables, state mirrors)
     gtensor: HashMap<String, u32>,
     progs: Vec<AneProg>,
+    extern_fns: HashMap<String, ExternCb>,
     witness: Vec<Wit>,
     rng: u64,
     sha: String,
@@ -734,10 +744,11 @@ pub struct Vm<'a> {
     result: Option<Val>,
 }
 
-impl<'a> Vm<'a> {
+impl Vm {
     /// build the VM: compile host fns, resolve globals (params load
     /// from safetensors here — f16-rounded like the emitted blobs).
-    pub fn new(h: &'a HProgram, progs: Vec<AneProg>, sha: &str) -> Result<Self, String> {
+    pub fn new(h: &HProgram, progs: Vec<AneProg>, sha: &str) -> Result<Self, String> {
+        let h = h.clone();
         let mut code = Vec::new();
         let mut nslots = Vec::new();
         for f in &h.fns {
@@ -816,6 +827,7 @@ impl<'a> Vm<'a> {
             tensors,
             gtensor,
             progs,
+            extern_fns: HashMap::new(),
             witness: Vec::new(),
             rng: seed,
             sha: sha.to_string(),
@@ -828,23 +840,52 @@ impl<'a> Vm<'a> {
         &self.witness
     }
 
-    /// kick off `main` and run to completion (or die).
-    pub fn run_main(&mut self) -> Result<Val, String> {
-        let entry = self
+    /// Bind a Rust or Swift FFI callback to an `extern fn` declared in
+    /// the `.cy` source.
+    pub fn bind_extern(
+        &mut self,
+        name: &str,
+        f: impl FnMut(&[Val]) -> Result<Val, String> + 'static,
+    ) {
+        self.extern_fns.insert(name.to_string(), Box::new(f));
+    }
+
+    /// Invoke any `host fn` or `reflex` by name with `args` and run to
+    /// completion.
+    pub fn call_fn(&mut self, name: &str, args: Vec<Val>) -> Result<Val, String> {
+        let fi = self
             .h
-            .entry
-            .ok_or_else(|| "no `host fn main`".to_string())?;
+            .fns
+            .iter()
+            .position(|f| f.name == name)
+            .ok_or_else(|| format!("no host fn or reflex `{name}`"))?;
+        let want = self.h.fns[fi].args.len();
+        if args.len() != want {
+            return Err(format!("{name} expects {want} args, found {}", args.len()));
+        }
+        self.stack.clear();
+        self.frames.clear();
+        self.halted = false;
+        self.result = None;
+        for a in args {
+            self.stack.push(a);
+        }
+        let need = self.nslots[fi] as usize;
+        for _ in want..need {
+            self.stack.push(Val::Unit);
+        }
         self.frames.push(Frame {
-            f: entry as u32,
+            f: fi as u32,
             ip: 0,
             base: 0,
         });
-        let need = self.nslots[entry] as usize;
-        for _ in 0..need {
-            self.stack.push(Val::Unit);
-        }
         self.run()?;
         Ok(self.result.clone().unwrap_or(Val::Unit))
+    }
+
+    /// kick off `main` and run to completion (or die).
+    pub fn run_main(&mut self) -> Result<Val, String> {
+        self.call_fn("main", Vec::new())
     }
 
     fn run(&mut self) -> Result<(), String> {
@@ -935,6 +976,20 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Op::Call(fi, argc) => self.do_call(fi, argc)?,
+                Op::CallExt(ei, argc) => {
+                    let mut args = Vec::new();
+                    for _ in 0..argc {
+                        args.push(self.stack.pop().unwrap());
+                    }
+                    args.reverse();
+                    let name = self.h.externs[ei as usize].name.clone();
+                    let cb = self
+                        .extern_fns
+                        .get_mut(&name)
+                        .ok_or_else(|| format!("unbound extern fn `{name}` — bind it before running"))?;
+                    let r = cb(&args)?;
+                    self.stack.push(r);
+                }
                 Op::CallDyn(argc) => {
                     let mut args = Vec::new();
                     for _ in 0..argc {

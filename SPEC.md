@@ -167,14 +167,18 @@ coyote run   f.cy -o dir     # + execute on ANE + diff vs CPU reference
 
 ## roadmap (the charter's order)
 
-- **M2** batched matmul (M>1 via conv1x1), gather/`embed[]`, concat, slices,
-  q4 dequant-at-load, tensor ÷ tensor, gelu, `.T` outside `@`
+- **M2** ✓ batched matmul (M>1 via Kronecker block projection), gather/`embed[]`,
+  `concat`, slices `x[a..b]`, `q4` blockwise weight quantization, `gelu`,
+  `tensor / tensor` (`real_div`), standalone `.T` outside `@` (`examples/m2_ops.cy`,
+  `examples/batched_m2.cy`, verified vs CPU)
 - **M4-lite** ✓ `state` blocks — packed persistent surfaces, scatter
   writes via one-hot `outer`, masked KV-cache attention on-chip
   (`examples/decode.cy`, verified vs CPU)
-- **M3** ✓ `grad(loss, w)` — reverse-mode AD, folded SGD updates, on-chip
-  training verified vs CPU. M3b: relu/softmax/rmsnorm/.T backwards,
-  adam state
+- **M3 / M3b** ✓ `grad(loss, w)` — reverse-mode AD over `@`, `+`, `-`, `*`,
+  `/`, `sigmoid`, `tanh`, `silu`, `relu`, `gelu`, `softmax`, `rmsnorm`,
+  `concat`, slices, `.T`, and `mse`; folded SGD updates (`w -= lr * grad`)
+  and `adam(w, grad(loss, w), lr)` optimizer state (`examples/train.cy`,
+  `examples/adam_m3b.cy`, verified vs CPU)
 - **M4** `if`/comparisons, masks, transformer block, decode step
 - **M5** `state` blocks — fixed-capacity KV cache + runtime occupancy,
   index/slice lowering, `io` streaming

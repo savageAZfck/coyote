@@ -138,7 +138,12 @@ step   3  |ane−cpu| pred 0.002617  kv 0.179768  |kv| 9236.196
 ```
 
 `examples/train.cy` — on-chip training via `grad` (MSE 1.35 → 0.12 over
-20 steps, weights fed back each step). `examples/decode.cy` — KV-cache
+20 steps, weights fed back each step). `examples/adam_m3b.cy` — on-chip
+backprop through `rmsnorm`, `relu`, `gelu`, and `softmax` with `adam`
+moment updates. `examples/m2_ops.cy` and `examples/batched_m2.cy` —
+batched matmul (`M > 1`), `q4` weights, `gelu`, `concat`, slices
+`h[0..32]`, `w[row]` gather, standalone `.T`, and `tensor / tensor`
+division verified on silicon against CPU. `examples/decode.cy` — KV-cache
 decode step. `examples/ffn.cy` — first light.
 
 `examples/qwenorg.cy` — single-layer Qwen3 organism decode loop.

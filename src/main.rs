@@ -7,13 +7,14 @@
 //!                                   with trainable params, N steps of the
 //!                                   weight-feedback loop = on-chip training.
 
+use coyote::emit_program;
 use coyote::eval::Evaluator;
-use coyote::lower::{init_weight_pub, lower, sha256_hex};
+use coyote::lower::{init_weight_pub, sha256_hex};
 use coyote::parser::parse_file;
 use coyote::typeck::check_all;
 use coyote::vm::{AneProg, ProgBackend, Vm};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn out_dir(args: &[String]) -> PathBuf {
     args.windows(2)
@@ -40,133 +41,6 @@ fn rebuild_arg(args: &[String]) -> bool {
 
 fn cpu_arg(args: &[String]) -> bool {
     args.iter().any(|a| a == "--cpu")
-}
-
-fn emit(
-    src: &str,
-    p: &coyote::typeck::TProgram,
-    dir: &Path,
-    rebuild: bool,
-) -> Result<coyote::lower::MilOut, String> {
-    use coyote::ast::DType;
-    use coyote::typeck::CTy;
-    let src_sha = sha256_hex(src.as_bytes());
-    let cache = dir.join("coyote_plan.txt");
-    if !rebuild {
-        if let Ok(text) = std::fs::read_to_string(&cache) {
-            if let Some(out) = parse_plan_cache(&text, &src_sha) {
-                if dir.join("net.mil").exists() {
-                    return Ok(out);
-                }
-            }
-        }
-    }
-    let out = lower(p, dir.to_str().unwrap_or("."), &src_sha).map_err(|d| d.to_string())?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    // blob paths in the mil are bare filenames → write next to net.mil
-    for (fname, bytes) in &out.blobs {
-        std::fs::write(dir.join(fname), bytes).map_err(|e| format!("{fname}: {e}"))?;
-    }
-    std::fs::write(dir.join("net.mil"), &out.mil).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("coyote_build.json"), &out.manifest).map_err(|e| e.to_string())?;
-    // the warm path: everything a cached program needs to re-enter the
-    // VM without re-lowering or re-resolving weights.
-    let dt_ch = |d: &DType| match d {
-        DType::F16 => "f16",
-        DType::F32 => "f32",
-        DType::I32 => "i32",
-        DType::Q4 => "q4",
-    };
-    let dims_s = |t: &CTy| t.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
-    let mut pl = format!("CYPLAN1\nsrc_sha {src_sha}\nmil_sha {}\n", out.mil_sha);
-    for (n, t, contig) in &out.inputs {
-        pl.push_str(&format!("input {n} {} {} {}\n", dt_ch(&t.dt), dims_s(t), *contig as u8));
-    }
-    for (pn, port, t, s) in &out.trainable {
-        pl.push_str(&format!("trainable {pn} {port} {} {} {}\n", dt_ch(&t.dt), dims_s(t), s.as_deref().unwrap_or("-")));
-    }
-    for (pn, mn, t) in &out.param_outs {
-        pl.push_str(&format!("param_out {pn} {mn} {} {}\n", dt_ch(&t.dt), dims_s(t)));
-    }
-    for (k, port, t) in &out.states {
-        pl.push_str(&format!("state {k} {port} {} {}\n", dt_ch(&t.dt), dims_s(t)));
-    }
-    for (port, mn, t) in &out.state_outs {
-        pl.push_str(&format!("state_out {port} {mn} {} {}\n", dt_ch(&t.dt), dims_s(t)));
-    }
-    pl.push_str(&format!("output {} {} {}\n", out.output.0, dt_ch(&out.output.1.dt), dims_s(&out.output.1)));
-    std::fs::write(&cache, pl).map_err(|e| e.to_string())?;
-    Ok(out)
-}
-
-/// rebuild a MilOut (mil/blobs empty — the artifacts on disk are
-/// authoritative) from a coyote_plan.txt written by emit().
-fn parse_plan_cache(text: &str, src_sha: &str) -> Option<coyote::lower::MilOut> {
-    use coyote::ast::DType;
-    use coyote::typeck::CTy;
-    let mut lines = text.lines();
-    if lines.next()? != "CYPLAN1" {
-        return None;
-    }
-    if lines.next()?.strip_prefix("src_sha ")? != src_sha {
-        return None;
-    }
-    let mil_sha = lines.next()?.strip_prefix("mil_sha ")?.to_string();
-    let rd_ty = |dt: &str, ds: &str| -> Option<CTy> {
-        Some(CTy {
-            dt: match dt {
-                "f16" => DType::F16,
-                "f32" => DType::F32,
-                "i32" => DType::I32,
-                _ => DType::Q4,
-            },
-            dims: ds
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|d| d.parse().ok())
-                .collect::<Option<Vec<i64>>>()?,
-        })
-    };
-    let (mut inputs, mut trainable, mut param_outs) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut states, mut state_outs) = (Vec::new(), Vec::new());
-    let mut output = None;
-    for l in lines {
-        let f: Vec<&str> = l.split_whitespace().collect();
-        match f.first().copied() {
-            Some("input") if f.len() >= 5 => {
-                inputs.push((f[1].into(), rd_ty(f[2], f[3])?, f[4] == "1"));
-            }
-            Some("trainable") if f.len() >= 6 => {
-                let src = (f[5] != "-").then(|| f[5].to_string());
-                trainable.push((f[1].into(), f[2].into(), rd_ty(f[3], f[4])?, src));
-            }
-            Some("param_out") if f.len() >= 5 => {
-                param_outs.push((f[1].into(), f[2].into(), rd_ty(f[3], f[4])?));
-            }
-            Some("state") if f.len() >= 5 => {
-                states.push((f[1].into(), f[2].into(), rd_ty(f[3], f[4])?));
-            }
-            Some("state_out") if f.len() >= 5 => {
-                state_outs.push((f[1].into(), f[2].into(), rd_ty(f[3], f[4])?));
-            }
-            Some("output") if f.len() >= 4 => {
-                output = Some((f[1].to_string(), rd_ty(f[2], f[3])?));
-            }
-            _ => {}
-        }
-    }
-    Some(coyote::lower::MilOut {
-        mil: String::new(),
-        blobs: Vec::new(),
-        inputs,
-        trainable,
-        param_outs,
-        states,
-        state_outs,
-        output: output?,
-        manifest: String::new(),
-        mil_sha,
-    })
 }
 
 /// elementwise f16 read of an output surface through its desc.
@@ -236,7 +110,7 @@ fn main() {
             for (name, tp) in &checked.ane {
                 let dir2 = dir.join(name);
                 let t0 = std::time::Instant::now();
-                let out = emit(&src, tp, &dir2, rebuild)?;
+                let out = emit_program(&src, tp, &dir2, rebuild)?;
                 let t_emit = t0.elapsed();
                 let backend = if use_cpu {
                     println!(
@@ -334,7 +208,7 @@ fn main() {
                     .first()
                     .ok_or("no ane programs and no host entry — nothing to run")?
                     .1;
-                let out = emit(&src, prog, &dir, rebuild)?;
+                let out = emit_program(&src, prog, &dir, rebuild)?;
                 let verb = if out.mil.is_empty() { "cached" } else { "lowered" };
                 println!("✓ {verb} → {}", dir.join("net.mil").display());
                 println!("  mil sha256: {}", &out.mil_sha[..16]);
@@ -455,6 +329,8 @@ fn main() {
                 // cpu-side weights track the same init
                 let mut cpu_w = ane_w.clone();
                 let mut cpu_s = ane_s.clone();
+                let mut ane_adam: HashMap<String, (Vec<f32>, Vec<f32>)> = HashMap::new();
+                let mut cpu_adam: HashMap<String, (Vec<f32>, Vec<f32>)> = HashMap::new();
                 for step in 0..nsteps {
                     // token feedback: embed the pending token's row
                     // into x (host gather — the same split Apple's own
@@ -586,14 +462,33 @@ fn main() {
                             let praw = rt.output(pidx).to_vec();
                             let (nn, kk) =
                                 (cty.dims[1] as usize, cty.dims[0] as usize);
-                            let wnew = read_surface(&praw, &pdesc, nn, kk);
+                            let mut wnew = read_surface(&praw, &pdesc, nn, kk);
                             // cpu-side update from the same step
-                            let cupd = ev
+                            let mut cupd = ev
                                 .param_updates()
                                 .iter()
                                 .find(|(p, _)| p == pname)
                                 .map(|(_, v)| v.clone())
                                 .unwrap_or_default();
+                            if let Some(&(_, lr)) = out.adam_lrs.iter().find(|(p, _)| p == pname) {
+                                let g_ane = wnew;
+                                let mut w_cur = ane_w.get(pname).cloned().unwrap_or_default();
+                                let (m, v) = ane_adam
+                                    .entry(pname.clone())
+                                    .or_insert_with(|| (vec![0.0; w_cur.len()], vec![0.0; w_cur.len()]));
+                                coyote::eval::adam_step(&mut w_cur, &g_ane, m, v, step, lr);
+                                wnew = w_cur;
+
+                                if !cupd.is_empty() {
+                                    let g_cpu = cupd;
+                                    let mut wc_cur = cpu_w.get(pname).cloned().unwrap_or_default();
+                                    let (mc, vc) = cpu_adam
+                                        .entry(pname.clone())
+                                        .or_insert_with(|| (vec![0.0; wc_cur.len()], vec![0.0; wc_cur.len()]));
+                                    coyote::eval::adam_step(&mut wc_cur, &g_cpu, mc, vc, step, lr);
+                                    cupd = wc_cur;
+                                }
+                            }
                             if !cupd.is_empty() {
                                 let d = wnew
                                     .iter()

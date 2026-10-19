@@ -11,6 +11,7 @@ pub enum Tok {
 
     // keywords
     Import,
+    Extern,
     Fn,
     Host,
     Reflex,
@@ -94,6 +95,7 @@ pub struct Lexed {
 fn kw(s: &str) -> Option<Tok> {
     Some(match s {
         "import" => Tok::Import,
+        "extern" => Tok::Extern,
         "fn" => Tok::Fn,
         "host" => Tok::Host,
         "reflex" => Tok::Reflex,

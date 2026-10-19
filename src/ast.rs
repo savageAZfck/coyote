@@ -158,8 +158,21 @@ pub enum Decl {
         name: Sp<String>,
         variants: Vec<(Sp<String>, Vec<Sp<HTy>>)>,
     },
+    /// `extern [det|stoch] fn name(args...) [-> ret] [cap c1, c2];` —
+    /// host/FFI function bound from Rust or Swift, checked under the
+    /// same constitutional rules as native functions.
+    ExternFn(Sp<ExternFn>),
     Fn(Sp<Fn>),
     HostFn(Sp<HFn>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternFn {
+    pub name: String,
+    pub args: Vec<(Sp<String>, Sp<HTy>)>,
+    pub ret: Option<Sp<HTy>>,
+    pub det: DetMode,
+    pub caps: Vec<Sp<String>>,
 }
 
 #[derive(Debug, Clone)]

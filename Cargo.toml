@@ -8,6 +8,7 @@ description = "bare-metal language for sovereign computation — source to silic
 [lib]
 name = "coyote"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "coyote"

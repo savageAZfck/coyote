@@ -76,6 +76,8 @@ pub enum TStmt {
     /// `w op= s * grad(loss, w)` — the SGD step, folded: the seed is
     /// pre-scaled so the update lowers to a single packed add.
     ParamUpdate { param: String, scale: f64, grad: Typed },
+    /// `adam(w, grad(loss, w), lr)` — Adam moment update over on-chip grad.
+    AdamUpdate { param: String, lr: f64, grad: Typed },
     /// `kv.k = e` / `kv.k += e` / `kv.k[pos] = e` — a state field takes
     /// a new value; the result becomes an output the host feeds back.
     /// `key` is `kv.k`, `port` the mil arg `kv_k`.
@@ -280,6 +282,30 @@ impl Ck {
                 if idxs.len() > base.ty.dims.len() {
                     return diag("too many indices", l, c);
                 }
+                // `w[pos]` where `w: [V, D]` and `pos: f16[V]` (runtime one-hot
+                // vector) desugars to `gather(w, pos)` (`pos @ w`).
+                if idxs.len() == 1 && base.ty.dims.len() == 2 {
+                    if let Index::Expr(ie) = &idxs[0].v {
+                        if self.const_int(ie, dims).is_err() {
+                            if let Ok(idx_t) = self.expr(ie, env, dims, depth) {
+                                if idx_t.ty.dims == vec![base.ty.dims[0]] {
+                                    let out_ty = CTy {
+                                        dt: DType::F16,
+                                        dims: vec![base.ty.dims[1]],
+                                    };
+                                    return Ok(Typed {
+                                        e: TExpr::Call(
+                                            "gather".into(),
+                                            vec![base, idx_t],
+                                            Vec::new(),
+                                        ),
+                                        ty: out_ty,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut tidx = Vec::new();
                 let mut out_dims = Vec::new();
                 for (i, ix) in idxs.iter().enumerate() {
@@ -312,7 +338,7 @@ impl Ck {
                 // remaining (unspecified) dims carry through
                 out_dims.extend_from_slice(&base.ty.dims[idxs.len()..]);
                 let ty = CTy {
-                    dt: base.ty.dt,
+                    dt: DType::F16,
                     dims: out_dims,
                 };
                 Ok(Typed {
@@ -537,14 +563,48 @@ impl Ck {
             }
         };
         match name {
-            // v1 lowerable set — the invariant is "everything that
+            // v1/M2 lowerable set — the invariant is "everything that
             // typechecks lowers", so the admitted set IS the backend set.
-            "relu" | "sigmoid" | "tanh" | "silu" | "softmax" => {
+            "relu" | "sigmoid" | "tanh" | "silu" | "softmax" | "gelu" => {
                 arity(1)?;
                 if args[0].ty.dims.is_empty() {
                     return diag(format!("{name} on scalar"), l, c);
                 }
                 Ok(args[0].ty.clone())
+            }
+            "concat" => {
+                arity(2)?;
+                if args[0].ty.dims.len() != 1 || args[1].ty.dims.len() != 1 {
+                    return diag("concat(a[K1], b[K2]) expects two rank-1 vectors", l, c);
+                }
+                Ok(CTy {
+                    dt: args[0].ty.dt,
+                    dims: vec![args[0].ty.dims[0] + args[1].ty.dims[0]],
+                })
+            }
+            "gather" | "embed" => {
+                arity(2)?;
+                if args[0].ty.dims.len() != 2 || args[1].ty.dims.len() != 1 {
+                    return diag(
+                        format!("{name}(table[V, D], onehot_idx[V]) expected"),
+                        l,
+                        c,
+                    );
+                }
+                if args[0].ty.dims[0] != args[1].ty.dims[0] {
+                    return diag(
+                        format!(
+                            "{name}: table has {} rows but index vector has length {}",
+                            args[0].ty.dims[0], args[1].ty.dims[0]
+                        ),
+                        l,
+                        c,
+                    );
+                }
+                Ok(CTy {
+                    dt: DType::F16,
+                    dims: vec![args[0].ty.dims[1]],
+                })
             }
             "rmsnorm" => {
                 arity(2)?;
@@ -581,7 +641,7 @@ impl Ck {
                 Ok(args[0].ty.clone())
             }
             _ => diag(
-                format!("unknown function {name:?} — v1 builtins: relu sigmoid tanh silu softmax rmsnorm mse outer"),
+                format!("unknown function {name:?} — builtins: relu sigmoid tanh silu gelu softmax rmsnorm concat gather embed mse outer"),
                 l,
                 c,
             ),
@@ -776,6 +836,45 @@ impl Ck {
                     return diag("control flow is host-stratum — wrap it in `host fn`", s.line, s.col)
                 }
                 Stmt::Expr(e) => {
+                    if let Expr::Call(n, pos, named) = &e.v {
+                        if n == "adam" {
+                            if pos.len() < 2 || pos.len() > 3 {
+                                return diag("adam(param, grad(loss, param) [, lr]) expects 2-3 args", e.line, e.col);
+                            }
+                            let pname = match &pos[0].v {
+                                Expr::Ident(s) => s.clone(),
+                                _ => return diag("adam's first arg must be a trainable param", pos[0].line, pos[0].col),
+                            };
+                            match self.params.get(&pname) {
+                                Some((Qual::Trainable, _, _)) => {}
+                                Some((q, _, _)) => {
+                                    return diag(format!("adam target {pname:?} is {q:?}, must be trainable"), pos[0].line, pos[0].col)
+                                }
+                                None => return diag(format!("adam target {pname:?} is not a param"), pos[0].line, pos[0].col),
+                            }
+                            let (_, gpos) = self.grad_of(&pos[1], letmap).ok_or(()).map_err(|_| Diag {
+                                msg: "adam's second arg must be `grad(loss, param)`".into(),
+                                line: pos[1].line,
+                                col: pos[1].col,
+                            })?;
+                            let grad = self.grad_call(gpos, env, dims, depth, pos[1].line, pos[1].col)?;
+                            let lr = pos
+                                .get(2)
+                                .or_else(|| named.iter().find(|(k, _)| k.v == "lr").map(|(_, v)| v))
+                                .and_then(|le| match le.v {
+                                    Expr::Lit(f) => Some(f),
+                                    Expr::Int(i) => Some(i as f64),
+                                    _ => None,
+                                })
+                                .unwrap_or(0.01);
+                            out.push(TStmt::AdamUpdate {
+                                param: pname,
+                                lr,
+                                grad,
+                            });
+                            continue;
+                        }
+                    }
                     let te = self.expr(e, env, dims, depth)?;
                     if terminal {
                         // the trailing expression is the block's result —
@@ -980,6 +1079,7 @@ pub(crate) fn collect(
     Vec<String>,
     Vec<(String, String)>,
     Vec<Sp<HFn>>,
+    Vec<Sp<ExternFn>>,
     Vec<(String, Vec<(String, HTy)>)>,
     Vec<(String, Vec<(String, Vec<HTy>)>)>,
     Vec<(String, Ty, Option<String>)>,
@@ -995,6 +1095,7 @@ pub(crate) fn collect(
     let mut caps = Vec::new();
     let mut provenance = Vec::new();
     let mut hostfns = Vec::new();
+    let mut externs = Vec::new();
     let mut structs = Vec::new();
     let mut enums = Vec::new();
     let mut tables = Vec::new();
@@ -1043,6 +1144,9 @@ pub(crate) fn collect(
                         .collect(),
                 ));
             }
+            Decl::ExternFn(ef) => {
+                externs.push(ef.clone());
+            }
             Decl::Fn(f) => {
                 ck.fns.insert(f.v.name.clone(), f.clone());
             }
@@ -1058,7 +1162,9 @@ pub(crate) fn collect(
             }
         }
     }
-    Ok((ck, invariants, caps, provenance, hostfns, structs, enums, tables))
+    Ok((
+        ck, invariants, caps, provenance, hostfns, externs, structs, enums, tables,
+    ))
 }
 
 impl Ck {
@@ -1152,7 +1258,8 @@ impl Ck {
 /// organism-aware entry point: every concrete ane fn becomes a
 /// program; host fns check against their signatures.
 pub fn check_all(p: &Program) -> CResult<Checked> {
-    let (mut ck, invariants, caps, provenance, hostfns, structs, enums, tables) = collect(p)?;
+    let (mut ck, invariants, caps, provenance, hostfns, externs, structs, enums, tables) =
+        collect(p)?;
     if hostfns.is_empty() {
         let prog = check(p)?;
         return Ok(Checked {
@@ -1203,7 +1310,9 @@ pub fn check_all(p: &Program) -> CResult<Checked> {
         )?;
         ane.push((f.v.name.clone(), prog));
     }
-    let host = crate::hostck::check(p, &hostfns, &structs, &enums, &caps, &ck, &ane, &tables)?;
+    let host = crate::hostck::check(
+        p, &hostfns, &externs, &structs, &enums, &caps, &ck, &ane, &tables,
+    )?;
     let organism = hostfns.iter().any(|f| f.v.name == "main");
     Ok(Checked {
         ane,
@@ -1216,7 +1325,8 @@ pub fn check_all(p: &Program) -> CResult<Checked> {
 
 /// typecheck a whole program → concrete TProgram.
 pub fn check(p: &Program) -> CResult<TProgram> {
-    let (mut ck, invariants, caps, provenance, _hostfns, _structs, _enums, _tables) = collect(p)?;
+    let (mut ck, invariants, caps, provenance, _hostfns, _externs, _structs, _enums, _tables) =
+        collect(p)?;
     let main = ck
         .fns
         .get("main")
