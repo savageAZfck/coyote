@@ -34,8 +34,29 @@ fn resume_arg(args: &[String]) -> Option<PathBuf> {
         .map(|w| PathBuf::from(&w[1]))
 }
 
-fn emit(src: &str, p: &coyote::typeck::TProgram, dir: &Path) -> Result<coyote::lower::MilOut, String> {
+fn rebuild_arg(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--rebuild")
+}
+
+fn emit(
+    src: &str,
+    p: &coyote::typeck::TProgram,
+    dir: &Path,
+    rebuild: bool,
+) -> Result<coyote::lower::MilOut, String> {
+    use coyote::ast::DType;
+    use coyote::typeck::CTy;
     let src_sha = sha256_hex(src.as_bytes());
+    let cache = dir.join("coyote_plan.txt");
+    if !rebuild {
+        if let Ok(text) = std::fs::read_to_string(&cache) {
+            if let Some(out) = parse_plan_cache(&text, &src_sha) {
+                if dir.join("net.mil").exists() {
+                    return Ok(out);
+                }
+            }
+        }
+    }
     let out = lower(p, dir.to_str().unwrap_or("."), &src_sha).map_err(|d| d.to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // blob paths in the mil are bare filenames → write next to net.mil
@@ -44,7 +65,104 @@ fn emit(src: &str, p: &coyote::typeck::TProgram, dir: &Path) -> Result<coyote::l
     }
     std::fs::write(dir.join("net.mil"), &out.mil).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("coyote_build.json"), &out.manifest).map_err(|e| e.to_string())?;
+    // the warm path: everything a cached program needs to re-enter the
+    // VM without re-lowering or re-resolving weights.
+    let dt_ch = |d: &DType| match d {
+        DType::F16 => "f16",
+        DType::F32 => "f32",
+        DType::I32 => "i32",
+        DType::Q4 => "q4",
+    };
+    let dims_s = |t: &CTy| t.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+    let mut pl = format!("CYPLAN1\nsrc_sha {src_sha}\nmil_sha {}\n", out.mil_sha);
+    for (n, t, contig) in &out.inputs {
+        pl.push_str(&format!("input {n} {} {} {}\n", dt_ch(&t.dt), dims_s(t), *contig as u8));
+    }
+    for (pn, port, t, s) in &out.trainable {
+        pl.push_str(&format!("trainable {pn} {port} {} {} {}\n", dt_ch(&t.dt), dims_s(t), s.as_deref().unwrap_or("-")));
+    }
+    for (pn, mn, t) in &out.param_outs {
+        pl.push_str(&format!("param_out {pn} {mn} {} {}\n", dt_ch(&t.dt), dims_s(t)));
+    }
+    for (k, port, t) in &out.states {
+        pl.push_str(&format!("state {k} {port} {} {}\n", dt_ch(&t.dt), dims_s(t)));
+    }
+    for (port, mn, t) in &out.state_outs {
+        pl.push_str(&format!("state_out {port} {mn} {} {}\n", dt_ch(&t.dt), dims_s(t)));
+    }
+    pl.push_str(&format!("output {} {} {}\n", out.output.0, dt_ch(&out.output.1.dt), dims_s(&out.output.1)));
+    std::fs::write(&cache, pl).map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+/// rebuild a MilOut (mil/blobs empty — the artifacts on disk are
+/// authoritative) from a coyote_plan.txt written by emit().
+fn parse_plan_cache(text: &str, src_sha: &str) -> Option<coyote::lower::MilOut> {
+    use coyote::ast::DType;
+    use coyote::typeck::CTy;
+    let mut lines = text.lines();
+    if lines.next()? != "CYPLAN1" {
+        return None;
+    }
+    if lines.next()?.strip_prefix("src_sha ")? != src_sha {
+        return None;
+    }
+    let mil_sha = lines.next()?.strip_prefix("mil_sha ")?.to_string();
+    let rd_ty = |dt: &str, ds: &str| -> Option<CTy> {
+        Some(CTy {
+            dt: match dt {
+                "f16" => DType::F16,
+                "f32" => DType::F32,
+                "i32" => DType::I32,
+                _ => DType::Q4,
+            },
+            dims: ds
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|d| d.parse().ok())
+                .collect::<Option<Vec<i64>>>()?,
+        })
+    };
+    let (mut inputs, mut trainable, mut param_outs) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut states, mut state_outs) = (Vec::new(), Vec::new());
+    let mut output = None;
+    for l in lines {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        match f.first().copied() {
+            Some("input") if f.len() >= 5 => {
+                inputs.push((f[1].into(), rd_ty(f[2], f[3])?, f[4] == "1"));
+            }
+            Some("trainable") if f.len() >= 6 => {
+                let src = (f[5] != "-").then(|| f[5].to_string());
+                trainable.push((f[1].into(), f[2].into(), rd_ty(f[3], f[4])?, src));
+            }
+            Some("param_out") if f.len() >= 5 => {
+                param_outs.push((f[1].into(), f[2].into(), rd_ty(f[3], f[4])?));
+            }
+            Some("state") if f.len() >= 5 => {
+                states.push((f[1].into(), f[2].into(), rd_ty(f[3], f[4])?));
+            }
+            Some("state_out") if f.len() >= 5 => {
+                state_outs.push((f[1].into(), f[2].into(), rd_ty(f[3], f[4])?));
+            }
+            Some("output") if f.len() >= 4 => {
+                output = Some((f[1].to_string(), rd_ty(f[2], f[3])?));
+            }
+            _ => {}
+        }
+    }
+    Some(coyote::lower::MilOut {
+        mil: String::new(),
+        blobs: Vec::new(),
+        inputs,
+        trainable,
+        param_outs,
+        states,
+        state_outs,
+        output: output?,
+        manifest: String::new(),
+        mil_sha,
+    })
 }
 
 /// elementwise f16 read of an output surface through its desc.
@@ -98,6 +216,7 @@ fn main() {
     let file = PathBuf::from(&args[2]);
     let dir = out_dir(&args[3..]);
     let steps = steps_arg(&args[3..]);
+    let rebuild = rebuild_arg(&args[3..]);
 
     let r = (|| -> Result<(), String> {
         let src = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -112,13 +231,20 @@ fn main() {
             let mut progs = Vec::new();
             for (name, tp) in &checked.ane {
                 let dir2 = dir.join(name);
-                let out = emit(&src, tp, &dir2)?;
+                let t0 = std::time::Instant::now();
+                let out = emit(&src, tp, &dir2, rebuild)?;
+                let t_emit = t0.elapsed();
                 let plan = mil_infer::graph::compile_graph(
                     dir2.join("net.mil").to_str().unwrap(),
                     dir2.to_str().unwrap(),
                 )
                 .map_err(|e| format!("compile_graph ({name}): {e}"))?;
-                println!("✓ {name} — {} program nodes", plan.nodes.len());
+                println!(
+                    "✓ {name} — {} program nodes  (emit {:.1}s, compile {:.1}s)",
+                    plan.nodes.len(),
+                    t_emit.as_secs_f64(),
+                    t0.elapsed().as_secs_f64() - t_emit.as_secs_f64()
+                );
                 let rt = mil_infer::graph::GraphRuntime::load(plan)
                     .map_err(|e| format!("runtime load ({name}): {e}"))?;
                 progs.push(AneProg {
@@ -190,8 +316,9 @@ fn main() {
                     .first()
                     .ok_or("no ane programs and no host entry — nothing to run")?
                     .1;
-                let out = emit(&src, &prog, &dir)?;
-                println!("✓ lowered → {}", dir.join("net.mil").display());
+                let out = emit(&src, prog, &dir, rebuild)?;
+                let verb = if out.mil.is_empty() { "cached" } else { "lowered" };
+                println!("✓ {verb} → {}", dir.join("net.mil").display());
                 println!("  mil sha256: {}", &out.mil_sha[..16]);
                 let plan = mil_infer::graph::compile_graph(
                     dir.join("net.mil").to_str().unwrap(),

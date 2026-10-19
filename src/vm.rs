@@ -1243,9 +1243,10 @@ impl<'a> Vm<'a> {
                 let surf = read_surface_dims(&raw, &desc, &dims_usize(ty));
                 souts.push((port.clone(), surf));
             }
-            // give the residency pool back — the organism's programs
-            // run one at a time; holding l0's residents starves l1.
-            prog.rt.release_residents();
+            // give both pools back — programs AND surfaces. the
+            // organism's calls are sequential; holding l0's resources
+            // starves l1's.
+            prog.rt.release_all();
             (odata, oty, pouts, souts)
         };
         // ---- land the results in the host store ----

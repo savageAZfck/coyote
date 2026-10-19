@@ -5,6 +5,24 @@
 //! deterministic xorshift init so programs stay reproducible offline.
 
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::cell::RefCell;
+
+thread_local! {
+    /// one in-memory load per source file — a checkpoint is read once
+    /// per process, not once per param.
+    static ST_FILES: RefCell<HashMap<String, Rc<SafeTensors>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn st_cached(path: &str) -> Result<Rc<SafeTensors>, String> {
+    if let Some(s) = ST_FILES.with(|c| c.borrow().get(path).cloned()) {
+        return Ok(s);
+    }
+    let s = Rc::new(SafeTensors::load(path)?);
+    ST_FILES.with(|c| c.borrow_mut().insert(path.to_string(), s.clone()));
+    Ok(s)
+}
 
 /// minimal safetensors index — name → (data range, shape, dtype)
 pub struct SafeTensors {
@@ -123,6 +141,69 @@ impl SafeTensors {
         })
     }
 
+    /// decode a strided box straight from the file buffer — only the
+    /// slice's elements are touched, so `[0:2048]` of a 300MB table
+    /// reads 4MB, not 300.
+    pub fn f32s_box(
+        &self,
+        name: &str,
+        ranges: &[(usize, usize)],
+    ) -> Result<Vec<f32>, String> {
+        let (a, b, shape, dt) = self
+            .index
+            .get(name)
+            .ok_or_else(|| format!("safetensors: missing {name}"))?;
+        let esz = match dt.as_str() {
+            "BF16" | "F16" => 2,
+            "F32" => 4,
+            other => return Err(format!("safetensors {name}: dtype {other} unsupported")),
+        };
+        let nd = shape.len().max(ranges.len());
+        let mut lo = vec![0usize; nd];
+        let mut hi = vec![1usize; nd];
+        for d in 0..nd {
+            hi[d] = shape.get(d).copied().unwrap_or(1);
+            if let Some(&(r0, r1)) = ranges.get(d) {
+                if r1 > hi[d] || r0 >= r1 {
+                    return Err(format!(
+                        "safetensors {name}: range [{r0}:{r1}] out of dim-{d} extent {}",
+                        hi[d]
+                    ));
+                }
+                lo[d] = r0;
+                hi[d] = r1;
+            }
+        }
+        let mut stride = vec![1usize; nd];
+        for d in (0..nd.saturating_sub(1)).rev() {
+            stride[d] = stride[d + 1] * shape.get(d + 1).copied().unwrap_or(1);
+        }
+        let dec = |flat: usize| -> f32 {
+            let off = a + flat * esz;
+            let end = (off + esz).min(*b);
+            let raw = &self.buf[off..end];
+            match dt.as_str() {
+                "BF16" => f32::from_bits((u16::from_le_bytes([raw[0], raw[1]]) as u32) << 16),
+                "F16" => half::f16::from_le_bytes([raw[0], raw[1]]).to_f32(),
+                _ => f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            }
+        };
+        let total: usize = (0..nd).map(|d| hi[d] - lo[d]).product();
+        let mut out = Vec::with_capacity(total);
+        let mut idx = lo.clone();
+        for _ in 0..total {
+            out.push(dec((0..nd).map(|d| idx[d] * stride[d]).sum::<usize>()));
+            for d in (0..nd).rev() {
+                idx[d] += 1;
+                if idx[d] < hi[d] {
+                    break;
+                }
+                idx[d] = lo[d];
+            }
+        }
+        Ok(out)
+    }
+
     /// decode the tensor to f32 (BF16/F16/F32 supported)
     pub fn f32s(&self, name: &str) -> Result<Vec<f32>, String> {
         let (a, b, _, dt) = self
@@ -220,14 +301,14 @@ pub fn resolve<F: Fn(&str, usize) -> Vec<f32>>(
         }
         None => (spec, None),
     };
-    let st = SafeTensors::load(path)?;
+    let st = st_cached(path)?;
     let shape = st
         .shape(tensor)
         .ok_or_else(|| format!("param {name}: missing tensor {tensor}"))?
         .to_vec();
-    let vals = st.f32s(tensor)?;
     let vals = match &ranges {
         None => {
+            let vals = st.f32s(tensor)?;
             if let Some(want) = expect {
                 if shape != want {
                     return Err(format!(
@@ -237,7 +318,9 @@ pub fn resolve<F: Fn(&str, usize) -> Vec<f32>>(
             }
             vals
         }
-        Some(rs) => slice(&vals, &shape, rs).map_err(|e| format!("param {name}: {e}"))?,
+        Some(rs) => st
+            .f32s_box(tensor, rs)
+            .map_err(|e| format!("param {name}: {e}"))?,
     };
     if let Some(want) = expect {
         let got = vals.len();
@@ -247,42 +330,4 @@ pub fn resolve<F: Fn(&str, usize) -> Vec<f32>>(
         }
     }
     Ok(vals)
-}
-
-/// row-major range slice of a decoded tensor; each dim's `[a,b)` must
-/// fit its extent. Omitted-tail dims take the full extent.
-fn slice(vals: &[f32], shape: &[usize], ranges: &[(usize, usize)]) -> Result<Vec<f32>, String> {
-    let nd = shape.len().max(ranges.len());
-    let mut lo = vec![0usize; nd];
-    let mut hi = vec![1usize; nd];
-    for d in 0..nd {
-        hi[d] = shape.get(d).copied().unwrap_or(1);
-        if let Some(&(a, b)) = ranges.get(d) {
-            if b > hi[d] || a >= b {
-                return Err(format!("range [{a}:{b}] out of dim-{d} extent {}", hi[d]));
-            }
-            lo[d] = a;
-            hi[d] = b;
-        }
-    }
-    // row-major walk over the strided box
-    let mut stride = vec![1usize; nd];
-    for d in (0..nd.saturating_sub(1)).rev() {
-        stride[d] = stride[d + 1] * shape.get(d + 1).copied().unwrap_or(1);
-    }
-    let mut out = Vec::new();
-    let mut idx = lo.clone();
-    let total: usize = (0..nd).map(|d| hi[d] - lo[d]).product();
-    out.reserve(total);
-    for _ in 0..total {
-        out.push(vals[(0..nd).map(|d| idx[d] * stride[d]).sum::<usize>()]);
-        for d in (0..nd).rev() {
-            idx[d] += 1;
-            if idx[d] < hi[d] {
-                break;
-            }
-            idx[d] = lo[d];
-        }
-    }
-    Ok(out)
 }

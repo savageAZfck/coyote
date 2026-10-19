@@ -48,7 +48,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "mil_compile"
 version = "0.2.0"
-source = "git+https://github.com/savageAZfck/mil_spec#3b1fd6e1109faa1a7f3982f34e9bb3af46016643"
+source = "git+https://github.com/savageAZfck/mil_spec#61d30ac0feb30f06ccaab946fafda2fa53c9d54a"
 dependencies = [
  "mil_spec",
 ]
@@ -56,7 +56,7 @@ dependencies = [
 [[package]]
 name = "mil_infer"
 version = "0.6.0"
-source = "git+https://github.com/savageAZfck/mil_spec#3b1fd6e1109faa1a7f3982f34e9bb3af46016643"
+source = "git+https://github.com/savageAZfck/mil_spec#61d30ac0feb30f06ccaab946fafda2fa53c9d54a"
 dependencies = [
  "half",
  "mil_compile",
@@ -67,7 +67,7 @@ dependencies = [
 [[package]]
 name = "mil_spec"
 version = "0.4.2"
-source = "git+https://github.com/savageAZfck/mil_spec#3b1fd6e1109faa1a7f3982f34e9bb3af46016643"
+source = "git+https://github.com/savageAZfck/mil_spec#61d30ac0feb30f06ccaab946fafda2fa53c9d54a"
 dependencies = [
  "half",
 ]
