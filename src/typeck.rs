@@ -116,6 +116,10 @@ pub(crate) struct Ck {
     pub(crate) params: HashMap<String, (Qual, Ty, Option<String>)>,
     pub(crate) states: HashMap<String, Vec<(String, Ty)>>,
     pub(crate) ios: Vec<(String, IoDir, CTy)>,
+    /// (state, field) pairs the current body actually touches — a
+    /// `state` decl is a spec; each program that references it gets
+    /// its own instance (a per-layer KV cache, not a shared one).
+    pub(crate) used_states: std::collections::HashSet<(String, String)>,
 }
 
 fn bind_dim(dims: &mut Dims, d: &Dim, v: i64, l: usize, c: usize) -> CResult<()> {
@@ -319,6 +323,7 @@ impl Ck {
                     if let Some(fields) = self.states.get(s) {
                         for (fname, fty) in fields {
                             if fname == &f.v {
+                                self.used_states.insert((s.clone(), f.v.clone()));
                                 return Ok(Typed {
                                     e: TExpr::Field(
                                         Box::new(Typed {
@@ -829,6 +834,7 @@ impl Ck {
                 col: target.col,
             })?;
         let fct = resolve_ty(dims, &fty, l, c)?;
+        self.used_states.insert((sname.clone(), fname.clone()));
         let key = format!("{sname}.{fname}");
         let port = format!("{sname}_{fname}");
         // `s.f` as a source expr (for += / scatter desugars)
@@ -972,6 +978,7 @@ pub(crate) fn collect(
         params: HashMap::new(),
         states: HashMap::new(),
         ios: Vec::new(),
+        used_states: std::collections::HashSet::new(),
     };
     let mut invariants = Vec::new();
     let mut caps = Vec::new();
@@ -1045,6 +1052,7 @@ impl Ck {
                 f.col,
             );
         }
+        self.used_states.clear();
         let mut dims = Dims::new();
         let mut env = Env::new();
         let mut ios = Vec::new();
@@ -1086,11 +1094,16 @@ impl Ck {
             }
         }
         ios.push(("out".to_string(), IoDir::Out, ret.ty.clone()));
+        // only the fields this program actually touches — a shared
+        // `state` decl instances per program, not globally.
         let mut states = Vec::new();
         let mut snames: Vec<_> = self.states.iter().collect();
         snames.sort_by(|a, b| a.0.cmp(b.0));
         for (sname, fields) in snames {
             for (fname, fty) in fields {
+                if !self.used_states.contains(&(sname.clone(), fname.clone())) {
+                    continue;
+                }
                 let ct = resolve_ty(&Dims::new(), fty, 0, 0)?;
                 states.push((format!("{sname}.{fname}"), format!("{sname}_{fname}"), ct));
             }
@@ -1231,12 +1244,16 @@ pub fn check(p: &Program) -> CResult<TProgram> {
             );
         }
     }
-    // state blocks → flat field tensors: (key `kv.k`, port `kv_k`, ty)
+    // state blocks → flat field tensors: (key `kv.k`, port `kv_k`, ty) —
+    // only fields the body touches (same instancing rule as program_for).
     let mut states = Vec::new();
     let mut snames: Vec<_> = ck.states.iter().collect();
     snames.sort_by(|a, b| a.0.cmp(b.0));
     for (sname, fields) in snames {
         for (fname, fty) in fields {
+            if !ck.used_states.contains(&(sname.clone(), fname.clone())) {
+                continue;
+            }
             let ct = resolve_ty(&Dims::new(), fty, 0, 0)?;
             states.push((format!("{sname}.{fname}"), format!("{sname}_{fname}"), ct));
         }

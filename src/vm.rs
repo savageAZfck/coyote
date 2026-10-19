@@ -1184,13 +1184,16 @@ impl<'a> Vm<'a> {
                     stages.push((port.clone(), dims_usize(ty), data));
                 }
             }
-            // state fields — [T, D] declared-order both ways
+            // state fields — [T, D] declared-order both ways; the
+            // host mirror is namespaced `prog.state.field` — this
+            // program's own instance, not a shared one.
             for (key, port, ty) in &prog.states {
+                let gkey = format!("{}.{}", prog.name, key);
                 let h = self
                     .gtensor
-                    .get(key)
+                    .get(&gkey)
                     .copied()
-                    .ok_or_else(|| format!("no host tensor for {key}"))?;
+                    .ok_or_else(|| format!("no host tensor for {gkey}"))?;
                 let data = self.tensors[h as usize].1.clone();
                 stages.push((port.clone(), dims_usize(ty), data));
             }
@@ -1240,6 +1243,9 @@ impl<'a> Vm<'a> {
                 let surf = read_surface_dims(&raw, &desc, &dims_usize(ty));
                 souts.push((port.clone(), surf));
             }
+            // give the residency pool back — the organism's programs
+            // run one at a time; holding l0's residents starves l1.
+            prog.rt.release_residents();
             (odata, oty, pouts, souts)
         };
         // ---- land the results in the host store ----
@@ -1252,7 +1258,8 @@ impl<'a> Vm<'a> {
             }
         }
         for (port, surf) in souts {
-            if let Some(&h) = self.gtensor.get(&port_to_key(&port)) {
+            let gkey = format!("{}.{}", self.progs[pi].name, port_to_key(&port));
+            if let Some(&h) = self.gtensor.get(&gkey) {
                 self.tensors[h as usize].1 = surf;
             }
         }

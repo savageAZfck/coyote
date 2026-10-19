@@ -492,6 +492,30 @@ impl Hk {
                 })
             }
             Expr::Field(bx, f) => {
+                // `prog.state.field` — a qualified state mirror.
+                if let Expr::Field(ibx, is) = &bx.v {
+                    if let Expr::Ident(p) = &ibx.v {
+                        let qkey = format!("{p}.{}", is.v);
+                        if let Some(fields) = self.states.get(&qkey).cloned() {
+                            if let Some(&gi) = fields.get(&f.v) {
+                                let ty = self
+                                    .glist
+                                    .get(gi as usize)
+                                    .map(|(_, _, t)| t.clone())
+                                    .unwrap_or(RTy::Unit);
+                                return Ok(HT {
+                                    e: HE::Global(gi),
+                                    ty,
+                                });
+                            }
+                            return diag(
+                                format!("state {qkey} has no field {}", f.v),
+                                f.line,
+                                f.col,
+                            );
+                        }
+                    }
+                }
                 // `state.field` — the on-chip mirror, readable as a tensor.
                 if let Expr::Ident(s) = &bx.v {
                     if let Some(fields) = self.states.get(s).cloned() {
@@ -1143,28 +1167,56 @@ pub(crate) fn check(
         hk.globals.insert(tname.clone(), (gi, rty));
     }
     // state fields — the on-chip mirror, readable by the organism.
-    let mut snames: Vec<_> = ck.states.keys().cloned().collect();
-    snames.sort();
-    for sname in snames {
-        let fields = ck.states.get(&sname).unwrap().clone();
-        let mut fmap = HashMap::new();
-        for (fname, fty) in fields {
-            let ct = resolve_ty_pub(&fty)?;
-            let key = format!("{sname}.{fname}");
-            let port = format!("{sname}_{fname}");
-            let rty = RTy::Tensor(ct.clone());
+    // `state` is a spec: each program that touches a field gets its own
+    // instance, keyed `<prog>.<state>.<field>` — layer0's kv cache is
+    // not layer1's. The unqualified `kv.k` alias exists when exactly
+    // one program uses the field.
+    let mut used_by: HashMap<String, Vec<String>> = HashMap::new(); // key → programs
+    for (pname, tp) in ane {
+        for (key, port, ty) in &tp.states {
+            used_by.entry(key.clone()).or_default().push(pname.clone());
+            let gkey = format!("{pname}.{key}");
+            let rty = RTy::Tensor(ty.clone());
             let gi = hk.glist.len() as u32;
-            hk.glist.push(
-                (
-                    key.clone(),
-                    GVal::State { key: key.clone(), port, ty: ct },
-                    rty.clone(),
-                ),
-            );
-            hk.globals.insert(key.clone(), (gi, rty));
-            fmap.insert(fname, gi);
+            hk.glist.push((
+                gkey.clone(),
+                GVal::State { key: gkey.clone(), port: port.clone(), ty: ty.clone() },
+                rty.clone(),
+            ));
+            hk.globals.insert(gkey, (gi, rty));
         }
-        hk.states.insert(sname, fmap);
+    }
+    for (pname, tp) in ane {
+        for (key, _, ty) in &tp.states {
+            let (sname, fname) = match key.split_once('.') {
+                Some(p) => p,
+                None => continue,
+            };
+            // qualified: `layer0.kv.k0lo`
+            hk.states
+                .entry(format!("{pname}.{sname}"))
+                .or_default()
+                .insert(fname.to_string(), hk.globals[&format!("{pname}.{key}")].0);
+            // unqualified `kv.k0lo` — only when unambiguous
+            if used_by.get(key).map(|v| v.len()) == Some(1) {
+                let gkey = key.to_string();
+                if !hk.globals.contains_key(&gkey) {
+                    let rty = RTy::Tensor(ty.clone());
+                    let gi = hk.glist.len() as u32;
+                    let port = format!("{sname}_{fname}");
+                    hk.glist.push((
+                        gkey.clone(),
+                        GVal::State { key: format!("{pname}.{key}"), port, ty: ty.clone() },
+                        rty.clone(),
+                    ));
+                    hk.globals.insert(gkey, (gi, rty));
+                }
+                hk.states
+                    .entry(sname.to_string())
+                    .or_default()
+                    .insert(fname.to_string(), hk.globals[key].0);
+            }
+        }
     }
     // fn name → index
     for (i, f) in hk.fndecl.iter().enumerate() {
