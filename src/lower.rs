@@ -114,7 +114,11 @@ fn mil_shape(ty: &CTy) -> String {
         2 => format!("[1, {}, 1, {}]", ty.dims[0], ty.dims[1]),
         _ => format!(
             "[{}]",
-            ty.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+            ty.dims
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -229,12 +233,11 @@ impl Lo {
 
     /// emit (or reuse) a param as a mil const; returns its mil name.
     fn param_ref(&mut self, name: &str, role: &'static str) -> CResult<(String, CTy, bool)> {
-        let (qual, ty, src) = self
-            .params
-            .get(name)
-            .cloned()
-            .ok_or(())
-            .map_err(|_| Diag { msg: format!("{name} is not a param"), line: 0, col: 0 })?;
+        let (qual, ty, src) = self.params.get(name).cloned().ok_or(()).map_err(|_| Diag {
+            msg: format!("{name} is not a param"),
+            line: 0,
+            col: 0,
+        })?;
         if let Some(n) = self.param_emitted.get(&(name.to_string(), role)) {
             return Ok((n.clone(), ty, qual == Qual::Sealed));
         }
@@ -247,7 +250,11 @@ impl Lo {
         let is_q4 = ty.dt == DType::Q4;
         let init = |expect: &[usize]| -> CResult<Vec<f32>> {
             let mut v = crate::weights::resolve(name, Some(expect), src.as_deref(), init_weight)
-                .map_err(|m| Diag { msg: m, line: 0, col: 0 })?;
+                .map_err(|m| Diag {
+                    msg: m,
+                    line: 0,
+                    col: 0,
+                })?;
             if is_q4 {
                 v = q4_quantize(&v);
             }
@@ -516,12 +523,15 @@ impl Lo {
                                     src.as_deref(),
                                     init_weight,
                                 )
-                                .map_err(|m| Diag { msg: m, line: 0, col: 0 })?;
+                                .map_err(|m| Diag {
+                                    msg: m,
+                                    line: 0,
+                                    col: 0,
+                                })?;
                                 if pty.dt == DType::Q4 {
                                     w = q4_quantize(&w);
                                 }
-                                let rvec: Vec<f32> =
-                                    (0..d_dim).map(|j| w[j * v_dim + r]).collect();
+                                let rvec: Vec<f32> = (0..d_dim).map(|j| w[j * v_dim + r]).collect();
                                 self.scalar_blobs += 1;
                                 let cname = format!("__row{}", self.scalar_blobs);
                                 let fname = format!("{cname}.bin");
@@ -546,10 +556,11 @@ impl Lo {
                 // latest StateUpdate value.
                 if let TExpr::Ident(s) = &base.e {
                     let key = format!("{s}.{f}");
-                    return self
-                        .lookup(&key)
-                        .ok_or(())
-                        .map_err(|_| Diag { msg: format!("unbound state field {key}"), line: 0, col: 0 });
+                    return self.lookup(&key).ok_or(()).map_err(|_| Diag {
+                        msg: format!("unbound state field {key}"),
+                        line: 0,
+                        col: 0,
+                    });
                 }
                 diag("field access only on state blocks", 0, 0)
             }
@@ -592,19 +603,30 @@ impl Lo {
                         TExpr::Ident(s) => (s.clone(), false),
                         TExpr::Transpose(inner) => match &inner.e {
                             TExpr::Ident(s) => (s.clone(), true),
-                            _ => return diag("batched matmul rhs must be a param or param.T", 0, 0),
+                            _ => {
+                                return diag("batched matmul rhs must be a param or param.T", 0, 0)
+                            }
                         },
                         _ => return diag("batched matmul rhs must be a param or param.T", 0, 0),
                     };
-                    let (qual, pty, src) = self
-                        .params
-                        .get(&pname)
-                        .cloned()
-                        .ok_or(())
-                        .map_err(|_| Diag { msg: format!("{pname} is not a param"), line: 0, col: 0 })?;
+                    let (qual, pty, src) =
+                        self.params
+                            .get(&pname)
+                            .cloned()
+                            .ok_or(())
+                            .map_err(|_| Diag {
+                                msg: format!("{pname} is not a param"),
+                                line: 0,
+                                col: 0,
+                            })?;
                     let expect = if is_trans { vec![k, n] } else { vec![n, k] };
-                    let mut w = crate::weights::resolve(&pname, Some(&expect), src.as_deref(), init_weight)
-                        .map_err(|e| Diag { msg: e, line: 0, col: 0 })?;
+                    let mut w =
+                        crate::weights::resolve(&pname, Some(&expect), src.as_deref(), init_weight)
+                            .map_err(|e| Diag {
+                                msg: e,
+                                line: 0,
+                                col: 0,
+                            })?;
                     if pty.dt == DType::Q4 {
                         w = q4_quantize(&w);
                     }
@@ -647,27 +669,31 @@ impl Lo {
                 let (wn, flag) = match &b.e {
                     TExpr::Field(base, f) => {
                         let port = match &base.e {
-                            TExpr::Ident(s) => self
-                                .state_ports
-                                .get(&format!("{s}.{f}"))
-                                .cloned(),
+                            TExpr::Ident(s) => self.state_ports.get(&format!("{s}.{f}")).cloned(),
                             _ => None,
                         }
                         .ok_or(())
-                        .map_err(|_| Diag { msg: "matmul rhs state field not found".into(), line: 0, col: 0 })?;
+                        .map_err(|_| Diag {
+                            msg: "matmul rhs state field not found".into(),
+                            line: 0,
+                            col: 0,
+                        })?;
                         (port, "transpose_x")
                     }
                     TExpr::Transpose(inner) => match &inner.e {
                         TExpr::Field(base, f) => {
                             let port = match &base.e {
-                                TExpr::Ident(s) => self
-                                    .state_ports
-                                    .get(&format!("{s}.{f}"))
-                                    .cloned(),
+                                TExpr::Ident(s) => {
+                                    self.state_ports.get(&format!("{s}.{f}")).cloned()
+                                }
                                 _ => None,
                             }
                             .ok_or(())
-                            .map_err(|_| Diag { msg: "matmul rhs state field not found".into(), line: 0, col: 0 })?;
+                            .map_err(|_| Diag {
+                                msg: "matmul rhs state field not found".into(),
+                                line: 0,
+                                col: 0,
+                            })?;
                             (port, "transpose_y")
                         }
                         _ => (self.w_name(b)?, "transpose_y"),
@@ -734,7 +760,13 @@ impl Lo {
         }
     }
 
-    fn call(&mut self, name: &str, args: &[Typed], named: &[(String, Typed)], ty: &CTy) -> CResult<V> {
+    fn call(
+        &mut self,
+        name: &str,
+        args: &[Typed],
+        named: &[(String, Typed)],
+        ty: &CTy,
+    ) -> CResult<V> {
         if name == "__ret" {
             return self.expr(&args[0]);
         }
@@ -743,7 +775,9 @@ impl Lo {
             return self.binop(BinOp::MatMul, &args[1], &args[0], ty);
         }
         let vals: Vec<V> = args.iter().map(|a| self.expr(a)).collect::<CResult<_>>()?;
-        let taint = vals.iter().any(|v| matches!(v, V::Named { taint: true, .. }));
+        let taint = vals
+            .iter()
+            .any(|v| matches!(v, V::Named { taint: true, .. }));
         let arg = |i: usize, vals: &[V], lo: &mut Lo| -> CResult<String> {
             let v = vals[i].clone();
             let ty = args[i].ty.clone();
@@ -791,23 +825,48 @@ impl Lo {
                     }
                     "gelu" => {
                         // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-                        let x2 = self.emit_op(ty, format!("mul(x = {x}, y = {x})"), taint).name().0;
-                        let x3 = self.emit_op(ty, format!("mul(x = {x2}, y = {x})"), taint).name().0;
+                        let x2 = self
+                            .emit_op(ty, format!("mul(x = {x}, y = {x})"), taint)
+                            .name()
+                            .0;
+                        let x3 = self
+                            .emit_op(ty, format!("mul(x = {x2}, y = {x})"), taint)
+                            .name()
+                            .0;
                         let c1 = self.bcast(0.044715, elems);
-                        let cx3 = self.emit_op(ty, format!("mul(x = {x3}, y = {c1})"), taint).name().0;
-                        let inner = self.emit_op(ty, format!("add(x = {x}, y = {cx3})"), taint).name().0;
+                        let cx3 = self
+                            .emit_op(ty, format!("mul(x = {x3}, y = {c1})"), taint)
+                            .name()
+                            .0;
+                        let inner = self
+                            .emit_op(ty, format!("add(x = {x}, y = {cx3})"), taint)
+                            .name()
+                            .0;
                         let c2 = self.bcast(0.7978845608028654, elems);
-                        let u = self.emit_op(ty, format!("mul(x = {inner}, y = {c2})"), taint).name().0;
+                        let u = self
+                            .emit_op(ty, format!("mul(x = {inner}, y = {c2})"), taint)
+                            .name()
+                            .0;
                         let th = self.emit_op(ty, format!("tanh(x = {u})"), taint).name().0;
                         let one = self.bcast(1.0, elems);
-                        let op1 = self.emit_op(ty, format!("add(x = {th}, y = {one})"), taint).name().0;
+                        let op1 = self
+                            .emit_op(ty, format!("add(x = {th}, y = {one})"), taint)
+                            .name()
+                            .0;
                         let half = self.bcast(0.5, elems);
-                        let hx = self.emit_op(ty, format!("mul(x = {x}, y = {half})"), taint).name().0;
+                        let hx = self
+                            .emit_op(ty, format!("mul(x = {x}, y = {half})"), taint)
+                            .name()
+                            .0;
                         Ok(self.emit_op(ty, format!("mul(x = {hx}, y = {op1})"), taint))
                     }
                     "sigmoid" if elems > 1024 => {
                         let sn = self.sigmoid_of(&x, ty);
-                        Ok(V::Named { name: sn, ty: ty.clone(), taint })
+                        Ok(V::Named {
+                            name: sn,
+                            ty: ty.clone(),
+                            taint,
+                        })
                     }
                     "silu" if elems > 1024 => {
                         let sn = self.sigmoid_of(&x, ty);
@@ -863,9 +922,7 @@ impl Lo {
                         .unwrap_or(false)
             }
             TExpr::Unary(_, a) | TExpr::Transpose(a) => self.needs_grad(a, depth + 1),
-            TExpr::Bin(_, a, b) => {
-                self.needs_grad(a, depth + 1) || self.needs_grad(b, depth + 1)
-            }
+            TExpr::Bin(_, a, b) => self.needs_grad(a, depth + 1) || self.needs_grad(b, depth + 1),
             TExpr::Call(_, args, named) => {
                 args.iter().any(|a| self.needs_grad(a, depth + 1))
                     || named.iter().any(|(_, a)| self.needs_grad(a, depth + 1))
@@ -929,39 +986,20 @@ impl Lo {
                 let n = args[0].ty.numel().max(1) as usize;
                 let (pn, pt) = self.fwd_name(&args[0])?;
                 let (tn, _tt) = self.fwd_name(&args[1])?;
-                let sub = self.emit_op(
-                    &args[0].ty,
-                    format!("sub(x = {pn}, y = {tn})"),
-                    pt,
-                );
+                let sub = self.emit_op(&args[0].ty, format!("sub(x = {pn}, y = {tn})"), pt);
                 let sn = self.named(sub, &args[0].ty)?.0;
                 let scale = self.bcast(scale * 2.0 / n as f64, n);
-                let seed = self.emit_op(
-                    &args[0].ty,
-                    format!("mul(x = {sn}, y = {scale})"),
-                    pt,
-                );
+                let seed = self.emit_op(&args[0].ty, format!("mul(x = {sn}, y = {scale})"), pt);
                 let seedn = self.named(seed.clone(), &args[0].ty)?.0;
                 self.back(&args[0], &seedn)?;
             }
-            _ => {
-                return diag(
-                    "grad: v1 losses must end in mse(pred, target)",
-                    0,
-                    0,
-                )
-            }
+            _ => return diag("grad: v1 losses must end in mse(pred, target)", 0, 0),
         }
-        let out = self
-            .grads
-            .get(wrt)
-            .cloned()
-            .ok_or(())
-            .map_err(|_| Diag {
-                msg: format!("grad: loss does not depend on param {wrt:?}"),
-                line: 0,
-                col: 0,
-            })?;
+        let out = self.grads.get(wrt).cloned().ok_or(()).map_err(|_| Diag {
+            msg: format!("grad: loss does not depend on param {wrt:?}"),
+            line: 0,
+            col: 0,
+        })?;
         self.in_grad = false;
         self.tape.clear();
         self.env.pop();
@@ -1018,9 +1056,7 @@ impl Lo {
                 let vn = self.named(v, &adjty)?.0;
                 self.back(a, &vn)?;
             }
-            TExpr::Unary(UnOp::Not, _) => {
-                return diag("back: `!` is host-stratum", 0, 0)
-            }
+            TExpr::Unary(UnOp::Not, _) => return diag("back: `!` is host-stratum", 0, 0),
             TExpr::Bin(op, a, b) => match op {
                 BinOp::Add => {
                     self.back(a, adj)?;
@@ -1059,17 +1095,33 @@ impl Lo {
                     } else {
                         let (bn, _) = self.fwd_name(b)?;
                         if self.needs_grad(a, 0) {
-                            let da = self.emit_op(&adjty, format!("real_div(x = {adj}, y = {bn})"), false);
+                            let da = self.emit_op(
+                                &adjty,
+                                format!("real_div(x = {adj}, y = {bn})"),
+                                false,
+                            );
                             let dan = self.named(da, &adjty)?.0;
                             self.back(a, &dan)?;
                         }
                         if self.needs_grad(b, 0) {
                             let (an, _) = self.fwd_name(a)?;
-                            let num = self.emit_op(&adjty, format!("mul(x = {adj}, y = {an})"), false).name().0;
-                            let b2 = self.emit_op(&adjty, format!("mul(x = {bn}, y = {bn})"), false).name().0;
-                            let q = self.emit_op(&adjty, format!("real_div(x = {num}, y = {b2})"), false).name().0;
+                            let num = self
+                                .emit_op(&adjty, format!("mul(x = {adj}, y = {an})"), false)
+                                .name()
+                                .0;
+                            let b2 = self
+                                .emit_op(&adjty, format!("mul(x = {bn}, y = {bn})"), false)
+                                .name()
+                                .0;
+                            let q = self
+                                .emit_op(&adjty, format!("real_div(x = {num}, y = {b2})"), false)
+                                .name()
+                                .0;
                             let neg = self.bcast(-1.0, elems);
-                            let db = self.emit_op(&adjty, format!("mul(x = {q}, y = {neg})"), false).name().0;
+                            let db = self
+                                .emit_op(&adjty, format!("mul(x = {q}, y = {neg})"), false)
+                                .name()
+                                .0;
                             self.back(b, &db)?;
                         }
                     }
@@ -1081,7 +1133,10 @@ impl Lo {
                     if self.needs_grad(a, 0) {
                         // dx = adj @ Wᵀ — transpose_x matvec (attn·V route)
                         let wn = self.w_name(b)?;
-                        let dty = CTy { dt: DType::F16, dims: vec![k] };
+                        let dty = CTy {
+                            dt: DType::F16,
+                            dims: vec![k],
+                        };
                         let v = self.emit_shaped(
                             &format!("[1, 1, 1, {k}]"),
                             format!("matmul(x = {adj}, y = {wn}, transpose_x = __bt)"),
@@ -1095,7 +1150,10 @@ impl Lo {
                     let pname = self.matmul_param(b)?;
                     if let Some(p) = pname {
                         let (an, _) = self.fwd_name(a)?;
-                        let dty = CTy { dt: DType::F16, dims: vec![k, n] };
+                        let dty = CTy {
+                            dt: DType::F16,
+                            dims: vec![k, n],
+                        };
                         let v = self.emit_shaped(
                             &format!("[1, {n}, 1, {k}]"),
                             format!("matmul(x = {adj}, y = {an}, transpose_x = __bt)"),
@@ -1129,8 +1187,7 @@ impl Lo {
                         let tt = self.emit_op(&dty, format!("mul(x = {tn}, y = {tn})"), false);
                         let ttn = self.named(tt, &dty)?.0;
                         let one = self.bcast(1.0, elems);
-                        let omtt =
-                            self.emit_op(&dty, format!("sub(x = {one}, y = {ttn})"), false);
+                        let omtt = self.emit_op(&dty, format!("sub(x = {one}, y = {ttn})"), false);
                         let omttn = self.named(omtt, &dty)?.0;
                         let dx = self.emit_op(&dty, format!("mul(x = {adj}, y = {omttn})"), false);
                         let dxn = self.named(dx, &dty)?.0;
@@ -1171,51 +1228,126 @@ impl Lo {
                         // pos = max(x, 0); mask = min((pos * 4096) * 4096, 1.0); dx = adj * mask
                         let (xn, _) = self.fwd_name(x)?;
                         let z = self.bcast(0.0, elems);
-                        let pos = self.emit_op(&dty, format!("maximum(x = {xn}, y = {z})"), false).name().0;
+                        let pos = self
+                            .emit_op(&dty, format!("maximum(x = {xn}, y = {z})"), false)
+                            .name()
+                            .0;
                         let big = self.bcast(4096.0, elems);
-                        let s1 = self.emit_op(&dty, format!("mul(x = {pos}, y = {big})"), false).name().0;
-                        let s2 = self.emit_op(&dty, format!("mul(x = {s1}, y = {big})"), false).name().0;
+                        let s1 = self
+                            .emit_op(&dty, format!("mul(x = {pos}, y = {big})"), false)
+                            .name()
+                            .0;
+                        let s2 = self
+                            .emit_op(&dty, format!("mul(x = {s1}, y = {big})"), false)
+                            .name()
+                            .0;
                         let one = self.bcast(1.0, elems);
-                        let mask = self.emit_op(&dty, format!("minimum(x = {s2}, y = {one})"), false).name().0;
-                        let dx = self.emit_op(&dty, format!("mul(x = {adj}, y = {mask})"), false).name().0;
+                        let mask = self
+                            .emit_op(&dty, format!("minimum(x = {s2}, y = {one})"), false)
+                            .name()
+                            .0;
+                        let dx = self
+                            .emit_op(&dty, format!("mul(x = {adj}, y = {mask})"), false)
+                            .name()
+                            .0;
                         self.back(x, &dx)?;
                     }
                     "gelu" => {
                         // d/dx [0.5 * x * (1 + tanh(u))] where u = a*(x + b*x^3)
                         // = 0.5*(1 + t) + 0.5*x*(1 - t^2)*a*(1 + 3*b*x^2)
                         let (xn, _) = self.fwd_name(x)?;
-                        let x2 = self.emit_op(&dty, format!("mul(x = {xn}, y = {xn})"), false).name().0;
-                        let x3 = self.emit_op(&dty, format!("mul(x = {x2}, y = {xn})"), false).name().0;
+                        let x2 = self
+                            .emit_op(&dty, format!("mul(x = {xn}, y = {xn})"), false)
+                            .name()
+                            .0;
+                        let x3 = self
+                            .emit_op(&dty, format!("mul(x = {x2}, y = {xn})"), false)
+                            .name()
+                            .0;
                         let cb = self.bcast(0.044715, elems);
-                        let bx3 = self.emit_op(&dty, format!("mul(x = {x3}, y = {cb})"), false).name().0;
-                        let inner = self.emit_op(&dty, format!("add(x = {xn}, y = {bx3})"), false).name().0;
+                        let bx3 = self
+                            .emit_op(&dty, format!("mul(x = {x3}, y = {cb})"), false)
+                            .name()
+                            .0;
+                        let inner = self
+                            .emit_op(&dty, format!("add(x = {xn}, y = {bx3})"), false)
+                            .name()
+                            .0;
                         let ca = self.bcast(0.7978845608028654, elems);
-                        let u = self.emit_op(&dty, format!("mul(x = {inner}, y = {ca})"), false).name().0;
+                        let u = self
+                            .emit_op(&dty, format!("mul(x = {inner}, y = {ca})"), false)
+                            .name()
+                            .0;
                         let t = self.emit_op(&dty, format!("tanh(x = {u})"), false).name().0;
                         let one = self.bcast(1.0, elems);
                         let half = self.bcast(0.5, elems);
-                        let tp1 = self.emit_op(&dty, format!("add(x = {one}, y = {t})"), false).name().0;
-                        let term1 = self.emit_op(&dty, format!("mul(x = {half}, y = {tp1})"), false).name().0;
-                        let t2 = self.emit_op(&dty, format!("mul(x = {t}, y = {t})"), false).name().0;
-                        let omt2 = self.emit_op(&dty, format!("sub(x = {one}, y = {t2})"), false).name().0;
+                        let tp1 = self
+                            .emit_op(&dty, format!("add(x = {one}, y = {t})"), false)
+                            .name()
+                            .0;
+                        let term1 = self
+                            .emit_op(&dty, format!("mul(x = {half}, y = {tp1})"), false)
+                            .name()
+                            .0;
+                        let t2 = self
+                            .emit_op(&dty, format!("mul(x = {t}, y = {t})"), false)
+                            .name()
+                            .0;
+                        let omt2 = self
+                            .emit_op(&dty, format!("sub(x = {one}, y = {t2})"), false)
+                            .name()
+                            .0;
                         let c3b = self.bcast(3.0 * 0.044715, elems);
-                        let tbx2 = self.emit_op(&dty, format!("mul(x = {x2}, y = {c3b})"), false).name().0;
-                        let du1 = self.emit_op(&dty, format!("add(x = {one}, y = {tbx2})"), false).name().0;
-                        let du = self.emit_op(&dty, format!("mul(x = {ca}, y = {du1})"), false).name().0;
-                        let hx = self.emit_op(&dty, format!("mul(x = {half}, y = {xn})"), false).name().0;
-                        let hx_sech = self.emit_op(&dty, format!("mul(x = {hx}, y = {omt2})"), false).name().0;
-                        let term2 = self.emit_op(&dty, format!("mul(x = {hx_sech}, y = {du})"), false).name().0;
-                        let dg = self.emit_op(&dty, format!("add(x = {term1}, y = {term2})"), false).name().0;
-                        let dx = self.emit_op(&dty, format!("mul(x = {adj}, y = {dg})"), false).name().0;
+                        let tbx2 = self
+                            .emit_op(&dty, format!("mul(x = {x2}, y = {c3b})"), false)
+                            .name()
+                            .0;
+                        let du1 = self
+                            .emit_op(&dty, format!("add(x = {one}, y = {tbx2})"), false)
+                            .name()
+                            .0;
+                        let du = self
+                            .emit_op(&dty, format!("mul(x = {ca}, y = {du1})"), false)
+                            .name()
+                            .0;
+                        let hx = self
+                            .emit_op(&dty, format!("mul(x = {half}, y = {xn})"), false)
+                            .name()
+                            .0;
+                        let hx_sech = self
+                            .emit_op(&dty, format!("mul(x = {hx}, y = {omt2})"), false)
+                            .name()
+                            .0;
+                        let term2 = self
+                            .emit_op(&dty, format!("mul(x = {hx_sech}, y = {du})"), false)
+                            .name()
+                            .0;
+                        let dg = self
+                            .emit_op(&dty, format!("add(x = {term1}, y = {term2})"), false)
+                            .name()
+                            .0;
+                        let dx = self
+                            .emit_op(&dty, format!("mul(x = {adj}, y = {dg})"), false)
+                            .name()
+                            .0;
                         self.back(x, &dx)?;
                     }
                     "softmax" => {
                         // dx = s * (adj - sum(adj * s))
                         let (sn, _) = self.fwd_name(e)?;
-                        let prod = self.emit_op(&dty, format!("mul(x = {adj}, y = {sn})"), false).name().0;
+                        let prod = self
+                            .emit_op(&dty, format!("mul(x = {adj}, y = {sn})"), false)
+                            .name()
+                            .0;
                         let dot = self.reduce_bcast(&prod, elems, 1.0)?;
-                        let diff = self.emit_op(&dty, format!("sub(x = {adj}, y = {dot})"), false).name().0;
-                        let dx = self.emit_op(&dty, format!("mul(x = {sn}, y = {diff})"), false).name().0;
+                        let diff = self
+                            .emit_op(&dty, format!("sub(x = {adj}, y = {dot})"), false)
+                            .name()
+                            .0;
+                        let dx = self
+                            .emit_op(&dty, format!("mul(x = {sn}, y = {diff})"), false)
+                            .name()
+                            .0;
                         self.back(x, &dx)?;
                     }
                     "rmsnorm" => {
@@ -1237,17 +1369,36 @@ impl Lo {
                         let rvec = format!("{xhat}_rvec");
                         if let TExpr::Ident(wp) = &w_arg.e {
                             if self.params.contains_key(wp) {
-                                let dw = self.emit_op(&dty, format!("mul(x = {adj}, y = {xhat})"), false);
+                                let dw = self.emit_op(
+                                    &dty,
+                                    format!("mul(x = {adj}, y = {xhat})"),
+                                    false,
+                                );
                                 self.acc(wp, dw)?;
                             }
                         }
                         if self.needs_grad(x, 0) {
-                            let g = self.emit_op(&dty, format!("mul(x = {adj}, y = {wn})"), false).name().0;
-                            let gx = self.emit_op(&dty, format!("mul(x = {g}, y = {xhat})"), false).name().0;
+                            let g = self
+                                .emit_op(&dty, format!("mul(x = {adj}, y = {wn})"), false)
+                                .name()
+                                .0;
+                            let gx = self
+                                .emit_op(&dty, format!("mul(x = {g}, y = {xhat})"), false)
+                                .name()
+                                .0;
                             let m = self.reduce_bcast(&gx, elems, 1.0 / elems as f32)?;
-                            let proj = self.emit_op(&dty, format!("mul(x = {xhat}, y = {m})"), false).name().0;
-                            let diff = self.emit_op(&dty, format!("sub(x = {g}, y = {proj})"), false).name().0;
-                            let dx = self.emit_op(&dty, format!("mul(x = {diff}, y = {rvec})"), false).name().0;
+                            let proj = self
+                                .emit_op(&dty, format!("mul(x = {xhat}, y = {m})"), false)
+                                .name()
+                                .0;
+                            let diff = self
+                                .emit_op(&dty, format!("sub(x = {g}, y = {proj})"), false)
+                                .name()
+                                .0;
+                            let dx = self
+                                .emit_op(&dty, format!("mul(x = {diff}, y = {rvec})"), false)
+                                .name()
+                                .0;
                             self.back(x, &dx)?;
                         }
                     }
@@ -1349,12 +1500,15 @@ impl Lo {
                 TExpr::Ident(s) => {
                     // If `s` was declared `[N, K]` and transposed to `[K, N]`,
                     // use `"mat_t"` when its declared dims[1] != b.ty.dims[1].
-                    let (_, pty, _) = self
-                        .params
-                        .get(s)
-                        .ok_or(())
-                        .map_err(|_| Diag { msg: format!("{s} is not a param"), line: 0, col: 0 })?;
-                    if pty.dims[0] == b.ty.dims[1] && pty.dims[1] == b.ty.dims[0] && pty.dims[0] != pty.dims[1] {
+                    let (_, pty, _) = self.params.get(s).ok_or(()).map_err(|_| Diag {
+                        msg: format!("{s} is not a param"),
+                        line: 0,
+                        col: 0,
+                    })?;
+                    if pty.dims[0] == b.ty.dims[1]
+                        && pty.dims[1] == b.ty.dims[0]
+                        && pty.dims[0] != pty.dims[1]
+                    {
                         Ok(self.param_ref(s, "mat_t")?.0)
                     } else {
                         Ok(self.param_ref(s, "mat")?.0)
@@ -1421,7 +1575,9 @@ impl Lo {
                 if let TExpr::Grad { loss, wrt } = &grad.e {
                     if wrt != param {
                         return diag(
-                            format!("adam update for {param} takes grad w.r.t. {wrt} — they must match"),
+                            format!(
+                                "adam update for {param} takes grad w.r.t. {wrt} — they must match"
+                            ),
                             0,
                             0,
                         );
@@ -1452,17 +1608,25 @@ impl Lo {
                 } else {
                     self.state_outs.push((port.clone(), en.clone(), ty.clone()));
                 }
-                self.bind(key, V::Named { name: en, ty, taint: et });
+                self.bind(
+                    key,
+                    V::Named {
+                        name: en,
+                        ty,
+                        taint: et,
+                    },
+                );
             }
             TStmt::Let { name, expr } => {
                 let v = self.expr(expr)?;
                 self.bind(name, v);
             }
             TStmt::Assign { name, op, expr } => {
-                let cur = self
-                    .lookup(name)
-                    .ok_or(())
-                    .map_err(|_| Diag { msg: format!("assign to undeclared {name}"), line: 0, col: 0 })?;
+                let cur = self.lookup(name).ok_or(()).map_err(|_| Diag {
+                    msg: format!("assign to undeclared {name}"),
+                    line: 0,
+                    col: 0,
+                })?;
                 let ty = match &cur {
                     V::Named { ty, .. } => ty.clone(),
                     V::Scalar(_) => expr.ty.clone(),
@@ -1475,7 +1639,11 @@ impl Lo {
                     // `-=` folds the negation into the operand.
                     let (cn, ct) = self.named(cur, &ty)?;
                     let nv = match op {
-                        AssignOp::Set => V::Named { name: en, ty: ty.clone(), taint: et },
+                        AssignOp::Set => V::Named {
+                            name: en,
+                            ty: ty.clone(),
+                            taint: et,
+                        },
                         _ => {
                             if ty.dims.len() != 2 {
                                 return diag("v1 param updates are rank-2 weights", 0, 0);
@@ -1486,7 +1654,8 @@ impl Lo {
                                 AssignOp::Add => (en, et),
                                 AssignOp::Sub => {
                                     let neg = self.bcast(-1.0, ty.numel().max(1) as usize);
-                                    let v2 = self.emit_op(&ty, format!("mul(x = {en}, y = {neg})"), et);
+                                    let v2 =
+                                        self.emit_op(&ty, format!("mul(x = {en}, y = {neg})"), et);
                                     self.named(v2, &ty)?
                                 }
                                 _ => return diag("param updates support =, +=, -= in v1", 0, 0),
@@ -1513,7 +1682,14 @@ impl Lo {
                 let (cn, ct) = self.named(cur, &ty)?;
                 let opname = match op {
                     AssignOp::Set => {
-                        self.bind(name, V::Named { name: en, ty, taint: et });
+                        self.bind(
+                            name,
+                            V::Named {
+                                name: en,
+                                ty,
+                                taint: et,
+                            },
+                        );
                         return Ok(());
                     }
                     AssignOp::Add => "add",
@@ -1608,7 +1784,9 @@ fn contig_ios(p: &TProgram) -> HashMap<String, bool> {
                         TStmt::ParamUpdate { grad, .. } | TStmt::AdamUpdate { grad, .. } => {
                             walk(grad, trainable, statenames, marks, p)
                         }
-                        TStmt::StateUpdate { expr, .. } => walk(expr, trainable, statenames, marks, p),
+                        TStmt::StateUpdate { expr, .. } => {
+                            walk(expr, trainable, statenames, marks, p)
+                        }
                         TStmt::Expr(t) => walk(t, trainable, statenames, marks, p),
                     }
                 }
@@ -1669,7 +1847,11 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
             .iter()
             .find(|(n, d, _)| n == port && *d == IoDir::In)
             .ok_or(())
-            .map_err(|_| Diag { msg: format!("io {port} not found"), line: 0, col: 0 })?;
+            .map_err(|_| Diag {
+                msg: format!("io {port} not found"),
+                line: 0,
+                col: 0,
+            })?;
         lo.bind(
             arg,
             V::Named {
@@ -1722,7 +1904,11 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
         .unwrap_or_else(|| p.ret.ty.clone());
     let (ret_name, ret_taint) = lo.named(ret_v, &out_ty)?;
     if ret_taint {
-        return diag("sealed value reaches the io boundary — constitution holds", 0, 0);
+        return diag(
+            "sealed value reaches the io boundary — constitution holds",
+            0,
+            0,
+        );
     }
     // func signature: io ins + trainable params as runtime tensors
     let marks = contig_ios(p);
@@ -1735,7 +1921,9 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
             .iter()
             .find(|(_, port)| port == n)
             .map(|(a, _)| a.clone());
-        let contig = arg.map(|a| marks.get(&a).copied().unwrap_or(false)).unwrap_or(false);
+        let contig = arg
+            .map(|a| marks.get(&a).copied().unwrap_or(false))
+            .unwrap_or(false);
         let shape = if contig && t.dims.len() == 1 {
             format!("[1, 1, 1, {}]", t.dims[0])
         } else if t.dims.len() == 2 && lo.state_ports.is_empty() {
@@ -1754,7 +1942,12 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
                 mil_shape(&tp.ty)
             };
             ins.push(format!("tensor<fp16, {shape}> {}", tp.name));
-            trainable.push((tp.name.clone(), tp.name.clone(), tp.ty.clone(), tp.src.clone()));
+            trainable.push((
+                tp.name.clone(),
+                tp.name.clone(),
+                tp.ty.clone(),
+                tp.src.clone(),
+            ));
         }
     }
     // state fields: packed [1, T, 1, D] runtime tensors
@@ -1785,12 +1978,20 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
     let _ = writeln!(
         manifest,
         "  \"invariants\": [{}],",
-        p.invariants.iter().map(|i| format!("\"{i}\"")).collect::<Vec<_>>().join(", ")
+        p.invariants
+            .iter()
+            .map(|i| format!("\"{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let _ = writeln!(
         manifest,
         "  \"caps\": [{}],",
-        p.caps.iter().map(|i| format!("\"{i}\"")).collect::<Vec<_>>().join(", ")
+        p.caps
+            .iter()
+            .map(|i| format!("\"{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let _ = writeln!(
         manifest,
@@ -1809,7 +2010,11 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
             .map(|(n, d, t)| format!(
                 "{{\"name\": \"{n}\", \"dir\": \"{}\", \"shape\": [{}]}}",
                 if *d == IoDir::In { "in" } else { "out" },
-                t.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+                t.dims
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))
             .collect::<Vec<_>>()
             .join(", ")
@@ -1819,13 +2024,27 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
         "  \"params\": [{}],",
         p.params
             .iter()
-            .map(|TParam { name, qual, ty, src }| format!(
-                "{{\"name\": \"{name}\", \"qual\": \"{qual:?}\", \"shape\": [{}]{}}}",
-                ty.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "),
-                src.as_ref()
-                    .map(|s| format!(", \"src\": \"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
-                    .unwrap_or_default(),
-            ))
+            .map(
+                |TParam {
+                     name,
+                     qual,
+                     ty,
+                     src,
+                 }| format!(
+                    "{{\"name\": \"{name}\", \"qual\": \"{qual:?}\", \"shape\": [{}]{}}}",
+                    ty.dims
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    src.as_ref()
+                        .map(|s| format!(
+                            ", \"src\": \"{}\"",
+                            s.replace('\\', "\\\\").replace('"', "\\\"")
+                        ))
+                        .unwrap_or_default(),
+                )
+            )
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -1878,17 +2097,20 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
 /// depend on mil_spec's private module layout.)
 pub fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
     let mut msg = data.to_vec();
     let bitlen = (data.len() as u64) * 8;
@@ -1900,19 +2122,31 @@ pub fn sha256_hex(data: &[u8]) -> String {
     for chunk in msg.chunks(64) {
         let mut w = [0u32; 64];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
             let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
         }
         let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
             (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ (!e & g);
-            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let t2 = s0.wrapping_add(maj);

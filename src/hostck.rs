@@ -50,7 +50,10 @@ impl RTy {
             RTy::Enum(i) => enums[*i as usize].0.clone(),
             RTy::AneFn(a, r) => format!(
                 "ane({}) -> {}",
-                a.iter().map(|t| t.show(structs, enums)).collect::<Vec<_>>().join(", "),
+                a.iter()
+                    .map(|t| t.show(structs, enums))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 r.show(structs, enums),
             ),
         }
@@ -85,12 +88,12 @@ pub const NATIVE_NAMES: &[&str] = &[
     "dfa_scan",      // (dfa, str) -> i64 — streaming DFA match index (-1 if clean)
     "quorum",        // (str topic, [Vote]) -> QuorumVerdict — dissenting council (tokala)
     "propose_patch", // (str target, str old, str new, str reason) -> Decision (akicita/xipe, cap `patch`)
-    "erase",         // (str subject, str payload) -> str — certified erasure (camazotz, cap `erase`)
-    "read_file",     // (str path) -> str (cap `fs`)
-    "write_file",    // (str path, str content) -> unit (cap `fs`)
-    "cortex_ask",    // (str prompt) -> str — SLICKS bridge (cap `cortex`, stoch)
-    "sha256",        // (str) -> str — hex sha-256, det (firing chain, dedupe fingerprints)
-    "parse_num",     // (str) -> f64 — NaN on non-numeric, det (threshold triggers)
+    "erase", // (str subject, str payload) -> str — certified erasure (camazotz, cap `erase`)
+    "read_file", // (str path) -> str (cap `fs`)
+    "write_file", // (str path, str content) -> unit (cap `fs`)
+    "cortex_ask", // (str prompt) -> str — SLICKS bridge (cap `cortex`, stoch)
+    "sha256", // (str) -> str — hex sha-256, det (firing chain, dedupe fingerprints)
+    "parse_num", // (str) -> f64 — NaN on non-numeric, det (threshold triggers)
 ];
 
 /// Capability required by a native, if any.
@@ -215,10 +218,24 @@ pub struct HFnT {
 /// state-field mirror, a host data table, or an ane program value.
 #[derive(Debug, Clone)]
 pub enum GVal {
-    Param { name: String, ty: CTy, src: Option<String> },
-    Table { name: String, ty: CTy, src: Option<String> },
-    State { key: String, port: String, ty: CTy },
-    Prog { idx: u32 },
+    Param {
+        name: String,
+        ty: CTy,
+        src: Option<String>,
+    },
+    Table {
+        name: String,
+        ty: CTy,
+        src: Option<String>,
+    },
+    State {
+        key: String,
+        port: String,
+        ty: CTy,
+    },
+    Prog {
+        idx: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -342,25 +359,33 @@ impl Hk {
         Some((ei as u32, vi as u32, ptys))
     }
 
-    fn expr(
-        &mut self,
-        e: &Sp<Expr>,
-        env: &mut HEnv,
-        loops: usize,
-    ) -> CResult<HT> {
+    fn expr(&mut self, e: &Sp<Expr>, env: &mut HEnv, loops: usize) -> CResult<HT> {
         let _ = loops;
         let (l, c) = (e.line, e.col);
         match &e.v {
-            Expr::Int(n) => Ok(HT { e: HE::I64(*n), ty: RTy::I64 }),
-            Expr::Lit(f) => Ok(HT { e: HE::F64(*f), ty: RTy::F64 }),
-            Expr::Bool(b) => Ok(HT { e: HE::Bool(*b), ty: RTy::Bool }),
+            Expr::Int(n) => Ok(HT {
+                e: HE::I64(*n),
+                ty: RTy::I64,
+            }),
+            Expr::Lit(f) => Ok(HT {
+                e: HE::F64(*f),
+                ty: RTy::F64,
+            }),
+            Expr::Bool(b) => Ok(HT {
+                e: HE::Bool(*b),
+                ty: RTy::Bool,
+            }),
             Expr::Str(s) => Ok(HT {
                 e: HE::Str(s.clone()),
                 ty: RTy::Str,
             }),
             Expr::VecLit(items) => {
                 if items.is_empty() {
-                    return diag("empty vec literal needs a type annotation — `let v: [i64] = []`", l, c);
+                    return diag(
+                        "empty vec literal needs a type annotation — `let v: [i64] = []`",
+                        l,
+                        c,
+                    );
                 }
                 let mut titems = Vec::new();
                 let mut ety: Option<RTy> = None;
@@ -371,7 +396,11 @@ impl Hk {
                         Some(w) if *w == t.ty => {}
                         Some(w) => {
                             return diag(
-                                format!("vec literal mixes {} and {}", self.show(w), self.show(&t.ty)),
+                                format!(
+                                    "vec literal mixes {} and {}",
+                                    self.show(w),
+                                    self.show(&t.ty)
+                                ),
                                 it.line,
                                 it.col,
                             )
@@ -387,7 +416,11 @@ impl Hk {
             }
             Expr::MapLit(items) => {
                 if items.is_empty() {
-                    return diag("empty map literal needs a type annotation — `let m: {str: i64} = {}`", l, c);
+                    return diag(
+                        "empty map literal needs a type annotation — `let m: {str: i64} = {}`",
+                        l,
+                        c,
+                    );
                 }
                 let mut titems = Vec::new();
                 let mut kty: Option<RTy> = None;
@@ -407,7 +440,11 @@ impl Hk {
                         Some(w) if *w == tk.ty => {}
                         Some(w) => {
                             return diag(
-                                format!("map literal mixes key types {} and {}", self.show(w), self.show(&tk.ty)),
+                                format!(
+                                    "map literal mixes key types {} and {}",
+                                    self.show(w),
+                                    self.show(&tk.ty)
+                                ),
                                 ke.line,
                                 ke.col,
                             )
@@ -418,7 +455,11 @@ impl Hk {
                         Some(w) if *w == tv.ty => {}
                         Some(w) => {
                             return diag(
-                                format!("map literal mixes value types {} and {}", self.show(w), self.show(&tv.ty)),
+                                format!(
+                                    "map literal mixes value types {} and {}",
+                                    self.show(w),
+                                    self.show(&tv.ty)
+                                ),
                                 ve.line,
                                 ve.col,
                             )
@@ -517,7 +558,9 @@ impl Hk {
                 }
                 if self.sealed.contains(s) {
                     return diag(
-                        format!("sealed param {s:?} cannot be named in host code — the boundary holds"),
+                        format!(
+                            "sealed param {s:?} cannot be named in host code — the boundary holds"
+                        ),
                         l,
                         c,
                     );
@@ -532,7 +575,11 @@ impl Hk {
                             ty: a.ty.clone(),
                             e: HE::Un(*op, Box::new(a)),
                         }),
-                        _ => diag(format!("- requires i64/f64, found {}", self.show(&a.ty)), l, c),
+                        _ => diag(
+                            format!("- requires i64/f64, found {}", self.show(&a.ty)),
+                            l,
+                            c,
+                        ),
                     },
                     UnOp::Not => match a.ty {
                         RTy::Bool => Ok(HT {
@@ -554,7 +601,11 @@ impl Hk {
                         (RTy::Str, RTy::Str) => RTy::Str,
                         _ => {
                             return diag(
-                                format!("+ needs matching i64/f64/str, found {} and {}", self.show(&a.ty), self.show(&b.ty)),
+                                format!(
+                                    "+ needs matching i64/f64/str, found {} and {}",
+                                    self.show(&a.ty),
+                                    self.show(&b.ty)
+                                ),
                                 l,
                                 c,
                             )
@@ -565,7 +616,11 @@ impl Hk {
                         (RTy::F64, RTy::F64) => RTy::F64,
                         _ => {
                             return diag(
-                                format!("arithmetic needs matching i64/f64, found {} and {}", self.show(&a.ty), self.show(&b.ty)),
+                                format!(
+                                    "arithmetic needs matching i64/f64, found {} and {}",
+                                    self.show(&a.ty),
+                                    self.show(&b.ty)
+                                ),
                                 l,
                                 c,
                             )
@@ -578,7 +633,11 @@ impl Hk {
                     BinOp::Eq | BinOp::Ne => {
                         if !same {
                             return diag(
-                                format!("== needs matching types, found {} and {}", self.show(&a.ty), self.show(&b.ty)),
+                                format!(
+                                    "== needs matching types, found {} and {}",
+                                    self.show(&a.ty),
+                                    self.show(&b.ty)
+                                ),
                                 l,
                                 c,
                             );
@@ -586,10 +645,16 @@ impl Hk {
                         RTy::Bool
                     }
                     BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => match (&a.ty, &b.ty) {
-                        (RTy::I64, RTy::I64) | (RTy::F64, RTy::F64) | (RTy::Str, RTy::Str) => RTy::Bool,
+                        (RTy::I64, RTy::I64) | (RTy::F64, RTy::F64) | (RTy::Str, RTy::Str) => {
+                            RTy::Bool
+                        }
                         _ => {
                             return diag(
-                                format!("ordering needs i64/f64/str, found {} and {}", self.show(&a.ty), self.show(&b.ty)),
+                                format!(
+                                    "ordering needs i64/f64/str, found {} and {}",
+                                    self.show(&a.ty),
+                                    self.show(&b.ty)
+                                ),
                                 l,
                                 c,
                             )
@@ -620,7 +685,11 @@ impl Hk {
                 let idx = match &idxs[0].v {
                     Index::Expr(ie) => ie.clone(),
                     Index::Range(..) => {
-                        return diag("host slices aren't supported — use a for loop", idxs[0].line, idxs[0].col)
+                        return diag(
+                            "host slices aren't supported — use a for loop",
+                            idxs[0].line,
+                            idxs[0].col,
+                        )
                     }
                 };
                 let tb = self.expr(base, env, loops)?;
@@ -629,7 +698,11 @@ impl Hk {
                     RTy::Map(kt, vt) => {
                         if ti.ty != **kt {
                             return diag(
-                                format!("map key must be {}, found {}", self.show(kt), self.show(&ti.ty)),
+                                format!(
+                                    "map key must be {}, found {}",
+                                    self.show(kt),
+                                    self.show(&ti.ty)
+                                ),
                                 idx.line,
                                 idx.col,
                             );
@@ -638,37 +711,46 @@ impl Hk {
                     }
                     RTy::Vec(t) => {
                         if ti.ty != RTy::I64 {
-                            return diag(format!("index must be i64, found {}", self.show(&ti.ty)), idx.line, idx.col);
+                            return diag(
+                                format!("index must be i64, found {}", self.show(&ti.ty)),
+                                idx.line,
+                                idx.col,
+                            );
                         }
                         (**t).clone()
                     }
                     RTy::Tensor(ct) => {
                         if ti.ty != RTy::I64 {
-                            return diag(format!("index must be i64, found {}", self.show(&ti.ty)), idx.line, idx.col);
+                            return diag(
+                                format!("index must be i64, found {}", self.show(&ti.ty)),
+                                idx.line,
+                                idx.col,
+                            );
                         }
                         if ct.dims.len() == 1 {
                             RTy::F64
                         } else if ct.dims.len() == 2 {
                             // row gather — `embed[tok]` reads a [N] row
                             // at runtime; this is the decode feedback.
-                            RTy::Tensor(CTy { dt: ct.dt, dims: vec![ct.dims[1]] })
+                            RTy::Tensor(CTy {
+                                dt: ct.dt,
+                                dims: vec![ct.dims[1]],
+                            })
                         } else {
                             return diag("host indexing supports rank 1-2 tensors", l, c);
                         }
                     }
                     RTy::Str => {
                         if ti.ty != RTy::I64 {
-                            return diag(format!("index must be i64, found {}", self.show(&ti.ty)), idx.line, idx.col);
+                            return diag(
+                                format!("index must be i64, found {}", self.show(&ti.ty)),
+                                idx.line,
+                                idx.col,
+                            );
                         }
                         RTy::Str
                     }
-                    _ => {
-                        return diag(
-                            format!("cannot index {}", self.show(&tb.ty)),
-                            l,
-                            c,
-                        )
-                    }
+                    _ => return diag(format!("cannot index {}", self.show(&tb.ty)), l, c),
                 };
                 Ok(HT {
                     e: HE::Index(Box::new(tb), Box::new(ti)),
@@ -704,7 +786,11 @@ impl Hk {
                 if let Expr::Ident(s) = &bx.v {
                     if let Some(fields) = self.states.get(s).cloned() {
                         if let Some(&gi) = fields.get(&f.v) {
-                            let ty = self.globals.get(&format!("{s}.{}", f.v)).map(|(_, t)| t.clone()).unwrap_or(RTy::Unit);
+                            let ty = self
+                                .globals
+                                .get(&format!("{s}.{}", f.v))
+                                .map(|(_, t)| t.clone())
+                                .unwrap_or(RTy::Unit);
                             return Ok(HT {
                                 e: HE::Global(gi),
                                 ty,
@@ -717,23 +803,32 @@ impl Hk {
                 match &tb.ty {
                     RTy::Struct(si) => {
                         let decl = &self.structs[*si as usize].1;
-                        let fi = decl
-                            .iter()
-                            .position(|(n, _)| n == &f.v)
-                            .ok_or(())
-                            .map_err(|_| Diag {
-                                msg: format!("struct {} has no field {}", self.structs[*si as usize].0, f.v),
-                                line: f.line,
-                                col: f.col,
-                            })?;
+                        let fi =
+                            decl.iter()
+                                .position(|(n, _)| n == &f.v)
+                                .ok_or(())
+                                .map_err(|_| Diag {
+                                    msg: format!(
+                                        "struct {} has no field {}",
+                                        self.structs[*si as usize].0, f.v
+                                    ),
+                                    line: f.line,
+                                    col: f.col,
+                                })?;
                         Ok(HT {
                             ty: decl[fi].1.clone(),
                             e: HE::Field(Box::new(tb), fi as u32),
                         })
                     }
                     RTy::Token => match f.v.as_str() {
-                        "id" => Ok(HT { ty: RTy::I64, e: HE::Field(Box::new(tb), 0) }),
-                        "epoch" => Ok(HT { ty: RTy::I64, e: HE::Field(Box::new(tb), 1) }),
+                        "id" => Ok(HT {
+                            ty: RTy::I64,
+                            e: HE::Field(Box::new(tb), 0),
+                        }),
+                        "epoch" => Ok(HT {
+                            ty: RTy::I64,
+                            e: HE::Field(Box::new(tb), 1),
+                        }),
                         _ => diag("token fields are .id and .epoch", f.line, f.col),
                     },
                     _ => diag(
@@ -769,7 +864,11 @@ impl Hk {
                 let t = self.expr(ae, env, loops)?;
                 if &t.ty != want {
                     return diag(
-                        format!("{name} arg {i} wants {}, found {}", self.show(want), self.show(&t.ty)),
+                        format!(
+                            "{name} arg {i} wants {}, found {}",
+                            self.show(want),
+                            self.show(&t.ty)
+                        ),
                         ae.line,
                         ae.col,
                     );
@@ -798,7 +897,12 @@ impl Hk {
                 let t = self.expr(ae, env, loops)?;
                 if t.ty != want {
                     return diag(
-                        format!("{name} arg {} wants {}, found {}", an.v, self.show(&want), self.show(&t.ty)),
+                        format!(
+                            "{name} arg {} wants {}, found {}",
+                            an.v,
+                            self.show(&want),
+                            self.show(&t.ty)
+                        ),
                         ae.line,
                         ae.col,
                     );
@@ -819,7 +923,11 @@ impl Hk {
             let ext = self.externs[ei as usize].clone();
             if pos.len() != ext.args.len() {
                 return diag(
-                    format!("{name} expects {} args, found {}", ext.args.len(), pos.len()),
+                    format!(
+                        "{name} expects {} args, found {}",
+                        ext.args.len(),
+                        pos.len()
+                    ),
                     l,
                     c,
                 );
@@ -835,7 +943,11 @@ impl Hk {
                 let t = self.expr(ae, env, loops)?;
                 if &t.ty != want {
                     return diag(
-                        format!("{name} arg {i} wants {}, found {}", self.show(want), self.show(&t.ty)),
+                        format!(
+                            "{name} arg {i} wants {}, found {}",
+                            self.show(want),
+                            self.show(&t.ty)
+                        ),
                         ae.line,
                         ae.col,
                     );
@@ -865,7 +977,11 @@ impl Hk {
                 let t = self.expr(ae, env, loops)?;
                 if &t.ty != want {
                     return diag(
-                        format!("{name} arg {i} wants {}, found {}", self.show(want), self.show(&t.ty)),
+                        format!(
+                            "{name} arg {i} wants {}, found {}",
+                            self.show(want),
+                            self.show(&t.ty)
+                        ),
                         ae.line,
                         ae.col,
                     );
@@ -909,7 +1025,8 @@ impl Hk {
                 );
             }
             if self.direct_steering[self.cur_fn].is_none() {
-                self.direct_steering[self.cur_fn] = Some((format!("dynamic ane call `{name}`"), l, c));
+                self.direct_steering[self.cur_fn] =
+                    Some((format!("dynamic ane call `{name}`"), l, c));
             }
             let callee = HT {
                 e: HE::Var(name.to_string()),
@@ -920,7 +1037,11 @@ impl Hk {
                 let t = self.expr(ae, env, loops)?;
                 if &t.ty != want {
                     return diag(
-                        format!("{name} arg {i} wants {}, found {}", self.show(want), self.show(&t.ty)),
+                        format!(
+                            "{name} arg {i} wants {}, found {}",
+                            self.show(want),
+                            self.show(&t.ty)
+                        ),
                         ae.line,
                         ae.col,
                     );
@@ -945,7 +1066,11 @@ impl Hk {
     ) -> CResult<RTy> {
         let arity = |n: usize| -> CResult<()> {
             if args.len() != n {
-                diag(format!("{name} expects {n} args, found {}", args.len()), l, c)
+                diag(
+                    format!("{name} expects {n} args, found {}", args.len()),
+                    l,
+                    c,
+                )
             } else {
                 Ok(())
             }
@@ -1007,7 +1132,11 @@ impl Hk {
                     }
                 };
                 if n <= 0 {
-                    return diag(format!("{name} size must be positive"), pos[1].line, pos[1].col);
+                    return diag(
+                        format!("{name} size must be positive"),
+                        pos[1].line,
+                        pos[1].col,
+                    );
                 }
                 Ok(RTy::Tensor(CTy {
                     dt: DType::F16,
@@ -1125,7 +1254,8 @@ impl Hk {
                     .iter()
                     .position(|(n, _)| n == "QuorumVerdict")
                     .unwrap_or(1) as u32;
-                if args[0].ty != RTy::Str || args[1].ty != RTy::Vec(Box::new(RTy::Struct(vote_si))) {
+                if args[0].ty != RTy::Str || args[1].ty != RTy::Vec(Box::new(RTy::Struct(vote_si)))
+                {
                     return diag("quorum(topic: str, votes: [Vote]) expected", l, c);
                 }
                 Ok(RTy::Struct(qv_si))
@@ -1133,7 +1263,11 @@ impl Hk {
             "propose_patch" => {
                 arity(4)?;
                 if args.iter().any(|a| a.ty != RTy::Str) {
-                    return diag("propose_patch(target: str, old: str, new: str, reason: str) expected", l, c);
+                    return diag(
+                        "propose_patch(target: str, old: str, new: str, reason: str) expected",
+                        l,
+                        c,
+                    );
                 }
                 let dec_ei = self
                     .enums
@@ -1324,7 +1458,11 @@ impl Hk {
                             RTy::Map(kt, _) => {
                                 if ti.ty != **kt {
                                     return diag(
-                                        format!("map key must be {}, found {}", self.show(kt), self.show(&ti.ty)),
+                                        format!(
+                                            "map key must be {}, found {}",
+                                            self.show(kt),
+                                            self.show(&ti.ty)
+                                        ),
                                         l,
                                         c,
                                     );
@@ -1345,15 +1483,14 @@ impl Hk {
                         match &tb.ty {
                             RTy::Struct(si) => {
                                 let decl = &self.structs[*si as usize].1;
-                                let fi = decl
-                                    .iter()
-                                    .position(|(n, _)| n == &f.v)
-                                    .ok_or(())
-                                    .map_err(|_| Diag {
-                                        msg: format!("no field {}", f.v),
-                                        line: f.line,
-                                        col: f.col,
-                                    })?;
+                                let fi =
+                                    decl.iter().position(|(n, _)| n == &f.v).ok_or(()).map_err(
+                                        |_| Diag {
+                                            msg: format!("no field {}", f.v),
+                                            line: f.line,
+                                            col: f.col,
+                                        },
+                                    )?;
                                 StoreT::Field(tb, fi as u32)
                             }
                             _ => return diag("field stores need a struct", l, c),
@@ -1377,17 +1514,28 @@ impl Hk {
                 };
                 if te.ty != want {
                     return diag(
-                        format!("store wants {}, found {}", self.show(&want), self.show(&te.ty)),
+                        format!(
+                            "store wants {}, found {}",
+                            self.show(&want),
+                            self.show(&te.ty)
+                        ),
                         expr.line,
                         expr.col,
                     );
                 }
-                Ok(HS::Store { target: st, expr: te })
+                Ok(HS::Store {
+                    target: st,
+                    expr: te,
+                })
             }
             Stmt::If { cond, then, els } => {
                 let tc = self.expr(cond, env, loops)?;
                 if tc.ty != RTy::Bool {
-                    return diag(format!("if needs bool, found {}", self.show(&tc.ty)), cond.line, cond.col);
+                    return diag(
+                        format!("if needs bool, found {}", self.show(&tc.ty)),
+                        cond.line,
+                        cond.col,
+                    );
                 }
                 env.push(HashMap::new());
                 let t = self.stmts(then, env, ret, loops)?;
@@ -1395,7 +1543,11 @@ impl Hk {
                 env.push(HashMap::new());
                 let e = self.stmts(els, env, ret, loops)?;
                 env.pop();
-                Ok(HS::If { cond: tc, then: t, els: e })
+                Ok(HS::If {
+                    cond: tc,
+                    then: t,
+                    els: e,
+                })
             }
             Stmt::Match { expr, arms } => {
                 let te = self.expr(expr, env, loops)?;
@@ -1427,7 +1579,10 @@ impl Hk {
                                 Some((en, vn)) => {
                                     if en != ename {
                                         return diag(
-                                            format!("pattern {} is not a variant of {ename}", name.v),
+                                            format!(
+                                                "pattern {} is not a variant of {ename}",
+                                                name.v
+                                            ),
                                             name.line,
                                             name.col,
                                         );
@@ -1493,7 +1648,11 @@ impl Hk {
             Stmt::While { cond, body } => {
                 let tc = self.expr(cond, env, loops)?;
                 if tc.ty != RTy::Bool {
-                    return diag(format!("while needs bool, found {}", self.show(&tc.ty)), cond.line, cond.col);
+                    return diag(
+                        format!("while needs bool, found {}", self.show(&tc.ty)),
+                        cond.line,
+                        cond.col,
+                    );
                 }
                 env.push(HashMap::new());
                 let b = self.stmts(body, env, ret, loops + 1)?;
@@ -1538,9 +1697,7 @@ impl Hk {
                 };
                 match (ret, &te) {
                     (RTy::Unit, None) => {}
-                    (RTy::Unit, Some(_)) => {
-                        return diag("returning a value from a unit fn", l, c)
-                    }
+                    (RTy::Unit, Some(_)) => return diag("returning a value from a unit fn", l, c),
                     (w, Some(t)) if *w == t.ty => {}
                     (w, Some(t)) => {
                         return diag(
@@ -1549,9 +1706,7 @@ impl Hk {
                             c,
                         )
                     }
-                    (_, None) => {
-                        return diag("bare return in a fn that returns a value", l, c)
-                    }
+                    (_, None) => return diag("bare return in a fn that returns a value", l, c),
                 }
                 Ok(HS::Return(te))
             }
@@ -1687,7 +1842,11 @@ pub(crate) fn check(
     // can reference any type.
     for ef in externs {
         if hk.ext_map.contains_key(&ef.v.name) {
-            return diag(format!("duplicate extern fn {}", ef.v.name), ef.line, ef.col);
+            return diag(
+                format!("duplicate extern fn {}", ef.v.name),
+                ef.line,
+                ef.col,
+            );
         }
         let mut rargs = Vec::new();
         for (_, aty) in &ef.v.args {
@@ -1725,7 +1884,8 @@ pub(crate) fn check(
         let ty = RTy::AneFn(pargs.clone(), Box::new(pret.clone()));
         hk.progs.insert(name.clone(), (i as u32, pargs, pret));
         let gi = hk.glist.len() as u32;
-        hk.glist.push((name.clone(), GVal::Prog { idx: i as u32 }, ty.clone()));
+        hk.glist
+            .push((name.clone(), GVal::Prog { idx: i as u32 }, ty.clone()));
         hk.globals.insert(name.clone(), (gi, ty));
     }
     // params: host-visible unless sealed — the constitutional boundary.
@@ -1742,9 +1902,15 @@ pub(crate) fn check(
         }
         let rty = RTy::Tensor(ct.clone());
         let gi = hk.glist.len() as u32;
-        hk.glist.push(
-            (pname.clone(), GVal::Param { name: pname.clone(), ty: ct, src }, rty.clone()),
-        );
+        hk.glist.push((
+            pname.clone(),
+            GVal::Param {
+                name: pname.clone(),
+                ty: ct,
+                src,
+            },
+            rty.clone(),
+        ));
         hk.globals.insert(pname, (gi, rty));
     }
     // tables — host data sources, indexable like params.
@@ -1757,7 +1923,11 @@ pub(crate) fn check(
         let gi = hk.glist.len() as u32;
         hk.glist.push((
             tname.clone(),
-            GVal::Table { name: tname.clone(), ty: ct, src: tsrc.clone() },
+            GVal::Table {
+                name: tname.clone(),
+                ty: ct,
+                src: tsrc.clone(),
+            },
             rty.clone(),
         ));
         hk.globals.insert(tname.clone(), (gi, rty));
@@ -1772,7 +1942,11 @@ pub(crate) fn check(
             let gi = hk.glist.len() as u32;
             hk.glist.push((
                 gkey.clone(),
-                GVal::State { key: gkey.clone(), port: port.clone(), ty: ty.clone() },
+                GVal::State {
+                    key: gkey.clone(),
+                    port: port.clone(),
+                    ty: ty.clone(),
+                },
                 rty.clone(),
             ));
             hk.globals.insert(gkey, (gi, rty));
@@ -1798,7 +1972,11 @@ pub(crate) fn check(
                     let port = format!("{sname}_{fname}");
                     hk.glist.push((
                         gkey.clone(),
-                        GVal::State { key: format!("{pname}.{key}"), port, ty: ty.clone() },
+                        GVal::State {
+                            key: format!("{pname}.{key}"),
+                            port,
+                            ty: ty.clone(),
+                        },
                         rty.clone(),
                     ));
                     hk.globals.insert(gkey, (gi, rty));
@@ -1816,7 +1994,11 @@ pub(crate) fn check(
             return diag(format!("duplicate host fn {}", f.name), 0, 0);
         }
         if hk.progs.contains_key(&f.name) {
-            return diag(format!("{} is both an ane program and a host fn", f.name), 0, 0);
+            return diag(
+                format!("{} is both an ane program and a host fn", f.name),
+                0,
+                0,
+            );
         }
     }
     let reflex_ei = hk
@@ -1861,7 +2043,11 @@ pub(crate) fn check(
         let body = hk.stmts(&decl.v.body, &mut env, &ret, 0)?;
         if ret != RTy::Unit && !definitely_returns(&body) {
             return diag(
-                format!("{} may reach its end without returning {}", f.name, hk.show(&ret)),
+                format!(
+                    "{} may reach its end without returning {}",
+                    f.name,
+                    hk.show(&ret)
+                ),
                 decl.line,
                 decl.col,
             );
@@ -1907,21 +2093,14 @@ pub(crate) fn check(
             for &(callee, cl, cc) in &hk.callees[i] {
                 if is_stoch[i].is_none() {
                     if let Some((why, _, _)) = &is_stoch[callee] {
-                        is_stoch[i] = Some((
-                            format!("{} -> {why}", hk.fndecl[callee].name),
-                            cl,
-                            cc,
-                        ));
+                        is_stoch[i] =
+                            Some((format!("{} -> {why}", hk.fndecl[callee].name), cl, cc));
                         changed = true;
                     }
                 }
                 if steers[i].is_none() {
                     if let Some((why, _, _)) = &steers[callee] {
-                        steers[i] = Some((
-                            format!("{} -> {why}", hk.fndecl[callee].name),
-                            cl,
-                            cc,
-                        ));
+                        steers[i] = Some((format!("{} -> {why}", hk.fndecl[callee].name), cl, cc));
                         changed = true;
                     }
                 }
@@ -1961,7 +2140,11 @@ pub(crate) fn check(
         // 2. Determinism soundness (`det` functions admit no `stoch` interior)
         if f.det == DetMode::Det {
             if let Some((why, l, c)) = &is_stoch[i] {
-                let kind = if f.is_reflex { "reflex" } else { "deterministic fn" };
+                let kind = if f.is_reflex {
+                    "reflex"
+                } else {
+                    "deterministic fn"
+                };
                 return diag(
                     format!(
                         "constitutional violation: {kind} `{}` calls stochastic `{why}` — declare `host stoch fn` or remove nondeterminism",
@@ -2036,9 +2219,7 @@ fn resolve_ty_pub(ty: &Ty) -> CResult<CTy> {
     for d in &ty.dims {
         match d {
             Dim::Lit(n) => dims.push(*n),
-            Dim::Name(s) => {
-                return diag(format!("unbound dim {s} in host-visible type"), 0, 0)
-            }
+            Dim::Name(s) => return diag(format!("unbound dim {s} in host-visible type"), 0, 0),
         }
     }
     Ok(CTy { dt: ty.dt, dims })

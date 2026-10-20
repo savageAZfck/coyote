@@ -32,7 +32,11 @@ impl CTy {
             format!(
                 "{:?}[{}]",
                 self.dt,
-                self.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+                self.dims
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
             .to_lowercase()
         }
@@ -60,7 +64,10 @@ pub enum TExpr {
     /// inlined user-fn body.
     Block(Vec<TStmt>, Box<Typed>),
     /// `grad(loss_expr, wrt_param)` — reverse-mode AD target.
-    Grad { loss: Box<Typed>, wrt: String },
+    Grad {
+        loss: Box<Typed>,
+        wrt: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -71,17 +78,36 @@ pub struct Typed {
 
 #[derive(Debug, Clone)]
 pub enum TStmt {
-    Let { name: String, expr: Typed },
-    Assign { name: String, op: AssignOp, expr: Typed },
+    Let {
+        name: String,
+        expr: Typed,
+    },
+    Assign {
+        name: String,
+        op: AssignOp,
+        expr: Typed,
+    },
     /// `w op= s * grad(loss, w)` — the SGD step, folded: the seed is
     /// pre-scaled so the update lowers to a single packed add.
-    ParamUpdate { param: String, scale: f64, grad: Typed },
+    ParamUpdate {
+        param: String,
+        scale: f64,
+        grad: Typed,
+    },
     /// `adam(w, grad(loss, w), lr)` — Adam moment update over on-chip grad.
-    AdamUpdate { param: String, lr: f64, grad: Typed },
+    AdamUpdate {
+        param: String,
+        lr: f64,
+        grad: Typed,
+    },
     /// `kv.k = e` / `kv.k += e` / `kv.k[pos] = e` — a state field takes
     /// a new value; the result becomes an output the host feeds back.
     /// `key` is `kv.k`, `port` the mil arg `kv_k`.
-    StateUpdate { key: String, port: String, expr: Typed },
+    StateUpdate {
+        key: String,
+        port: String,
+        expr: Typed,
+    },
     Expr(Typed),
 }
 
@@ -151,22 +177,29 @@ fn resolve_ty(dims: &Dims, ty: &Ty, l: usize, c: usize) -> CResult<CTy> {
     for d in &ty.dims {
         match d {
             Dim::Lit(n) => out.push(*n),
-            Dim::Name(s) => out.push(
-                *dims
-                    .get(s)
-                    .ok_or(())
-                    .map_err(|_| Diag { msg: format!("unbound dim {s}"), line: l, col: c })?,
-            ),
+            Dim::Name(s) => out.push(*dims.get(s).ok_or(()).map_err(|_| Diag {
+                msg: format!("unbound dim {s}"),
+                line: l,
+                col: c,
+            })?),
         }
     }
-    Ok(CTy { dt: ty.dt, dims: out })
+    Ok(CTy {
+        dt: ty.dt,
+        dims: out,
+    })
 }
 
 /// unify a declared (possibly generic) arg type with a concrete arg type.
 fn unify(dims: &mut Dims, decl: &Ty, act: &CTy, l: usize, c: usize) -> CResult<()> {
     if decl.dims.len() != act.dims.len() {
         return diag(
-            format!("rank mismatch: declared {:?}[{}] vs actual {}", decl.dt, decl.dims.len(), act.show()),
+            format!(
+                "rank mismatch: declared {:?}[{}] vs actual {}",
+                decl.dt,
+                decl.dims.len(),
+                act.show()
+            ),
             l,
             c,
         );
@@ -190,7 +223,11 @@ impl Ck {
         depth: usize,
     ) -> CResult<Typed> {
         if depth > 64 {
-            return diag("inlining depth exceeded — recursive fns are not supported", e.line, e.col);
+            return diag(
+                "inlining depth exceeded — recursive fns are not supported",
+                e.line,
+                e.col,
+            );
         }
         let (l, c) = (e.line, e.col);
         match &e.v {
@@ -206,9 +243,7 @@ impl Ck {
             | Expr::Str(_)
             | Expr::VecLit(_)
             | Expr::MapLit(_)
-            | Expr::StructLit(..) => {
-                diag("host-stratum value — belongs inside `host fn`", l, c)
-            }
+            | Expr::StructLit(..) => diag("host-stratum value — belongs inside `host fn`", l, c),
             Expr::Ident(s) => {
                 if let Some(ty) = env.get(s) {
                     Ok(Typed {
@@ -261,11 +296,7 @@ impl Ck {
             Expr::Transpose(a) => {
                 let a = self.expr(a, env, dims, depth)?;
                 if a.ty.dims.len() != 2 {
-                    return diag(
-                        format!(".T requires rank-2, found {}", a.ty.show()),
-                        l,
-                        c,
-                    );
+                    return diag(format!(".T requires rank-2, found {}", a.ty.show()), l, c);
                 }
                 let ty = CTy {
                     dt: a.ty.dt,
@@ -314,7 +345,11 @@ impl Ck {
                         Index::Expr(ie) => {
                             let v = self.const_int(ie, dims)?;
                             if v < 0 || v >= dim {
-                                return diag(format!("index {v} out of bounds for dim {dim}"), ix.line, ix.col);
+                                return diag(
+                                    format!("index {v} out of bounds for dim {dim}"),
+                                    ix.line,
+                                    ix.col,
+                                );
                             }
                             tidx.push(TIndex::Lit(v));
                         }
@@ -328,7 +363,11 @@ impl Ck {
                                 None => dim,
                             };
                             if lv < 0 || hv > dim || lv >= hv {
-                                return diag(format!("range {lv}..{hv} invalid for dim {dim}"), ix.line, ix.col);
+                                return diag(
+                                    format!("range {lv}..{hv} invalid for dim {dim}"),
+                                    ix.line,
+                                    ix.col,
+                                );
                             }
                             tidx.push(TIndex::Range(lv, hv));
                             out_dims.push(hv - lv);
@@ -378,11 +417,11 @@ impl Ck {
     fn const_int(&mut self, e: &Sp<Expr>, dims: &Dims) -> CResult<i64> {
         match &e.v {
             Expr::Int(n) => Ok(*n),
-            Expr::Ident(s) => dims
-                .get(s)
-                .copied()
-                .ok_or(())
-                .map_err(|_| Diag { msg: format!("index {s} is not a compile-time dim"), line: e.line, col: e.col }),
+            Expr::Ident(s) => dims.get(s).copied().ok_or(()).map_err(|_| Diag {
+                msg: format!("index {s} is not a compile-time dim"),
+                line: e.line,
+                col: e.col,
+            }),
             Expr::Unary(UnOp::Neg, a) => Ok(-self.const_int(a, dims)?),
             _ => diag("index must be a constant or generic dim", e.line, e.col),
         }
@@ -391,23 +430,51 @@ impl Ck {
     fn matmul_ty(&self, a: &CTy, b: &CTy, l: usize, c: usize) -> CResult<CTy> {
         // v1: vector @ matrix and matrix @ matrix; b rank-2.
         if b.dims.len() != 2 {
-            return diag(format!("matmul rhs must be rank-2, found {}", b.show()), l, c);
+            return diag(
+                format!("matmul rhs must be rank-2, found {}", b.show()),
+                l,
+                c,
+            );
         }
         let (k1, n) = (b.dims[0], b.dims[1]);
         match a.dims.len() {
             1 => {
                 if a.dims[0] != k1 {
-                    return diag(format!("matmul: a[K={}] vs b[K={k1}, N={n}] — K mismatch", a.dims[0]), l, c);
+                    return diag(
+                        format!(
+                            "matmul: a[K={}] vs b[K={k1}, N={n}] — K mismatch",
+                            a.dims[0]
+                        ),
+                        l,
+                        c,
+                    );
                 }
-                Ok(CTy { dt: a.dt, dims: vec![n] })
+                Ok(CTy {
+                    dt: a.dt,
+                    dims: vec![n],
+                })
             }
             2 => {
                 if a.dims[1] != k1 {
-                    return diag(format!("matmul: a[M={}, K={}] vs b[K={k1}, N={n}] — K mismatch", a.dims[0], a.dims[1]), l, c);
+                    return diag(
+                        format!(
+                            "matmul: a[M={}, K={}] vs b[K={k1}, N={n}] — K mismatch",
+                            a.dims[0], a.dims[1]
+                        ),
+                        l,
+                        c,
+                    );
                 }
-                Ok(CTy { dt: a.dt, dims: vec![a.dims[0], n] })
+                Ok(CTy {
+                    dt: a.dt,
+                    dims: vec![a.dims[0], n],
+                })
             }
-            _ => diag(format!("matmul lhs must be rank-1 or 2, found {}", a.show()), l, c),
+            _ => diag(
+                format!("matmul lhs must be rank-1 or 2, found {}", a.show()),
+                l,
+                c,
+            ),
         }
     }
 
@@ -421,7 +488,11 @@ impl Ck {
         if b.is_scalar() {
             return Ok(a.clone());
         }
-        diag(format!("shape mismatch: {} vs {}", a.show(), b.show()), l, c)
+        diag(
+            format!("shape mismatch: {} vs {}", a.show(), b.show()),
+            l,
+            c,
+        )
     }
 
     fn call(
@@ -517,18 +588,19 @@ impl Ck {
         }
         let wrt = match &pos[1].v {
             Expr::Ident(s) => s.clone(),
-            _ => return diag("grad's second arg must be a param name", pos[1].line, pos[1].col),
+            _ => {
+                return diag(
+                    "grad's second arg must be a param name",
+                    pos[1].line,
+                    pos[1].col,
+                )
+            }
         };
-        let (_, pty, _) = self
-            .params
-            .get(&wrt)
-            .cloned()
-            .ok_or(())
-            .map_err(|_| Diag {
-                msg: format!("grad target {wrt:?} is not a param"),
-                line: pos[1].line,
-                col: pos[1].col,
-            })?;
+        let (_, pty, _) = self.params.get(&wrt).cloned().ok_or(()).map_err(|_| Diag {
+            msg: format!("grad target {wrt:?} is not a param"),
+            line: pos[1].line,
+            col: pos[1].col,
+        })?;
         let loss = self.expr(&pos[0], env, dims, depth)?;
         if !loss.ty.is_scalar() {
             return diag(
@@ -557,7 +629,11 @@ impl Ck {
     ) -> CResult<CTy> {
         let arity = |n: usize| -> CResult<()> {
             if args.len() != n {
-                diag(format!("{name} expects {n} args, found {}", args.len()), l, c)
+                diag(
+                    format!("{name} expects {n} args, found {}", args.len()),
+                    l,
+                    c,
+                )
             } else {
                 Ok(())
             }
@@ -660,7 +736,12 @@ impl Ck {
     ) -> CResult<Typed> {
         if pos.len() != f.args.len() {
             return diag(
-                format!("{} expects {} args, found {}", f.name, f.args.len(), pos.len()),
+                format!(
+                    "{} expects {} args, found {}",
+                    f.name,
+                    f.args.len(),
+                    pos.len()
+                ),
                 l,
                 c,
             );
@@ -678,7 +759,11 @@ impl Ck {
         // declared generic dims must all get bound by arg unification
         for d in &f.dims {
             if !cdims.contains_key(&d.v) {
-                return diag(format!("dim {} of {} is not bound by arguments", d.v, f.name), d.line, d.col);
+                return diag(
+                    format!("dim {} of {} is not bound by arguments", d.v, f.name),
+                    d.line,
+                    d.col,
+                );
             }
         }
         let mut letmap = HashMap::new();
@@ -691,7 +776,12 @@ impl Ck {
             let want = resolve_ty(&cdims, &rt.v, rt.line, rt.col)?;
             if want.dims != ret.ty.dims {
                 return diag(
-                    format!("{} declared -> {} but returns {}", f.name, want.show(), ret.ty.show()),
+                    format!(
+                        "{} declared -> {} but returns {}",
+                        f.name,
+                        want.show(),
+                        ret.ty.show()
+                    ),
                     rt.line,
                     rt.col,
                 );
@@ -740,7 +830,13 @@ impl Ck {
         for (i, s) in stmts.iter().enumerate() {
             let terminal = i + 1 == stmts.len();
             match &s.v {
-                Stmt::Let { name, hty, ty, expr, .. } => {
+                Stmt::Let {
+                    name,
+                    hty,
+                    ty,
+                    expr,
+                    ..
+                } => {
                     if hty.is_some() {
                         return diag("host type annotation inside an ane fn", name.line, name.col);
                     }
@@ -750,14 +846,22 @@ impl Ck {
                         let want = resolve_ty(dims, &dt.v, dt.line, dt.col)?;
                         if want.dims != te.ty.dims {
                             return diag(
-                                format!("{}: declared {} but expression is {}", name.v, want.show(), te.ty.show()),
+                                format!(
+                                    "{}: declared {} but expression is {}",
+                                    name.v,
+                                    want.show(),
+                                    te.ty.show()
+                                ),
                                 dt.line,
                                 dt.col,
                             );
                         }
                     }
                     env.insert(name.v.clone(), te.ty.clone());
-                    out.push(TStmt::Let { name: name.v.clone(), expr: te });
+                    out.push(TStmt::Let {
+                        name: name.v.clone(),
+                        expr: te,
+                    });
                     if terminal {
                         last = None;
                     }
@@ -778,9 +882,16 @@ impl Ck {
                             let sign = match op {
                                 AssignOp::Add => 1.0,
                                 AssignOp::Sub => -1.0,
-                                _ => return diag("param updates support += and -= in v1", s.line, s.col),
+                                _ => {
+                                    return diag(
+                                        "param updates support += and -= in v1",
+                                        s.line,
+                                        s.col,
+                                    )
+                                }
                             };
-                            let grad = self.grad_call(pos, env, dims, depth, expr.line, expr.col)?;
+                            let grad =
+                                self.grad_call(pos, env, dims, depth, expr.line, expr.col)?;
                             out.push(TStmt::ParamUpdate {
                                 param: name.v.clone(),
                                 scale: sign * scale,
@@ -797,12 +908,21 @@ impl Ck {
                     let te = self.expr(expr, env, dims, depth)?;
                     if te.ty.dims != cur.dims {
                         return diag(
-                            format!("assign: {} is {}, expr is {}", name.v, cur.show(), te.ty.show()),
+                            format!(
+                                "assign: {} is {}, expr is {}",
+                                name.v,
+                                cur.show(),
+                                te.ty.show()
+                            ),
                             s.line,
                             s.col,
                         );
                     }
-                    out.push(TStmt::Assign { name: name.v.clone(), op: *op, expr: te });
+                    out.push(TStmt::Assign {
+                        name: name.v.clone(),
+                        op: *op,
+                        expr: te,
+                    });
                 }
                 Stmt::Store { target, op, expr } => {
                     let ts = self.store(target, op, expr, env, dims, depth, s.line, s.col)?;
@@ -815,11 +935,7 @@ impl Ck {
                         Some(e) => e.clone(),
                         None => return diag("bare return — ane fns end in a value", s.line, s.col),
                     };
-                    let marker = sp(
-                        Expr::Call("__ret".into(), vec![e], vec![]),
-                        s.line,
-                        s.col,
-                    );
+                    let marker = sp(Expr::Call("__ret".into(), vec![e], vec![]), s.line, s.col);
                     let te = self.expr(&marker, env, dims, depth)?;
                     if terminal {
                         last = Some(te);
@@ -833,31 +949,59 @@ impl Ck {
                 | Stmt::For { .. }
                 | Stmt::Break
                 | Stmt::Continue => {
-                    return diag("control flow is host-stratum — wrap it in `host fn`", s.line, s.col)
+                    return diag(
+                        "control flow is host-stratum — wrap it in `host fn`",
+                        s.line,
+                        s.col,
+                    )
                 }
                 Stmt::Expr(e) => {
                     if let Expr::Call(n, pos, named) = &e.v {
                         if n == "adam" {
                             if pos.len() < 2 || pos.len() > 3 {
-                                return diag("adam(param, grad(loss, param) [, lr]) expects 2-3 args", e.line, e.col);
+                                return diag(
+                                    "adam(param, grad(loss, param) [, lr]) expects 2-3 args",
+                                    e.line,
+                                    e.col,
+                                );
                             }
                             let pname = match &pos[0].v {
                                 Expr::Ident(s) => s.clone(),
-                                _ => return diag("adam's first arg must be a trainable param", pos[0].line, pos[0].col),
+                                _ => {
+                                    return diag(
+                                        "adam's first arg must be a trainable param",
+                                        pos[0].line,
+                                        pos[0].col,
+                                    )
+                                }
                             };
                             match self.params.get(&pname) {
                                 Some((Qual::Trainable, _, _)) => {}
                                 Some((q, _, _)) => {
-                                    return diag(format!("adam target {pname:?} is {q:?}, must be trainable"), pos[0].line, pos[0].col)
+                                    return diag(
+                                        format!(
+                                            "adam target {pname:?} is {q:?}, must be trainable"
+                                        ),
+                                        pos[0].line,
+                                        pos[0].col,
+                                    )
                                 }
-                                None => return diag(format!("adam target {pname:?} is not a param"), pos[0].line, pos[0].col),
+                                None => {
+                                    return diag(
+                                        format!("adam target {pname:?} is not a param"),
+                                        pos[0].line,
+                                        pos[0].col,
+                                    )
+                                }
                             }
-                            let (_, gpos) = self.grad_of(&pos[1], letmap).ok_or(()).map_err(|_| Diag {
-                                msg: "adam's second arg must be `grad(loss, param)`".into(),
-                                line: pos[1].line,
-                                col: pos[1].col,
-                            })?;
-                            let grad = self.grad_call(gpos, env, dims, depth, pos[1].line, pos[1].col)?;
+                            let (_, gpos) =
+                                self.grad_of(&pos[1], letmap).ok_or(()).map_err(|_| Diag {
+                                    msg: "adam's second arg must be `grad(loss, param)`".into(),
+                                    line: pos[1].line,
+                                    col: pos[1].col,
+                                })?;
+                            let grad =
+                                self.grad_call(gpos, env, dims, depth, pos[1].line, pos[1].col)?;
                             let lr = pos
                                 .get(2)
                                 .or_else(|| named.iter().find(|(k, _)| k.v == "lr").map(|(_, v)| v))
@@ -909,16 +1053,40 @@ impl Ck {
         let (sname, fname, idxs) = match &target.v {
             Expr::Field(b, f) => match &b.v {
                 Expr::Ident(s) => (s.clone(), f.v.clone(), None),
-                _ => return diag("store target must be a state field", target.line, target.col),
+                _ => {
+                    return diag(
+                        "store target must be a state field",
+                        target.line,
+                        target.col,
+                    )
+                }
             },
             Expr::Index(b, idxs) => match &b.v {
                 Expr::Field(fb, f) => match &fb.v {
                     Expr::Ident(s) => (s.clone(), f.v.clone(), Some(idxs)),
-                    _ => return diag("store target must be a state field", target.line, target.col),
+                    _ => {
+                        return diag(
+                            "store target must be a state field",
+                            target.line,
+                            target.col,
+                        )
+                    }
                 },
-                _ => return diag("scatter writes target state fields — `kv.k[pos] = e`", target.line, target.col),
+                _ => {
+                    return diag(
+                        "scatter writes target state fields — `kv.k[pos] = e`",
+                        target.line,
+                        target.col,
+                    )
+                }
             },
-            _ => return diag("store target must be `state.field` or `state.field[i]`", target.line, target.col),
+            _ => {
+                return diag(
+                    "store target must be `state.field` or `state.field[i]`",
+                    target.line,
+                    target.col,
+                )
+            }
         };
         let fields = self
             .states
@@ -975,12 +1143,20 @@ impl Ck {
             // additive write; fresh cache slots start zeroed.
             (Some(ix), AssignOp::Set) | (Some(ix), AssignOp::Add) => {
                 if ix.len() != 1 {
-                    return diag("v1 scatter writes one index — `s.f[p] = e`", target.line, target.col);
+                    return diag(
+                        "v1 scatter writes one index — `s.f[p] = e`",
+                        target.line,
+                        target.col,
+                    );
                 }
                 let pos = match &ix[0].v {
                     Index::Expr(e) => e.clone(),
                     Index::Range(..) => {
-                        return diag("scatter index is a one-hot vector, not a range", ix[0].line, ix[0].col)
+                        return diag(
+                            "scatter index is a one-hot vector, not a range",
+                            ix[0].line,
+                            ix[0].col,
+                        )
                     }
                 };
                 // the index must be a runtime vector matching dim 0
@@ -1000,7 +1176,14 @@ impl Ck {
                 let want = &fct.dims[1..];
                 if val_t.ty.dims != want {
                     return diag(
-                        format!("scatter value {} must be [{}]", val_t.ty.show(), want.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")),
+                        format!(
+                            "scatter value {} must be [{}]",
+                            val_t.ty.show(),
+                            want.iter()
+                                .map(|d| d.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
                         expr.line,
                         expr.col,
                     );
@@ -1018,12 +1201,20 @@ impl Ck {
             }
             (Some(ix), AssignOp::Sub) => {
                 if ix.len() != 1 {
-                    return diag("v1 scatter writes one index — `s.f[p] -= e`", target.line, target.col);
+                    return diag(
+                        "v1 scatter writes one index — `s.f[p] -= e`",
+                        target.line,
+                        target.col,
+                    );
                 }
                 let pos = match &ix[0].v {
                     Index::Expr(e) => e.clone(),
                     Index::Range(..) => {
-                        return diag("scatter index is a one-hot vector, not a range", ix[0].line, ix[0].col)
+                        return diag(
+                            "scatter index is a one-hot vector, not a range",
+                            ix[0].line,
+                            ix[0].col,
+                        )
                     }
                 };
                 let outer = sp(
@@ -1031,7 +1222,11 @@ impl Ck {
                         "outer".into(),
                         vec![
                             pos,
-                            sp(Expr::Unary(UnOp::Neg, Box::new(expr.clone())), expr.line, expr.col),
+                            sp(
+                                Expr::Unary(UnOp::Neg, Box::new(expr.clone())),
+                                expr.line,
+                                expr.col,
+                            ),
                         ],
                         vec![],
                     ),
@@ -1044,17 +1239,32 @@ impl Ck {
                     c,
                 )
             }
-            (Some(_), _) => return diag("state scatter supports `=`, `+=`, `-=`", target.line, target.col),
+            (Some(_), _) => {
+                return diag(
+                    "state scatter supports `=`, `+=`, `-=`",
+                    target.line,
+                    target.col,
+                )
+            }
         };
         let te = self.expr(&desugared, env, dims, depth)?;
         if te.ty.dims != fct.dims {
             return diag(
-                format!("state update {} produces {} — field is {}", key, te.ty.show(), fct.show()),
+                format!(
+                    "state update {} produces {} — field is {}",
+                    key,
+                    te.ty.show(),
+                    fct.show()
+                ),
                 l,
                 c,
             );
         }
-        Ok(TStmt::StateUpdate { key, port, expr: te })
+        Ok(TStmt::StateUpdate {
+            key,
+            port,
+            expr: te,
+        })
     }
 }
 
@@ -1107,7 +1317,12 @@ pub(crate) fn collect(
             Decl::Provenance(kvs) => {
                 provenance.extend(kvs.iter().map(|(k, v)| (k.v.clone(), v.v.clone())))
             }
-            Decl::Param { name, qual, ty, src } => {
+            Decl::Param {
+                name,
+                qual,
+                ty,
+                src,
+            } => {
                 ck.params.insert(
                     name.v.clone(),
                     (*qual, ty.v.clone(), src.as_ref().map(|s| s.v.clone())),
@@ -1121,13 +1336,19 @@ pub(crate) fn collect(
             Decl::State { name, fields } => {
                 ck.states.insert(
                     name.v.clone(),
-                    fields.iter().map(|(f, t)| (f.v.clone(), t.v.clone())).collect(),
+                    fields
+                        .iter()
+                        .map(|(f, t)| (f.v.clone(), t.v.clone()))
+                        .collect(),
                 );
             }
             Decl::Struct { name, fields } => {
                 structs.push((
                     name.v.clone(),
-                    fields.iter().map(|(f, t)| (f.v.clone(), t.v.clone())).collect(),
+                    fields
+                        .iter()
+                        .map(|(f, t)| (f.v.clone(), t.v.clone()))
+                        .collect(),
                 ));
             }
             Decl::Enum { name, variants } => {
@@ -1136,10 +1357,7 @@ pub(crate) fn collect(
                     variants
                         .iter()
                         .map(|(vn, ptys)| {
-                            (
-                                vn.v.clone(),
-                                ptys.iter().map(|t| t.v.clone()).collect(),
-                            )
+                            (vn.v.clone(), ptys.iter().map(|t| t.v.clone()).collect())
                         })
                         .collect(),
                 ));
@@ -1180,7 +1398,10 @@ impl Ck {
     ) -> CResult<TProgram> {
         if !f.v.dims.is_empty() {
             return diag(
-                format!("{} has generic dims — programs need concrete signatures", f.v.name),
+                format!(
+                    "{} has generic dims — programs need concrete signatures",
+                    f.v.name
+                ),
                 f.line,
                 f.col,
             );
@@ -1202,7 +1423,12 @@ impl Ck {
         sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (n, (q, t, s)) in sorted {
             let ct = resolve_ty(&mut pdims, t, 0, 0)?;
-            tparams.push(TParam { name: n.clone(), qual: *q, ty: ct, src: s.clone() });
+            tparams.push(TParam {
+                name: n.clone(),
+                qual: *q,
+                ty: ct,
+                src: s.clone(),
+            });
         }
         for (n, (_, t, _)) in self.params.clone() {
             if let Ok(ct) = resolve_ty(&dims, &t, 0, 0) {
@@ -1212,7 +1438,10 @@ impl Ck {
         let mut letmap = HashMap::new();
         let (body, last) = self.body(&f.v.body, &mut env, &mut dims, 0, &mut letmap)?;
         let ret = last.ok_or(()).map_err(|_| Diag {
-            msg: format!("{} must end in a result expression — a program needs an output", f.v.name),
+            msg: format!(
+                "{} must end in a result expression — a program needs an output",
+                f.v.name
+            ),
             line: f.line,
             col: f.col,
         })?;
@@ -1220,7 +1449,12 @@ impl Ck {
             let want = resolve_ty(&dims, &rt.v, rt.line, rt.col)?;
             if want.dims != ret.ty.dims {
                 return diag(
-                    format!("{} declared -> {} but returns {}", f.v.name, want.show(), ret.ty.show()),
+                    format!(
+                        "{} declared -> {} but returns {}",
+                        f.v.name,
+                        want.show(),
+                        ret.ty.show()
+                    ),
                     rt.line,
                     rt.col,
                 );
@@ -1292,22 +1526,16 @@ pub fn check_all(p: &Program) -> CResult<Checked> {
         if !f.v.dims.is_empty() {
             continue; // inline-only — generic fns can't be programs
         }
-        let has_generic_ty = f
-            .v
-            .args
-            .iter()
-            .map(|(_, t)| t)
-            .chain(f.v.ret.iter())
-            .any(|t| t.v.dims.iter().any(|d| matches!(d, Dim::Name(_))));
+        let has_generic_ty =
+            f.v.args
+                .iter()
+                .map(|(_, t)| t)
+                .chain(f.v.ret.iter())
+                .any(|t| t.v.dims.iter().any(|d| matches!(d, Dim::Name(_))));
         if has_generic_ty {
             continue;
         }
-        let prog = ck.program_for(
-            f,
-            invariants.clone(),
-            caps.clone(),
-            provenance.clone(),
-        )?;
+        let prog = ck.program_for(f, invariants.clone(), caps.clone(), provenance.clone())?;
         ane.push((f.v.name.clone(), prog));
     }
     let host = crate::hostck::check(
@@ -1327,17 +1555,21 @@ pub fn check_all(p: &Program) -> CResult<Checked> {
 pub fn check(p: &Program) -> CResult<TProgram> {
     let (mut ck, invariants, caps, provenance, _hostfns, _externs, _structs, _enums, _tables) =
         collect(p)?;
-    let main = ck
-        .fns
-        .get("main")
-        .cloned()
-        .ok_or(())
-        .map_err(|_| Diag { msg: "no `fn main` — a coyote program needs an entry".into(), line: 0, col: 0 })?;
+    let main = ck.fns.get("main").cloned().ok_or(()).map_err(|_| Diag {
+        msg: "no `fn main` — a coyote program needs an entry".into(),
+        line: 0,
+        col: 0,
+    })?;
     // bind main's args to `io in` decls
-    let ins: Vec<&(String, IoDir, CTy)> = ck.ios.iter().filter(|(_, d, _)| *d == IoDir::In).collect();
+    let ins: Vec<&(String, IoDir, CTy)> =
+        ck.ios.iter().filter(|(_, d, _)| *d == IoDir::In).collect();
     if ins.len() != main.v.args.len() {
         return diag(
-            format!("main takes {} args but {} `io in` declared", main.v.args.len(), ins.len()),
+            format!(
+                "main takes {} args but {} `io in` declared",
+                main.v.args.len(),
+                ins.len()
+            ),
             main.line,
             main.col,
         );
@@ -1360,7 +1592,12 @@ pub fn check(p: &Program) -> CResult<TProgram> {
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     for (n, (q, t, s)) in sorted {
         let ct = resolve_ty(&mut pdims, t, 0, 0)?;
-        tparams.push(TParam { name: n.clone(), qual: *q, ty: ct, src: s.clone() });
+        tparams.push(TParam {
+            name: n.clone(),
+            qual: *q,
+            ty: ct,
+            src: s.clone(),
+        });
     }
     // main sees param types under its own dim env
     for (n, (_, t, _)) in ck.params.clone() {
@@ -1375,11 +1612,16 @@ pub fn check(p: &Program) -> CResult<TProgram> {
         line: main.line,
         col: main.col,
     })?;
-    let outs: Vec<&(String, IoDir, CTy)> = ck.ios.iter().filter(|(_, d, _)| *d == IoDir::Out).collect();
+    let outs: Vec<&(String, IoDir, CTy)> =
+        ck.ios.iter().filter(|(_, d, _)| *d == IoDir::Out).collect();
     if let Some((_, _, oct)) = outs.first() {
         if oct.dims != ret.ty.dims {
             return diag(
-                format!("main returns {} but `io out` declares {}", ret.ty.show(), oct.show()),
+                format!(
+                    "main returns {} but `io out` declares {}",
+                    ret.ty.show(),
+                    oct.show()
+                ),
                 main.line,
                 main.col,
             );

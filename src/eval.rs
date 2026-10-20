@@ -10,14 +10,7 @@ use std::collections::HashMap;
 
 /// Standard Adam optimizer step ($\beta_1 = 0.9, \beta_2 = 0.999, \epsilon = 10^{-8}$),
 /// with updated weights rounded to fp16 to match the ANE surface representation.
-pub fn adam_step(
-    w: &mut [f32],
-    g: &[f32],
-    m: &mut [f32],
-    v: &mut [f32],
-    step: usize,
-    lr: f64,
-) {
+pub fn adam_step(w: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32], step: usize, lr: f64) {
     let b1 = 0.9f32;
     let b2 = 0.999f32;
     // fp16-safe epsilon (1e-2 prevents sub-ULP fp16 gradient noise near 0
@@ -156,11 +149,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn is_param(&self, name: &str) -> Option<&CTy> {
-        self.p
-            .params
-            .iter()
-            .find(|t| t.name == name)
-            .map(|t| &t.ty)
+        self.p.params.iter().find(|t| t.name == name).map(|t| &t.ty)
     }
 
     fn param_val(&self, name: &str) -> CResult<Val> {
@@ -170,7 +159,11 @@ impl<'a> Evaluator<'a> {
             .iter()
             .find(|t| t.name == name)
             .ok_or(())
-            .map_err(|_| Diag { msg: format!("no param {name}"), line: 0, col: 0 })?;
+            .map_err(|_| Diag {
+                msg: format!("no param {name}"),
+                line: 0,
+                col: 0,
+            })?;
         // storage is always [N, K] for matrices — matches emitted blobs
         // and the packed runtime layout.
         let expect: Vec<usize> = if t.ty.dims.len() == 2 {
@@ -178,14 +171,18 @@ impl<'a> Evaluator<'a> {
         } else {
             vec![t.ty.numel() as usize]
         };
-        let v = crate::weights::resolve(name, Some(&expect), t.src.as_deref(), qw)
-            .map_err(|m| Diag { msg: m, line: 0, col: 0 })?;
+        let v =
+            crate::weights::resolve(name, Some(&expect), t.src.as_deref(), qw).map_err(|m| {
+                Diag {
+                    msg: m,
+                    line: 0,
+                    col: 0,
+                }
+            })?;
         let v = if t.ty.dt == DType::Q4 {
             q4_quantize(&v)
         } else {
-            v.iter()
-                .map(|&x| half::f16::from_f32(x).to_f32())
-                .collect()
+            v.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect()
         };
         Ok(Val::V(v))
     }
@@ -256,13 +253,19 @@ impl<'a> Evaluator<'a> {
                             // field storage is [T, D] row-major
                             let (t, d) = match &b.e {
                                 TExpr::Field(..) => (b.ty.dims[0] as usize, b.ty.dims[1] as usize),
-                                TExpr::Transpose(i) => (i.ty.dims[0] as usize, i.ty.dims[1] as usize),
+                                TExpr::Transpose(i) => {
+                                    (i.ty.dims[0] as usize, i.ty.dims[1] as usize)
+                                }
                                 _ => unreachable!(),
                             };
                             let v = self
                                 .lookup(&key)
                                 .ok_or(())
-                                .map_err(|_| Diag { msg: format!("unbound state {key}"), line: 0, col: 0 })?
+                                .map_err(|_| Diag {
+                                    msg: format!("unbound state {key}"),
+                                    line: 0,
+                                    col: 0,
+                                })?
                                 .vec(t * d);
                             let nn = b.ty.dims[1] as usize;
                             let mut out = vec![0f32; nn];
@@ -477,10 +480,11 @@ impl<'a> Evaluator<'a> {
             TExpr::Field(bx, f) => {
                 if let TExpr::Ident(s) = &bx.e {
                     let key = format!("{s}.{f}");
-                    return self
-                        .lookup(&key)
-                        .ok_or(())
-                        .map_err(|_| Diag { msg: format!("unbound state {key}"), line: 0, col: 0 });
+                    return self.lookup(&key).ok_or(()).map_err(|_| Diag {
+                        msg: format!("unbound state {key}"),
+                        line: 0,
+                        col: 0,
+                    });
                 }
                 diag("eval: field access only on state blocks", 0, 0)
             }
@@ -541,12 +545,11 @@ impl<'a> Evaluator<'a> {
             }
             _ => return diag("grad: v1 losses must end in mse", 0, 0),
         }
-        let out = self
-            .grads
-            .get(wrt)
-            .cloned()
-            .ok_or(())
-            .map_err(|_| Diag { msg: format!("grad: loss does not depend on {wrt}"), line: 0, col: 0 })?;
+        let out = self.grads.get(wrt).cloned().ok_or(()).map_err(|_| Diag {
+            msg: format!("grad: loss does not depend on {wrt}"),
+            line: 0,
+            col: 0,
+        })?;
         self.in_grad = false;
         self.tape.clear();
         self.env.pop();
@@ -569,9 +572,7 @@ impl<'a> Evaluator<'a> {
                 let neg: Vec<f32> = adj.iter().map(|x| -x).collect();
                 self.back(a, &neg)?;
             }
-            TExpr::Unary(UnOp::Not, _) => {
-                return diag("back: `!` is host-stratum", 0, 0)
-            }
+            TExpr::Unary(UnOp::Not, _) => return diag("back: `!` is host-stratum", 0, 0),
             TExpr::Bin(op, a, b) => match op {
                 BinOp::Add => {
                     self.back(a, adj)?;
@@ -622,10 +623,8 @@ impl<'a> Evaluator<'a> {
                 }
                 BinOp::MatMul => {
                     // grad through state-field contractions lands in M3b
-                    let is_state_rhs = matches!(
-                        &b.e,
-                        TExpr::Field(..)
-                    ) || matches!(&b.e, TExpr::Transpose(i) if matches!(&i.e, TExpr::Field(..)));
+                    let is_state_rhs = matches!(&b.e, TExpr::Field(..))
+                        || matches!(&b.e, TExpr::Transpose(i) if matches!(&i.e, TExpr::Field(..)));
                     if is_state_rhs {
                         if self.needs_grad(a) {
                             return diag("grad through cache/state ops lands in M3b", 0, 0);
@@ -677,20 +676,14 @@ impl<'a> Evaluator<'a> {
                 match name.as_str() {
                     "sigmoid" => {
                         let h = self.fwd(e)?.vec(n);
-                        let dx: Vec<f32> = adj
-                            .iter()
-                            .zip(&h)
-                            .map(|(d, h)| d * h * (1.0 - h))
-                            .collect();
+                        let dx: Vec<f32> =
+                            adj.iter().zip(&h).map(|(d, h)| d * h * (1.0 - h)).collect();
                         self.back(x, &dx)?;
                     }
                     "tanh" => {
                         let t = self.fwd(e)?.vec(n);
-                        let dx: Vec<f32> = adj
-                            .iter()
-                            .zip(&t)
-                            .map(|(d, t)| d * (1.0 - t * t))
-                            .collect();
+                        let dx: Vec<f32> =
+                            adj.iter().zip(&t).map(|(d, t)| d * (1.0 - t * t)).collect();
                         self.back(x, &dx)?;
                     }
                     "silu" => {
@@ -734,11 +727,8 @@ impl<'a> Evaluator<'a> {
                     "softmax" => {
                         let s = self.fwd(e)?.vec(n);
                         let dot: f32 = adj.iter().zip(&s).map(|(d, si)| d * si).sum();
-                        let dx: Vec<f32> = adj
-                            .iter()
-                            .zip(&s)
-                            .map(|(d, si)| si * (d - dot))
-                            .collect();
+                        let dx: Vec<f32> =
+                            adj.iter().zip(&s).map(|(d, si)| si * (d - dot)).collect();
                         self.back(x, &dx)?;
                     }
                     "rmsnorm" => {
@@ -762,8 +752,7 @@ impl<'a> Evaluator<'a> {
                         if self.needs_grad(x) {
                             let g: Vec<f32> = adj.iter().zip(&wv).map(|(d, w)| d * w).collect();
                             let mean_gx: f32 =
-                                g.iter().zip(&xhat).map(|(gi, xh)| gi * xh).sum::<f32>()
-                                    / n as f32;
+                                g.iter().zip(&xhat).map(|(gi, xh)| gi * xh).sum::<f32>() / n as f32;
                             let dx: Vec<f32> = g
                                 .iter()
                                 .zip(&xhat)

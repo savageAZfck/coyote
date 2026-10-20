@@ -203,7 +203,11 @@ fn main() {
             std::fs::write(dir.join("witness.jsonl"), &wl).map_err(|e| e.to_string())?;
             println!("✓ organism returned {}", vm.stringify(&ret));
             if !vm.witness_log().is_empty() {
-                println!("  witness: {} entries → {}", vm.witness_log().len(), dir.join("witness.jsonl").display());
+                println!(
+                    "  witness: {} entries → {}",
+                    vm.witness_log().len(),
+                    dir.join("witness.jsonl").display()
+                );
             }
             return Ok(());
         }
@@ -211,7 +215,12 @@ fn main() {
             "check" => {
                 println!("✓ {} — checked", file.display());
                 for (name, p) in &checked.ane {
-                    println!("  program {name}: {} io, {} params, {} stmts", p.ios.len(), p.params.len(), p.body.len());
+                    println!(
+                        "  program {name}: {} io, {} params, {} stmts",
+                        p.ios.len(),
+                        p.params.len(),
+                        p.body.len()
+                    );
                 }
                 if let Some(h) = &checked.host {
                     let nreflex = h.fns.iter().filter(|f| f.is_reflex).count();
@@ -239,7 +248,11 @@ fn main() {
                     .ok_or("no ane programs and no host entry — nothing to run")?
                     .1;
                 let out = emit_program(&src, prog, &dir, rebuild)?;
-                let verb = if out.mil.is_empty() { "cached" } else { "lowered" };
+                let verb = if out.mil.is_empty() {
+                    "cached"
+                } else {
+                    "lowered"
+                };
                 println!("✓ {verb} → {}", dir.join("net.mil").display());
                 println!("  mil sha256: {}", &out.mil_sha[..16]);
                 let plan = mil_infer::graph::compile_graph(
@@ -270,8 +283,7 @@ fn main() {
                                 desc.offset(0, 0, i as u64, 0, 0)
                             };
                             if o + 2 <= b.len() {
-                                b[o..o + 2]
-                                    .copy_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+                                b[o..o + 2].copy_from_slice(&half::f16::from_f32(*v).to_le_bytes());
                             }
                         }
                     });
@@ -324,12 +336,12 @@ fn main() {
                 }
                 // per-step io conventions for the decode loop: `pos` is
                 // the one-hot write position, `mask` the causal mask.
-                let pos_io = inputs.iter().find_map(|(n, v)| {
-                    (n == "pos").then(|| v.len())
-                });
-                let mask_io = inputs.iter().find_map(|(n, v)| {
-                    (n == "mask").then(|| v.len())
-                });
+                let pos_io = inputs
+                    .iter()
+                    .find_map(|(n, v)| (n == "pos").then(|| v.len()));
+                let mask_io = inputs
+                    .iter()
+                    .find_map(|(n, v)| (n == "mask").then(|| v.len()));
                 let training = !out.trainable.is_empty() || !out.states.is_empty();
                 // decode mode: an io out named `logits` means the loop
                 // argmaxes, gathers the next token's embedding row from
@@ -426,7 +438,11 @@ fn main() {
                                 .map(|i| {
                                     let th = base.powf(-2.0 * i as f64 / (2.0 * d as f64));
                                     let ang = p * th;
-                                    if nm == "cos" { ang.cos() as f32 } else { ang.sin() as f32 }
+                                    if nm == "cos" {
+                                        ang.cos() as f32
+                                    } else {
+                                        ang.sin() as f32
+                                    }
                                 })
                                 .collect();
                             inputs.insert(nm.to_string(), v.clone());
@@ -490,8 +506,7 @@ fn main() {
                                 .ok_or_else(|| format!("update node {mname} missing"))?;
                             let pdesc = rt.out_desc(pidx);
                             let praw = rt.output(pidx).to_vec();
-                            let (nn, kk) =
-                                (cty.dims[1] as usize, cty.dims[0] as usize);
+                            let (nn, kk) = (cty.dims[1] as usize, cty.dims[0] as usize);
                             let mut wnew = read_surface(&praw, &pdesc, nn, kk);
                             // cpu-side update from the same step
                             let mut cupd = ev
@@ -503,18 +518,19 @@ fn main() {
                             if let Some(&(_, lr)) = out.adam_lrs.iter().find(|(p, _)| p == pname) {
                                 let g_ane = wnew;
                                 let mut w_cur = ane_w.get(pname).cloned().unwrap_or_default();
-                                let (m, v) = ane_adam
-                                    .entry(pname.clone())
-                                    .or_insert_with(|| (vec![0.0; w_cur.len()], vec![0.0; w_cur.len()]));
+                                let (m, v) = ane_adam.entry(pname.clone()).or_insert_with(|| {
+                                    (vec![0.0; w_cur.len()], vec![0.0; w_cur.len()])
+                                });
                                 coyote::eval::adam_step(&mut w_cur, &g_ane, m, v, step, lr);
                                 wnew = w_cur;
 
                                 if !cupd.is_empty() {
                                     let g_cpu = cupd;
                                     let mut wc_cur = cpu_w.get(pname).cloned().unwrap_or_default();
-                                    let (mc, vc) = cpu_adam
-                                        .entry(pname.clone())
-                                        .or_insert_with(|| (vec![0.0; wc_cur.len()], vec![0.0; wc_cur.len()]));
+                                    let (mc, vc) =
+                                        cpu_adam.entry(pname.clone()).or_insert_with(|| {
+                                            (vec![0.0; wc_cur.len()], vec![0.0; wc_cur.len()])
+                                        });
                                     coyote::eval::adam_step(&mut wc_cur, &g_cpu, mc, vc, step, lr);
                                     cupd = wc_cur;
                                 }

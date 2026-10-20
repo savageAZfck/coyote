@@ -56,8 +56,11 @@ impl P {
             Tok::Ident(s) => s,
             t => return diag(format!("expected dtype, found {t:?}"), l, c),
         };
-        let dt = DType::parse(&name).ok_or(())
-            .map_err(|_| crate::Diag { msg: format!("unknown dtype {name:?}"), line: l, col: c })?;
+        let dt = DType::parse(&name).ok_or(()).map_err(|_| crate::Diag {
+            msg: format!("unknown dtype {name:?}"),
+            line: l,
+            col: c,
+        })?;
         let mut dims = Vec::new();
         if self.eat(&Tok::LBracket) {
             loop {
@@ -278,7 +281,11 @@ impl P {
                                     idx.push(sp(Index::Range(Some(Box::new(lo)), None), il, ic));
                                 } else {
                                     let hi = self.expr()?;
-                                    idx.push(sp(Index::Range(Some(Box::new(lo)), Some(Box::new(hi))), il, ic));
+                                    idx.push(sp(
+                                        Index::Range(Some(Box::new(lo)), Some(Box::new(hi))),
+                                        il,
+                                        ic,
+                                    ));
                                 }
                             } else {
                                 idx.push(sp(Index::Expr(lo), il, ic));
@@ -421,11 +428,7 @@ impl P {
         let (l, c) = self.at();
         match self.peek().clone() {
             Tok::If | Tok::Match | Tok::While | Tok::For | Tok::Break | Tok::Continue if !host => {
-                diag(
-                    "control flow is host-stratum — wrap it in `host fn`",
-                    l,
-                    c,
-                )
+                diag("control flow is host-stratum — wrap it in `host fn`", l, c)
             }
             Tok::Match => {
                 self.bump();
@@ -583,7 +586,15 @@ impl P {
                             l2,
                             c2,
                         )),
-                        _ => Ok(sp(Stmt::Store { target, op, expr: e }, l2, c2)),
+                        _ => Ok(sp(
+                            Stmt::Store {
+                                target,
+                                op,
+                                expr: e,
+                            },
+                            l2,
+                            c2,
+                        )),
                     };
                 }
                 self.i = save;
@@ -631,9 +642,23 @@ impl P {
             }
         }
         self.expect(&Tok::RParen)?;
-        let ret = if self.eat(&Tok::Arrow) { Some(self.ty()?) } else { None };
+        let ret = if self.eat(&Tok::Arrow) {
+            Some(self.ty()?)
+        } else {
+            None
+        };
         let body = self.block(false)?;
-        Ok(sp(Fn { name, dims, args, ret, body }, l, c))
+        Ok(sp(
+            Fn {
+                name,
+                dims,
+                args,
+                ret,
+                body,
+            },
+            l,
+            c,
+        ))
     }
 
     /// `host [det|stoch] fn name(arg: hty, ...) [-> hty] [cap c1, c2] { stmt* }`
@@ -666,7 +691,11 @@ impl P {
             }
         }
         self.expect(&Tok::RParen)?;
-        let ret = if self.eat(&Tok::Arrow) { Some(self.hty()?) } else { None };
+        let ret = if self.eat(&Tok::Arrow) {
+            Some(self.hty()?)
+        } else {
+            None
+        };
         let caps = if self.eat(&Tok::Cap) {
             let mut cs = Vec::new();
             if self.peek() != &Tok::LBrace {
@@ -756,7 +785,13 @@ impl P {
                     let (sl, sc) = self.at();
                     let path = match self.bump() {
                         Tok::Str(s) => sp(s, sl, sc),
-                        t => return diag(format!("import expects a path string, found {t:?}"), sl, sc),
+                        t => {
+                            return diag(
+                                format!("import expects a path string, found {t:?}"),
+                                sl,
+                                sc,
+                            )
+                        }
                     };
                     self.eat(&Tok::Semi);
                     decls.push(Decl::Import(path));
@@ -891,7 +926,13 @@ impl P {
                             Tok::Str(s) => sp(s, vl, vc),
                             Tok::Ident(s) => sp(s, vl, vc),
                             Tok::Int(n) => sp(n.to_string(), vl, vc),
-                            t => return diag(format!("provenance value must be a string, found {t:?}"), vl, vc),
+                            t => {
+                                return diag(
+                                    format!("provenance value must be a string, found {t:?}"),
+                                    vl,
+                                    vc,
+                                )
+                            }
                         };
                         kvs.push((k, v));
                         self.eat(&Tok::Comma);
@@ -923,12 +964,23 @@ impl P {
                     let src = if self.eat(&Tok::At) {
                         match self.bump() {
                             Tok::Str(s) => Some(sp(s, l, c)),
-                            t => return diag(format!("param source must be \"file::tensor\", found {t:?}"), l, c),
+                            t => {
+                                return diag(
+                                    format!("param source must be \"file::tensor\", found {t:?}"),
+                                    l,
+                                    c,
+                                )
+                            }
                         }
                     } else {
                         None
                     };
-                    decls.push(Decl::Param { name: n, qual, ty, src });
+                    decls.push(Decl::Param {
+                        name: n,
+                        qual,
+                        ty,
+                        src,
+                    });
                 }
                 Tok::Table => {
                     self.bump();
@@ -938,7 +990,13 @@ impl P {
                     let src = if self.eat(&Tok::At) {
                         match self.bump() {
                             Tok::Str(s) => Some(sp(s, l, c)),
-                            t => return diag(format!("table source must be \"file::tensor\", found {t:?}"), l, c),
+                            t => {
+                                return diag(
+                                    format!("table source must be \"file::tensor\", found {t:?}"),
+                                    l,
+                                    c,
+                                )
+                            }
                         }
                     } else {
                         None
@@ -952,7 +1010,13 @@ impl P {
                     let dir = match self.bump() {
                         Tok::In => IoDir::In,
                         Tok::Out => IoDir::Out,
-                        t => return diag(format!("io direction must be `in` or `out`, found {t:?}"), l, c),
+                        t => {
+                            return diag(
+                                format!("io direction must be `in` or `out`, found {t:?}"),
+                                l,
+                                c,
+                            )
+                        }
                     };
                     let ty = self.ty()?;
                     decls.push(Decl::Io { name: n, dir, ty });
@@ -1008,8 +1072,11 @@ fn load_recursive(
     if !seen.insert(canon) {
         return Ok(());
     }
-    let src = std::fs::read_to_string(path)
-        .map_err(|e| crate::Diag { msg: format!("{}: {e}", path.display()), line: l, col: c })?;
+    let src = std::fs::read_to_string(path).map_err(|e| crate::Diag {
+        msg: format!("{}: {e}", path.display()),
+        line: l,
+        col: c,
+    })?;
     let prog = parse(&src)?;
     let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     for d in prog.decls {

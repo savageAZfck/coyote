@@ -328,7 +328,9 @@ host fn main() -> i64 {
     }
     let train_ane_ms = t_train_ane0.elapsed().as_secs_f64() * 1000.0;
 
-    println!("STUDY 3 — On-Chip ANE Training (`grad` Forward + Backward + In-Place Update, 20 steps)");
+    println!(
+        "STUDY 3 — On-Chip ANE Training (`grad` Forward + Backward + In-Place Update, 20 steps)"
+    );
     println!("  ----------------------------------------------------------------------------");
     println!(
         "  Coyote `grad` on ANE : {:>8.2} ms total ({:.2} ms/step) | MSE {:.4} -> {:.4}",
@@ -434,7 +436,9 @@ host fn main() -> i64 {
     let rs_org_us = t_rs_org0.elapsed().as_secs_f64() * 1_000_000.0;
     assert_eq!(vm_org.stringify(&v_org), rs_passed.to_string());
 
-    println!("STUDY 4 — Full Sovereign Organ Pipeline (100 Reflex + DFA + Marshal + Quorum + Erase)");
+    println!(
+        "STUDY 4 — Full Sovereign Organ Pipeline (100 Reflex + DFA + Marshal + Quorum + Erase)"
+    );
     println!("  ----------------------------------------------------------------------------");
     println!(
         "  Coyote Unified VM (compiled in-memory organs) : {:>8.1} µs ({:.2} µs/iter)",

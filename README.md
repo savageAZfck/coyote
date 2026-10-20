@@ -146,6 +146,14 @@ batched matmul (`M > 1`), `q4` weights, `gelu`, `concat`, slices
 division verified on silicon against CPU. `examples/decode.cy` — KV-cache
 decode step. `examples/ffn.cy` — first light.
 
+`examples/head_to_head.rs` (`cargo run --release --example head_to_head`) —
+live hardware benchmark comparing Coyote (`.cy`) against raw Rust across
+tool/reflex compile turnaround (`0.07 ms` vs `162 ms`, `1.5 KB` `.wasm` vs
+`458 KB` Mach-O), Qwen3-0.6B MLP ANE step latency (`6.8–7.1 ms` vs `14.8–20.7 ms`
+CPU), 20-step on-chip ANE `grad` training (`19 LOC` vs `~260 LOC`), and
+the full sovereign organ pipeline (`63 µs` in-memory VM vs `819–1,541 µs`
+JSON sidecar I/O).
+
 `examples/qwenorg.cy` — single-layer Qwen3 organism decode loop.
 `examples/organism.cy` — structs, vectors, loops, recursion, and a
 program passed by value without needing a checkpoint.
