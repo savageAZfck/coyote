@@ -2,3 +2,4 @@
 /out
 /models
 *.macho
+coyote_out/

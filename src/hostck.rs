@@ -89,6 +89,8 @@ pub const NATIVE_NAMES: &[&str] = &[
     "read_file",     // (str path) -> str (cap `fs`)
     "write_file",    // (str path, str content) -> unit (cap `fs`)
     "cortex_ask",    // (str prompt) -> str — SLICKS bridge (cap `cortex`, stoch)
+    "sha256",        // (str) -> str — hex sha-256, det (firing chain, dedupe fingerprints)
+    "parse_num",     // (str) -> f64 — NaN on non-numeric, det (threshold triggers)
 ];
 
 /// Capability required by a native, if any.
@@ -1089,6 +1091,13 @@ impl Hk {
                     return diag("slice_str(s: str, lo: i64, hi: i64) expected", l, c);
                 }
                 Ok(RTy::Str)
+            }
+            "sha256" | "parse_num" => {
+                arity(1)?;
+                if args[0].ty != RTy::Str {
+                    return diag(format!("{name}(s: str) expected"), l, c);
+                }
+                Ok(if name == "sha256" { RTy::Str } else { RTy::F64 })
             }
             "dfa_compile" => {
                 arity(1)?;

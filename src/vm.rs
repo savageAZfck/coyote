@@ -399,6 +399,7 @@ impl Bc {
                 BinOp::Or => {
                     self.expr(a)?;
                     let jf = self.emit(Op::JmpF(0));
+                    self.emit(Op::Bool(true));
                     let je = self.emit(Op::Jmp(0));
                     let l1 = self.here();
                     self.expr(b)?;
@@ -1801,6 +1802,14 @@ impl Vm {
                     Ok(Val::S(Rc::from(sub.as_str())))
                 }
                 _ => Err("slice_str(str, i64, i64) expected".into()),
+            },
+            "sha256" => {
+                let s = self.stringify(&args[0]);
+                Ok(Val::S(Rc::from(sha256_hex(s.as_bytes()).as_str())))
+            }
+            "parse_num" => match &args[0] {
+                Val::S(s) => Ok(Val::F(s.trim().parse::<f64>().unwrap_or(f64::NAN))),
+                v => Err(format!("parse_num on {}", self.kind(v))),
             },
             "dfa_compile" => match &args[0] {
                 Val::V(rc) => {
