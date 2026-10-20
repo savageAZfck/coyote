@@ -43,6 +43,10 @@ fn cpu_arg(args: &[String]) -> bool {
     args.iter().any(|a| a == "--cpu")
 }
 
+fn wasm_arg(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--wasm")
+}
+
 /// elementwise f16 read of an output surface through its desc.
 fn read_surface(
     raw: &[u8],
@@ -96,10 +100,36 @@ fn main() {
     let steps = steps_arg(&args[3..]);
     let rebuild = rebuild_arg(&args[3..]);
     let use_cpu = cpu_arg(&args[3..]);
+    let emit_wasm = wasm_arg(&args[3..]);
 
     let r = (|| -> Result<(), String> {
         let (src, ast) = parse_file(&file).map_err(|d| format!("{d}"))?;
         let checked = check_all(&ast).map_err(|d| format!("{d}"))?;
+        if emit_wasm {
+            let host = checked
+                .host
+                .as_ref()
+                .ok_or("no `host fn` stratum to compile to wasm")?;
+            let bytes = coyote::wasm::emit_wasm(host)?;
+            let out_path = if dir.extension().is_some_and(|e| e == "wasm") {
+                dir.clone()
+            } else {
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                dir.join("module.wasm")
+            };
+            if let Some(parent) = out_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+            }
+            std::fs::write(&out_path, &bytes).map_err(|e| e.to_string())?;
+            println!(
+                "✓ wasm emitted → {} ({} bytes, WasmCage ABI)",
+                out_path.display(),
+                bytes.len()
+            );
+            return Ok(());
+        }
         // ---- organism mode: `host fn main` drives the programs ----
         if checked.host.is_some() && cmd != "check" {
             let host = checked.host.as_ref().unwrap();

@@ -12,6 +12,7 @@ pub mod lower;
 pub mod parser;
 pub mod typeck;
 pub mod vm;
+pub mod wasm;
 pub mod weights;
 
 #[derive(Debug, Clone)]
@@ -208,6 +209,18 @@ fn parse_plan_cache(text: &str, src_sha: &str) -> Option<lower::MilOut> {
         manifest: String::new(),
         mil_sha,
     })
+}
+
+/// Compile a `.cy` source string directly into a standalone WebAssembly
+/// (`\0asm`) binary targeting Bad Apple's `WasmCage` ABI.
+pub fn compile_to_wasm(src: &str) -> Result<Vec<u8>, String> {
+    let ast = parser::parse(src).map_err(|d| d.to_string())?;
+    let checked = typeck::check_all(&ast).map_err(|d| d.to_string())?;
+    let host = checked
+        .host
+        .as_ref()
+        .ok_or_else(|| "no `host fn` stratum to compile to wasm".to_string())?;
+    wasm::emit_wasm(host)
 }
 
 /// Parse, typecheck, compile all tensor `fn`s, and return a ready-to-run
