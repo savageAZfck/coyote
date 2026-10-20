@@ -1537,6 +1537,7 @@ impl Vm {
                 stages.push((port.clone(), dims_usize(ty), data));
             }
         }
+        let release_after = self.progs.len() > 2;
         // ---- drive the program ----
         let (odata, oty, pouts, souts) = {
             let prog = &mut self.progs[pi];
@@ -1580,7 +1581,9 @@ impl Vm {
                         let surf = read_surface_dims(&raw, &desc, &dims_usize(ty));
                         souts.push((port.clone(), surf));
                     }
-                    rt.release_all();
+                    if release_after {
+                        rt.release_all();
+                    }
                     (odata, oty, pouts, souts)
                 }
                 ProgBackend::Cpu(tp) => {
