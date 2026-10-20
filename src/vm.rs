@@ -9,7 +9,7 @@
 
 use crate::ast::{AssignOp, BinOp, DType, UnOp};
 use crate::eval::Evaluator;
-use crate::hostck::{GVal, HFnT, HProgram, StoreT, HE, HS, HT, RTy, NATIVE_NAMES};
+use crate::hostck::{GVal, HFnT, HProgram, RTy, StoreT, HE, HS, HT, NATIVE_NAMES};
 use crate::lower::{init_weight_pub, sha256_hex};
 use crate::typeck::{CTy, TProgram};
 use mil_infer::graph::GraphRuntime;
@@ -138,7 +138,11 @@ impl DfaMachine {
         for row in goto {
             next.extend_from_slice(&row);
         }
-        Self { patterns, next, out }
+        Self {
+            patterns,
+            next,
+            out,
+        }
     }
 
     pub fn scan(&self, text: &str) -> i64 {
@@ -176,7 +180,10 @@ pub enum Val {
     /// ane program value — index into the program table
     Ane(u32),
     /// witnessed identity — her SecurityToken. Immutable.
-    Tok { id: u64, epoch: u64 },
+    Tok {
+        id: u64,
+        epoch: u64,
+    },
 }
 
 impl Val {
@@ -273,7 +280,11 @@ fn write_surface(rt: &mut GraphRuntime, name: &str, dims: &[usize], data: &[f32]
 }
 
 /// read a surface as declared-order row-major f32s.
-fn read_surface_dims(raw: &[u8], desc: &mil_infer::espresso::TensorDesc, dims: &[usize]) -> Vec<f32> {
+fn read_surface_dims(
+    raw: &[u8],
+    desc: &mil_infer::espresso::TensorDesc,
+    dims: &[usize],
+) -> Vec<f32> {
     let rd = |o: usize| -> f32 {
         if o + 2 <= raw.len() {
             half::f16::from_le_bytes([raw[o], raw[o + 1]]).to_f32()
@@ -734,6 +745,8 @@ pub struct Vm {
     globals: Vec<Val>,
     /// tensors: (declared cty, declared-order row-major f32s)
     tensors: Vec<(CTy, Vec<f32>)>,
+    /// number of persistent global/param/table/state tensors at index 0..base_tensors
+    base_tensors: usize,
     /// global name → tensor handle (params, tables, state mirrors)
     gtensor: HashMap<String, u32>,
     progs: Vec<AneProg>,
@@ -744,6 +757,11 @@ pub struct Vm {
     halted: bool,
     result: Option<Val>,
 }
+
+// SAFETY: Vm owns all of its Rc/RefCell values and ANE program handles
+// exclusively and never shares interior references across threads; callers
+// synchronize access via a Mutex when moving or sharing a resident Vm.
+unsafe impl Send for Vm {}
 
 impl Vm {
     /// build the VM: compile host fns, resolve globals (params load
@@ -818,6 +836,7 @@ impl Vm {
                 .try_into()
                 .unwrap_or([0u8; 8]),
         ) | 1;
+        let base_tensors = tensors.len();
         Ok(Self {
             h,
             code,
@@ -826,6 +845,7 @@ impl Vm {
             frames: Vec::new(),
             globals,
             tensors,
+            base_tensors,
             gtensor,
             progs,
             extern_fns: HashMap::new(),
@@ -839,6 +859,285 @@ impl Vm {
 
     pub fn witness_log(&self) -> &[Wit] {
         &self.witness
+    }
+
+    /// True when the VM holds at least one compiled tensor program and
+    /// every program is backed by native ANE silicon (`GraphRuntime`).
+    pub fn is_ane(&self) -> bool {
+        !self.progs.is_empty()
+            && self
+                .progs
+                .iter()
+                .all(|p| matches!(p.backend, ProgBackend::Ane(_)))
+    }
+
+    /// Names of all compiled tensor `fn` programs in this VM.
+    pub fn prog_names(&self) -> Vec<&str> {
+        self.progs.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// Allocate a runtime f16 tensor in the VM store and return its `Val::T` handle.
+    pub fn alloc_tensor(&mut self, dims: Vec<i64>, data: Vec<f32>) -> Val {
+        let idx = self.tensors.len() as u32;
+        self.tensors.push((
+            CTy {
+                dt: DType::F16,
+                dims,
+            },
+            data,
+        ));
+        Val::T(idx)
+    }
+
+    /// Borrow the flat f32 slice of a tensor handle `h`.
+    pub fn tensor_slice(&self, h: u32) -> Option<&[f32]> {
+        self.tensors.get(h as usize).map(|(_, d)| d.as_slice())
+    }
+
+    /// Borrow the flat f32 slice of a named global `param` or `table`.
+    pub fn param_slice(&self, name: &str) -> Option<&[f32]> {
+        let &h = self.gtensor.get(name)?;
+        self.tensor_slice(h)
+    }
+
+    /// Overwrite a named global `param`'s host tensor buffer in-place.
+    pub fn set_param(&mut self, name: &str, data: Vec<f32>) -> Result<(), String> {
+        let &h = self
+            .gtensor
+            .get(name)
+            .ok_or_else(|| format!("no param `{name}` in VM"))?;
+        let slot = &mut self.tensors[h as usize].1;
+        if slot.len() != data.len() {
+            return Err(format!(
+                "param `{name}` expects {} elements, got {}",
+                slot.len(),
+                data.len()
+            ));
+        }
+        *slot = data;
+        Ok(())
+    }
+
+    /// Zero all instanced `state` tensors across every program in this VM.
+    pub fn reset_states(&mut self) {
+        let mut handles = Vec::new();
+        for prog in &self.progs {
+            for (key, _, _) in &prog.states {
+                let gkey = format!("{}.{key}", prog.name);
+                if let Some(&h) = self.gtensor.get(&gkey) {
+                    handles.push(h as usize);
+                }
+            }
+        }
+        for h in handles {
+            for v in &mut self.tensors[h].1 {
+                *v = 0.0;
+            }
+        }
+    }
+
+    /// Rewind all `[T, D]` instanced `state` tensors from `from_pos` back to
+    /// `to_pos` by zeroing rows `to_pos..from_pos` so subsequent additive
+    /// scatter writes (`kv.k[pos] = ...`) land in clean rows.
+    pub fn rewind_states(&mut self, from_pos: usize, to_pos: usize) {
+        if to_pos >= from_pos {
+            return;
+        }
+        let mut targets = Vec::new();
+        for prog in &self.progs {
+            for (key, _, ty) in &prog.states {
+                if ty.dims.len() == 2 {
+                    let gkey = format!("{}.{key}", prog.name);
+                    if let Some(&h) = self.gtensor.get(&gkey) {
+                        targets.push((h as usize, ty.dims[0] as usize, ty.dims[1] as usize));
+                    }
+                }
+            }
+        }
+        for (h, rows, cols) in targets {
+            let hi = from_pos.min(rows);
+            let lo = to_pos.min(hi);
+            let buf = &mut self.tensors[h].1;
+            for r in lo..hi {
+                let start = r * cols;
+                let end = (start + cols).min(buf.len());
+                for v in &mut buf[start..end] {
+                    *v = 0.0;
+                }
+            }
+        }
+    }
+
+    /// Hidden dimension of the first layer program (`l0` or `layer`), if present.
+    pub fn decoder_hidden_size(&self) -> usize {
+        self.progs
+            .iter()
+            .find(|p| p.name == "l0" || p.name == "layer" || p.ins.len() >= 5)
+            .and_then(|p| p.ins.first())
+            .and_then(|(_, ty, _)| ty.dims.first().copied())
+            .unwrap_or(1024) as usize
+    }
+
+    /// Compiled sequence length (KV horizon) of the first layer program, if present.
+    pub fn decoder_seq_len(&self) -> usize {
+        self.progs
+            .iter()
+            .find(|p| p.name == "l0" || p.name == "layer" || p.ins.len() >= 5)
+            .and_then(|p| p.ins.get(1))
+            .and_then(|(_, ty, _)| ty.dims.first().copied())
+            .unwrap_or(64) as usize
+    }
+
+    /// Execute one autoregressive decode step at KV position `pos` for `token`
+    /// through the organism's compiled ANE programs (`qwenorg.cy` / `qwen28.cy` /
+    /// custom `step_token`). With `project == true`, runs `head` (if separate)
+    /// and returns `Some(argmax_token)`.
+    pub fn step_decoder_token(
+        &mut self,
+        token: u32,
+        pos: usize,
+        project: bool,
+    ) -> Result<Option<u32>, String> {
+        if self.h.fns.iter().any(|f| f.name == "step_token") {
+            let v = self.call_fn("step_token", vec![Val::I(token as i64), Val::I(pos as i64)])?;
+            return match v {
+                Val::I(t) if t >= 0 => Ok(project.then_some(t as u32)),
+                _ => Err("step_token returned negative/invalid token".into()),
+            };
+        }
+        let &emb_h = self
+            .gtensor
+            .get("emb")
+            .ok_or_else(|| "Coyote decoder VM has no `table emb`".to_string())?;
+        let (emb_ty, emb_data) = &self.tensors[emb_h as usize];
+        if emb_ty.dims.len() != 2 {
+            return Err("`table emb` must be rank-2 [vocab, hidden]".into());
+        }
+        let vocab = emb_ty.dims[0] as usize;
+        let hidden = emb_ty.dims[1] as usize;
+        let tok = token as usize;
+        if tok >= vocab {
+            return Err(format!("token {tok} out of vocab {vocab}"));
+        }
+        let row = emb_data[tok * hidden..(tok + 1) * hidden].to_vec();
+        self.step_decoder_hidden(&row, pos, project)
+    }
+
+    /// Execute one autoregressive decode step at KV position `pos` starting from
+    /// an f32 hidden-state vector `[hidden]` (`step_decoder_token` after gather,
+    /// or the mesh-brain / speculative-verify hidden seam).
+    pub fn step_decoder_hidden(
+        &mut self,
+        hidden_row: &[f32],
+        pos: usize,
+        project: bool,
+    ) -> Result<Option<u32>, String> {
+        let hidden = self.decoder_hidden_size();
+        if hidden_row.len() != hidden {
+            return Err(format!(
+                "hidden row length {} != decoder hidden size {hidden}",
+                hidden_row.len()
+            ));
+        }
+        let seq_len = self.decoder_seq_len();
+        let slot = pos % seq_len;
+
+        let mut onehot = vec![0.0f32; seq_len];
+        onehot[slot] = 1.0;
+        let mask: Vec<f32> = (0..seq_len)
+            .map(|j| if j <= slot { 0.0 } else { -1e4 })
+            .collect();
+        let rope_dim = self
+            .progs
+            .iter()
+            .find(|p| p.name == "l0" || p.name == "layer" || p.ins.len() >= 5)
+            .and_then(|p| p.ins.get(3))
+            .and_then(|(_, ty, _)| ty.dims.first().copied())
+            .unwrap_or(64) as usize;
+        let cos: Vec<f32> = (0..rope_dim)
+            .map(|i| {
+                let th = 1e6f64.powf(-2.0 * i as f64 / (2.0 * rope_dim as f64));
+                ((pos as f64) * th).cos() as f32
+            })
+            .collect();
+        let sin: Vec<f32> = (0..rope_dim)
+            .map(|i| {
+                let th = 1e6f64.powf(-2.0 * i as f64 / (2.0 * rope_dim as f64));
+                ((pos as f64) * th).sin() as f32
+            })
+            .collect();
+
+        let mut x_val = self.alloc_tensor(vec![hidden as i64], hidden_row.to_vec());
+        let p_val = self.alloc_tensor(vec![seq_len as i64], onehot);
+        let m_val = self.alloc_tensor(vec![seq_len as i64], mask);
+        let c_val = self.alloc_tensor(vec![rope_dim as i64], cos);
+        let s_val = self.alloc_tensor(vec![rope_dim as i64], sin);
+
+        // Order layer programs numerically (`l0`, `l1`, ..., `l27`), or single `layer`.
+        let mut layer_indices: Vec<(usize, usize)> = self
+            .progs
+            .iter()
+            .enumerate()
+            .filter_map(|(pi, p)| {
+                if p.name == "layer" {
+                    Some((0, pi))
+                } else if let Some(num) = p
+                    .name
+                    .strip_prefix('l')
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    Some((num, pi))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        layer_indices.sort_by_key(|(ord, _)| *ord);
+        let head_idx = self.progs.iter().position(|p| p.name == "head");
+
+        self.stack.clear();
+        for (_, pi) in &layer_indices {
+            self.call_ane(
+                *pi,
+                vec![
+                    x_val.clone(),
+                    p_val.clone(),
+                    m_val.clone(),
+                    c_val.clone(),
+                    s_val.clone(),
+                ],
+            )?;
+            x_val = self
+                .stack
+                .pop()
+                .ok_or("layer call_ane produced no output")?;
+        }
+
+        if !project {
+            self.tensors.truncate(self.base_tensors);
+            return Ok(None);
+        }
+
+        let logits_val = if let Some(hpi) = head_idx {
+            self.call_ane(hpi, vec![x_val])?;
+            self.stack.pop().ok_or("head call_ane produced no output")?
+        } else {
+            x_val
+        };
+
+        let th = logits_val
+            .as_t()
+            .ok_or_else(|| "decoder output is not a tensor".to_string())?;
+        let logits = &self.tensors[th as usize].1;
+        let (best_idx, _) = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or((0, &0.0));
+        let tok = best_idx as u32;
+        self.wit("tok", &tok.to_string());
+        self.tensors.truncate(self.base_tensors);
+        Ok(Some(tok))
     }
 
     /// Bind a Rust or Swift FFI callback to an `extern fn` declared in
@@ -881,7 +1180,23 @@ impl Vm {
             base: 0,
         });
         self.run()?;
-        Ok(self.result.clone().unwrap_or(Val::Unit))
+        let ret = self.result.clone().unwrap_or(Val::Unit);
+        match ret {
+            Val::T(h) if (h as usize) >= self.base_tensors => {
+                let kept = self.tensors[h as usize].clone();
+                self.tensors.truncate(self.base_tensors);
+                self.tensors.push(kept);
+                Ok(Val::T(self.base_tensors as u32))
+            }
+            Val::T(_) => {
+                self.tensors.truncate(self.base_tensors);
+                Ok(ret)
+            }
+            other => {
+                self.tensors.truncate(self.base_tensors);
+                Ok(other)
+            }
+        }
     }
 
     /// kick off `main` and run to completion (or die).
@@ -924,13 +1239,16 @@ impl Vm {
                 Op::AddI => self.ibi(|a, b| a.wrapping_add(b), Val::I)?,
                 Op::SubI => self.ibi(|a, b| a.wrapping_sub(b), Val::I)?,
                 Op::MulI => self.ibi(|a, b| a.wrapping_mul(b), Val::I)?,
-                Op::DivI => self.ibi(|a, b| {
-                    if b == 0 {
-                        0
-                    } else {
-                        a.wrapping_div(b)
-                    }
-                }, Val::I)?,
+                Op::DivI => self.ibi(
+                    |a, b| {
+                        if b == 0 {
+                            0
+                        } else {
+                            a.wrapping_div(b)
+                        }
+                    },
+                    Val::I,
+                )?,
                 Op::ModI => self.ibi(|a, b| if b == 0 { 0 } else { a % b }, Val::I)?,
                 Op::NegI => {
                     let a = self.stack.pop().unwrap();
@@ -984,10 +1302,9 @@ impl Vm {
                     }
                     args.reverse();
                     let name = self.h.externs[ei as usize].name.clone();
-                    let cb = self
-                        .extern_fns
-                        .get_mut(&name)
-                        .ok_or_else(|| format!("unbound extern fn `{name}` — bind it before running"))?;
+                    let cb = self.extern_fns.get_mut(&name).ok_or_else(|| {
+                        format!("unbound extern fn `{name}` — bind it before running")
+                    })?;
                     let r = cb(&args)?;
                     self.stack.push(r);
                 }
@@ -1051,10 +1368,9 @@ impl Vm {
                     match v {
                         Val::V(rc) => {
                             let b = rc.borrow();
-                            let item = b
-                                .get(i)
-                                .cloned()
-                                .ok_or_else(|| format!("vec index {i} out of bounds ({})", b.len()))?;
+                            let item = b.get(i).cloned().ok_or_else(|| {
+                                format!("vec index {i} out of bounds ({})", b.len())
+                            })?;
                             self.stack.push(item);
                         }
                         _ => return Err("vecget on non-vec".into()),
@@ -1102,7 +1418,9 @@ impl Vm {
                             let item = b
                                 .iter()
                                 .find_map(|(ek, ev)| self.val_eq(ek, &k).then(|| ev.clone()))
-                                .ok_or_else(|| format!("map key {} not found", self.stringify(&k)))?;
+                                .ok_or_else(|| {
+                                    format!("map key {} not found", self.stringify(&k))
+                                })?;
                             self.stack.push(item);
                         }
                         _ => return Err("mapget on non-map".into()),
@@ -1241,7 +1559,8 @@ impl Vm {
                     let s = self.stack.pop().unwrap();
                     match s {
                         Val::Tok { id, epoch } => {
-                            self.stack.push(Val::I(if fi == 0 { id as i64 } else { epoch as i64 }));
+                            self.stack
+                                .push(Val::I(if fi == 0 { id as i64 } else { epoch as i64 }));
                         }
                         v => return Err(format!("token field on {}", self.kind(&v))),
                     }
@@ -1295,11 +1614,7 @@ impl Vm {
                 self.stack.push(mk(f(x, y)));
                 Ok(())
             }
-            (x, y) => Err(format!(
-                "int op on {} and {}",
-                self.kind(&x),
-                self.kind(&y)
-            )),
+            (x, y) => Err(format!("int op on {} and {}", self.kind(&x), self.kind(&y))),
         }
     }
 
@@ -1337,9 +1652,7 @@ impl Vm {
                     && p1.len() == p2.len()
                     && p1.iter().zip(p2.iter()).all(|(x, y)| self.val_eq(x, y))
             }
-            (Val::Tok { id: i, epoch: e }, Val::Tok { id: i2, epoch: e2 }) => {
-                i == i2 && e == e2
-            }
+            (Val::Tok { id: i, epoch: e }, Val::Tok { id: i2, epoch: e2 }) => i == i2 && e == e2,
             _ => false,
         }
     }
@@ -1358,8 +1671,14 @@ impl Vm {
             BinOp::Ne => !self.val_eq(a, b),
             BinOp::Lt => ord(a, b) == Some(std::cmp::Ordering::Less),
             BinOp::Gt => ord(a, b) == Some(std::cmp::Ordering::Greater),
-            BinOp::Le => matches!(ord(a, b), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
-            BinOp::Ge => matches!(ord(a, b), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+            BinOp::Le => matches!(
+                ord(a, b),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            ),
+            BinOp::Ge => matches!(
+                ord(a, b),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            ),
             _ => return Err("bad compare".into()),
         })
     }
@@ -1437,7 +1756,11 @@ impl Vm {
                     format!("{ename}::{vname}({})", inner.join(", "))
                 }
             }
-            Val::Dfa(d) => format!("<dfa {} patterns, {} states>", d.patterns.len(), d.out.len()),
+            Val::Dfa(d) => format!(
+                "<dfa {} patterns, {} states>",
+                d.patterns.len(),
+                d.out.len()
+            ),
             Val::T(i) => {
                 let (ty, data) = &self.tensors[*i as usize];
                 let head: Vec<String> = data.iter().take(4).map(|x| format!("{x:.4}")).collect();
@@ -1548,7 +1871,8 @@ impl Vm {
                     for (port, dims, data) in &stages {
                         write_surface(rt, port, dims, data);
                     }
-                    rt.run().map_err(|e| format!("ane run ({}): {e}", prog.name))?;
+                    rt.run()
+                        .map_err(|e| format!("ane run ({}): {e}", prog.name))?;
                     let idx = rt
                         .out_node(&oname)
                         .ok_or_else(|| format!("output node {oname} missing"))?;
@@ -1689,7 +2013,10 @@ impl Vm {
                     d[i] = 1.0;
                 }
                 self.tensors.push((
-                    CTy { dt: DType::F16, dims: vec![n as i64] },
+                    CTy {
+                        dt: DType::F16,
+                        dims: vec![n as i64],
+                    },
                     d,
                 ));
                 Ok(Val::T(self.tensors.len() as u32 - 1))
@@ -1699,7 +2026,10 @@ impl Vm {
                 let n = args[1].as_i().unwrap_or(0) as usize;
                 let d: Vec<f32> = (0..n).map(|j| if j <= upto { 0.0 } else { -1e4 }).collect();
                 self.tensors.push((
-                    CTy { dt: DType::F16, dims: vec![n as i64] },
+                    CTy {
+                        dt: DType::F16,
+                        dims: vec![n as i64],
+                    },
                     d,
                 ));
                 Ok(Val::T(self.tensors.len() as u32 - 1))
@@ -1712,11 +2042,18 @@ impl Vm {
                     .map(|i| {
                         let th = 1e6f64.powf(-2.0 * i as f64 / (2.0 * d as f64));
                         let ang = pos * th;
-                        if cos { ang.cos() as f32 } else { ang.sin() as f32 }
+                        if cos {
+                            ang.cos() as f32
+                        } else {
+                            ang.sin() as f32
+                        }
                     })
                     .collect();
                 self.tensors.push((
-                    CTy { dt: DType::F16, dims: vec![d as i64] },
+                    CTy {
+                        dt: DType::F16,
+                        dims: vec![d as i64],
+                    },
                     v,
                 ));
                 Ok(Val::T(self.tensors.len() as u32 - 1))
@@ -1724,15 +2061,17 @@ impl Vm {
             "zeros" => {
                 let n = args[0].as_i().unwrap_or(0) as usize;
                 self.tensors.push((
-                    CTy { dt: DType::F16, dims: vec![n as i64] },
+                    CTy {
+                        dt: DType::F16,
+                        dims: vec![n as i64],
+                    },
                     vec![0.0; n],
                 ));
                 Ok(Val::T(self.tensors.len() as u32 - 1))
             }
             "self_token" => {
-                let id = u64::from_le_bytes(
-                    self.sha.as_bytes()[..8].try_into().unwrap_or([0u8; 8]),
-                );
+                let id =
+                    u64::from_le_bytes(self.sha.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
                 Ok(Val::Tok {
                     id,
                     epoch: self.witness.len() as u64,
@@ -1752,7 +2091,9 @@ impl Vm {
                 self.halted = true;
                 Ok(Val::Unit)
             }
-            "migrate" => Err("migrate must run in the dispatch loop — it freezes stack state".into()),
+            "migrate" => {
+                Err("migrate must run in the dispatch loop — it freezes stack state".into())
+            }
             "rand" => {
                 // xorshift64* — deterministic, seeded by lineage.
                 let mut x = self.rng;
@@ -1785,10 +2126,8 @@ impl Vm {
             },
             "split" => match (&args[0], &args[1]) {
                 (Val::S(a), Val::S(sep)) => {
-                    let parts: Vec<Val> = a
-                        .split(sep.as_ref())
-                        .map(|p| Val::S(Rc::from(p)))
-                        .collect();
+                    let parts: Vec<Val> =
+                        a.split(sep.as_ref()).map(|p| Val::S(Rc::from(p))).collect();
                     Ok(Val::V(Rc::new(RefCell::new(parts))))
                 }
                 _ => Err("split needs two str args".into()),
@@ -1818,7 +2157,12 @@ impl Vm {
                     for x in b.iter() {
                         match x {
                             Val::S(s) => pats.push(s.to_string()),
-                            v => return Err(format!("dfa pattern must be str, found {}", self.kind(v))),
+                            v => {
+                                return Err(format!(
+                                    "dfa pattern must be str, found {}",
+                                    self.kind(v)
+                                ))
+                            }
                         }
                     }
                     Ok(Val::Dfa(Rc::new(DfaMachine::compile(pats))))
@@ -1946,24 +2290,20 @@ impl Vm {
                 // 4) witness and return the erasure certificate hash.
                 let subject = self.stringify(&args[0]);
                 let payload = self.stringify(&args[1]);
-                let mut key = sha256_hex(format!("{}|key|{subject}", self.sha).as_bytes())
-                    .into_bytes();
+                let mut key =
+                    sha256_hex(format!("{}|key|{subject}", self.sha).as_bytes()).into_bytes();
                 let pbytes = payload.as_bytes();
                 let mut ct = Vec::with_capacity(pbytes.len());
                 for (i, &b) in pbytes.iter().enumerate() {
                     ct.push(b ^ key[i % key.len()]);
                 }
-                let tag = sha256_hex(
-                    &[key.as_slice(), ct.as_slice()].concat(),
-                );
+                let tag = sha256_hex(&[key.as_slice(), ct.as_slice()].concat());
                 // Destroy the per-subject key
                 for kb in key.iter_mut() {
                     *kb = 0;
                 }
                 // Attempt verification under destroyed key — must fail
-                let post_tag = sha256_hex(
-                    &[key.as_slice(), ct.as_slice()].concat(),
-                );
+                let post_tag = sha256_hex(&[key.as_slice(), ct.as_slice()].concat());
                 let decrypt_verified = post_tag != tag;
                 if !decrypt_verified {
                     return Err("camazotz: erasure verification failed".into());
@@ -2028,9 +2368,10 @@ impl Vm {
         // intern shared heap objects so aliasing survives the round trip
         let mut ids: HashMap<usize, u32> = HashMap::new();
         let mut heap: Vec<u8> = Vec::new();
-        let write_val = |v: &Val, out: &mut Vec<u8>, heap: &mut Vec<u8>, ids: &mut HashMap<usize, u32>| {
-            snap_val(v, out, heap, ids, self);
-        };
+        let write_val =
+            |v: &Val, out: &mut Vec<u8>, heap: &mut Vec<u8>, ids: &mut HashMap<usize, u32>| {
+                snap_val(v, out, heap, ids, self);
+            };
         // frames
         out.extend_from_slice(&(self.frames.len() as u32).to_le_bytes());
         for fr in &self.frames {
@@ -2096,7 +2437,12 @@ impl Vm {
             let vl = u32::from_le_bytes(take(&buf, &mut pos, 4)?.try_into().unwrap()) as usize;
             let val = String::from_utf8_lossy(take(&buf, &mut pos, vl)?).to_string();
             let hash = String::from_utf8_lossy(take(&buf, &mut pos, 64)?).to_string();
-            witness.push(Wit { seq, tag, val, hash });
+            witness.push(Wit {
+                seq,
+                tag,
+                val,
+                hash,
+            });
         }
         let nframes = u32::from_le_bytes(take(&buf, &mut pos, 4)?.try_into().unwrap());
         let mut frames = Vec::new();
@@ -2142,12 +2488,16 @@ impl Vm {
             let rank = u32::from_le_bytes(take(&buf, &mut pos, 4)?.try_into().unwrap());
             let mut dims = Vec::new();
             for _ in 0..rank {
-                dims.push(i64::from_le_bytes(take(&buf, &mut pos, 8)?.try_into().unwrap()));
+                dims.push(i64::from_le_bytes(
+                    take(&buf, &mut pos, 8)?.try_into().unwrap(),
+                ));
             }
             let len = u64::from_le_bytes(take(&buf, &mut pos, 8)?.try_into().unwrap()) as usize;
             let mut data = Vec::with_capacity(len);
             for _ in 0..len {
-                data.push(f32::from_le_bytes(take(&buf, &mut pos, 4)?.try_into().unwrap()));
+                data.push(f32::from_le_bytes(
+                    take(&buf, &mut pos, 4)?.try_into().unwrap(),
+                ));
             }
             tensors.push((CTy { dt, dims }, data));
         }
@@ -2362,10 +2712,7 @@ fn unsnap_val(
         if p + 8 > buf.len() {
             return Err("snap: truncated".into());
         }
-        Ok((
-            u64::from_le_bytes(buf[p..p + 8].try_into().unwrap()),
-            p + 8,
-        ))
+        Ok((u64::from_le_bytes(buf[p..p + 8].try_into().unwrap()), p + 8))
     };
     Ok(match tag {
         0 => (Val::Unit, p),
@@ -2431,7 +2778,10 @@ fn unsnap_heap(
     let tag = *buf.get(pos).ok_or("snap: truncated heap")?;
     let mut p = pos + 1;
     let id = u32::from_le_bytes(
-        buf.get(p..p + 4).ok_or("snap: truncated heap")?.try_into().unwrap(),
+        buf.get(p..p + 4)
+            .ok_or("snap: truncated heap")?
+            .try_into()
+            .unwrap(),
     );
     p += 4;
     let v = match tag {

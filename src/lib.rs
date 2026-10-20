@@ -474,8 +474,7 @@ pub extern "C" fn coyote_call_str(
     out_buf: *mut c_char,
     cap: usize,
 ) -> isize {
-    let (Some(vm), Some(fname), Some(arg_s)) =
-        (unsafe { vm.as_mut() }, c_str(fn_name), c_str(arg))
+    let (Some(vm), Some(fname), Some(arg_s)) = (unsafe { vm.as_mut() }, c_str(fn_name), c_str(arg))
     else {
         return -1;
     };
@@ -564,4 +563,342 @@ fn write_c_buf(s: &str, out_buf: *mut c_char, cap: usize) -> isize {
         }
     }
     bytes.len() as isize
+}
+
+// ------------------------------------------------ `bad_apple_ane_*` Bridge ABI
+
+use std::ffi::c_void;
+use std::path::PathBuf;
+use std::time::Instant;
+
+struct BadAppleAneHandle {
+    vm: vm::Vm,
+    pos: usize,
+    load_us: u64,
+    prewarm_us: u64,
+}
+
+fn resolve_cy_model_path(raw: &str) -> PathBuf {
+    let p = PathBuf::from(raw);
+    if p.extension().is_some_and(|e| e == "cy") && p.exists() {
+        return p;
+    }
+    if let Ok(env_cy) = std::env::var("BADAPPLE_ANE_CY") {
+        let ep = PathBuf::from(env_cy);
+        if ep.exists() {
+            return ep;
+        }
+    }
+    if p.is_dir() {
+        let cand = p.join("model.cy");
+        if cand.exists() {
+            return cand;
+        }
+    } else if let Some(parent) = p.parent() {
+        let cand = parent.join("model.cy");
+        if cand.exists() {
+            return cand;
+        }
+    }
+    PathBuf::from("/Users/savag3/coyote/examples/qwenorg.cy")
+}
+
+fn resolve_cy_out_dir(cy_path: &Path) -> PathBuf {
+    let stem = cy_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("coyote_ane");
+    let warm = PathBuf::from("/Users/savag3/coyote/out").join(stem);
+    if warm.is_dir() {
+        return warm;
+    }
+    std::env::temp_dir().join(format!("coyote_ane_{stem}"))
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_create(path: *const c_char) -> *mut c_void {
+    let Some(raw) = c_str(path) else {
+        return std::ptr::null_mut();
+    };
+    let cy_path = resolve_cy_model_path(raw);
+    let out_dir = resolve_cy_out_dir(&cy_path);
+    let t0 = Instant::now();
+    match load_vm(&cy_path, &out_dir, false, false, true) {
+        Ok(vm) => {
+            let load_us = t0.elapsed().as_micros() as u64;
+            Box::into_raw(Box::new(BadAppleAneHandle {
+                vm,
+                pos: 0,
+                load_us,
+                prewarm_us: 0,
+            })) as *mut c_void
+        }
+        Err(e) => {
+            set_err(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_destroy(h: *mut c_void) {
+    if !h.is_null() {
+        unsafe {
+            drop(Box::from_raw(h as *mut BadAppleAneHandle));
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_predict_next(
+    h: *mut c_void,
+    tokens: *const i32,
+    count: usize,
+) -> i32 {
+    if h.is_null() || tokens.is_null() || count == 0 {
+        return -1;
+    }
+    let h = unsafe { &mut *(h as *mut BadAppleAneHandle) };
+    let toks = unsafe { std::slice::from_raw_parts(tokens, count) };
+    let mut last_tok = -1i32;
+    for (i, &t) in toks.iter().enumerate() {
+        if t < 0 {
+            return -1;
+        }
+        let project = i + 1 == count;
+        match h.vm.step_decoder_token(t as u32, h.pos, project) {
+            Ok(Some(tok)) => {
+                h.pos += 1;
+                last_tok = tok as i32;
+            }
+            Ok(None) => {
+                h.pos += 1;
+            }
+            Err(e) => {
+                set_err(e);
+                return -1;
+            }
+        }
+    }
+    last_tok
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_prefill(h: *mut c_void, tokens: *const i32, count: i32) -> bool {
+    if h.is_null() || tokens.is_null() || count <= 0 {
+        return false;
+    }
+    let h = unsafe { &mut *(h as *mut BadAppleAneHandle) };
+    let toks = unsafe { std::slice::from_raw_parts(tokens, count as usize) };
+    for &t in toks {
+        if t < 0 {
+            return false;
+        }
+        if h.vm.step_decoder_token(t as u32, h.pos, false).is_err() {
+            return false;
+        }
+        h.pos += 1;
+    }
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_reset(h: *mut c_void) -> bool {
+    if h.is_null() {
+        return false;
+    }
+    let h = unsafe { &mut *(h as *mut BadAppleAneHandle) };
+    h.vm.reset_states();
+    h.pos = 0;
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_prewarm(h: *mut c_void) -> bool {
+    if h.is_null() {
+        return false;
+    }
+    let h = unsafe { &mut *(h as *mut BadAppleAneHandle) };
+    let t0 = Instant::now();
+    let ok = h.vm.step_decoder_token(0, 0, false).is_ok();
+    h.vm.reset_states();
+    h.pos = 0;
+    h.prewarm_us = t0.elapsed().as_micros() as u64;
+    ok
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_placement_ratio(h: *mut c_void) -> f64 {
+    if h.is_null() {
+        -1.0
+    } else {
+        let h = unsafe { &*(h as *const BadAppleAneHandle) };
+        if h.vm.is_ane() {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_compute_units_raw_value(h: *mut c_void) -> i32 {
+    if h.is_null() {
+        -1
+    } else {
+        2
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_selection_latency_us(
+    h: *mut c_void,
+    load_us: *mut u64,
+    prewarm_us: *mut u64,
+) -> bool {
+    if h.is_null() {
+        return false;
+    }
+    let h = unsafe { &*(h as *const BadAppleAneHandle) };
+    if !load_us.is_null() {
+        unsafe { *load_us = h.load_us };
+    }
+    if !prewarm_us.is_null() {
+        unsafe { *prewarm_us = h.prewarm_us };
+    }
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_coreml_placement_ratio(_path: *const c_char, _units: i32) -> f64 {
+    1.0
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_probe_shard(
+    path: *const c_char,
+    _units: i32,
+    iterations: usize,
+    avg_us: *mut u64,
+) -> bool {
+    if path.is_null() || iterations == 0 {
+        return false;
+    }
+    let raw = bad_apple_ane_create(path);
+    if raw.is_null() {
+        return false;
+    }
+    let h = unsafe { &mut *(raw as *mut BadAppleAneHandle) };
+    let t0 = Instant::now();
+    for i in 0..iterations {
+        if h.vm.step_decoder_token(0, i % 64, false).is_err() {
+            bad_apple_ane_destroy(raw);
+            return false;
+        }
+    }
+    if !avg_us.is_null() {
+        unsafe { *avg_us = (t0.elapsed().as_micros() as u64) / iterations as u64 };
+    }
+    bad_apple_ane_destroy(raw);
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_forward_hidden(
+    h: *mut c_void,
+    bytes: *const c_void,
+    count: usize,
+) -> i32 {
+    if h.is_null() || bytes.is_null() || count == 0 {
+        return -1;
+    }
+    let h = unsafe { &mut *(h as *mut BadAppleAneHandle) };
+    let hidden = h.vm.decoder_hidden_size();
+    let row_bytes = hidden * 2;
+    if row_bytes == 0 || count % row_bytes != 0 {
+        return -1;
+    }
+    let rows = count / row_bytes;
+    let data = unsafe { std::slice::from_raw_parts(bytes as *const u8, count) };
+    let mut last_tok = -1i32;
+    for r in 0..rows {
+        let slice = &data[r * row_bytes..(r + 1) * row_bytes];
+        let row_f32: Vec<f32> = slice
+            .chunks_exact(2)
+            .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect();
+        match h.vm.step_decoder_hidden(&row_f32, h.pos, r + 1 == rows) {
+            Ok(Some(tok)) => {
+                h.pos += 1;
+                last_tok = tok as i32;
+            }
+            Ok(None) => {
+                h.pos += 1;
+            }
+            Err(_) => return -1,
+        }
+    }
+    last_tok
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_forward_hidden_multi(
+    h: *mut c_void,
+    bytes: *const c_void,
+    count: usize,
+    out_tokens: *mut i32,
+    out_capacity: usize,
+) -> i32 {
+    if h.is_null() || bytes.is_null() || count == 0 || out_tokens.is_null() {
+        return -1;
+    }
+    let h = unsafe { &mut *(h as *mut BadAppleAneHandle) };
+    let hidden = h.vm.decoder_hidden_size();
+    let row_bytes = hidden * 2;
+    if row_bytes == 0 || count % row_bytes != 0 {
+        return -1;
+    }
+    let rows = (count / row_bytes).min(out_capacity);
+    let data = unsafe { std::slice::from_raw_parts(bytes as *const u8, count) };
+    let out = unsafe { std::slice::from_raw_parts_mut(out_tokens, out_capacity) };
+    for r in 0..rows {
+        let slice = &data[r * row_bytes..(r + 1) * row_bytes];
+        let row_f32: Vec<f32> = slice
+            .chunks_exact(2)
+            .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect();
+        match h.vm.step_decoder_hidden(&row_f32, h.pos, true) {
+            Ok(Some(tok)) => {
+                h.pos += 1;
+                out[r] = tok as i32;
+            }
+            _ => return -1,
+        }
+    }
+    rows as i32
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_rewind(h: *mut c_void, position: i32) -> bool {
+    if h.is_null() || position < 0 {
+        return false;
+    }
+    let h = unsafe { &mut *(h as *mut BadAppleAneHandle) };
+    let target = position as usize;
+    if target > h.pos {
+        return false;
+    }
+    h.vm.rewind_states(h.pos, target);
+    h.pos = target;
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn bad_apple_ane_position(h: *mut c_void) -> i32 {
+    if h.is_null() {
+        -1
+    } else {
+        let h = unsafe { &*(h as *const BadAppleAneHandle) };
+        h.pos as i32
+    }
 }

@@ -4,9 +4,9 @@
 //! no external crates. A param without a source falls back to the
 //! deterministic xorshift init so programs stay reproducible offline.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::RefCell;
 
 thread_local! {
     /// one in-memory load per source file — a checkpoint is read once
@@ -32,7 +32,20 @@ pub struct SafeTensors {
 
 impl SafeTensors {
     pub fn load(path: &str) -> Result<Self, String> {
-        let buf = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let resolved = if std::path::Path::new(path).exists() {
+            std::path::PathBuf::from(path)
+        } else {
+            let c1 = std::path::Path::new("/Users/savag3/coyote").join(path);
+            let c2 = std::path::Path::new("/Users/savag3").join(path);
+            if c1.exists() {
+                c1
+            } else if c2.exists() {
+                c2
+            } else {
+                std::path::PathBuf::from(path)
+            }
+        };
+        let buf = std::fs::read(&resolved).map_err(|e| format!("{path}: {e}"))?;
         if buf.len() < 8 {
             return Err(format!("{path}: not a safetensors file"));
         }
@@ -89,10 +102,7 @@ impl SafeTensors {
                         .collect::<Vec<_>>();
                     let offs = json_nums(obj, "data_offsets");
                     if offs.len() == 2 {
-                        let (a, b) = (
-                            offs[0] as usize + 8 + hlen,
-                            offs[1] as usize + 8 + hlen,
-                        );
+                        let (a, b) = (offs[0] as usize + 8 + hlen, offs[1] as usize + 8 + hlen);
                         index.insert(name.to_string(), (a, b, shape, dt));
                     }
                 }
@@ -116,7 +126,9 @@ impl SafeTensors {
             .ok_or_else(|| format!("safetensors: missing {name}"))?;
         let cols = shape.get(1).copied().unwrap_or(1);
         if shape.len() != 2 || width != cols || row >= shape[0] {
-            return Err(format!("safetensors {name}: row {row}/{width} of {shape:?}"));
+            return Err(format!(
+                "safetensors {name}: row {row}/{width} of {shape:?}"
+            ));
         }
         let esz = match dt.as_str() {
             "BF16" | "F16" => 2,
@@ -144,11 +156,7 @@ impl SafeTensors {
     /// decode a strided box straight from the file buffer — only the
     /// slice's elements are touched, so `[0:2048]` of a 300MB table
     /// reads 4MB, not 300.
-    pub fn f32s_box(
-        &self,
-        name: &str,
-        ranges: &[(usize, usize)],
-    ) -> Result<Vec<f32>, String> {
+    pub fn f32s_box(&self, name: &str, ranges: &[(usize, usize)]) -> Result<Vec<f32>, String> {
         let (a, b, shape, dt) = self
             .index
             .get(name)
@@ -269,9 +277,7 @@ pub fn resolve<F: Fn(&str, usize) -> Vec<f32>>(
     src: Option<&str>,
     fallback: F,
 ) -> Result<Vec<f32>, String> {
-    let numel = expect
-        .map(|s| s.iter().product())
-        .unwrap_or(0);
+    let numel = expect.map(|s| s.iter().product()).unwrap_or(0);
     let Some(src) = src else {
         return Ok(fallback(name, numel));
     };
@@ -326,7 +332,9 @@ pub fn resolve<F: Fn(&str, usize) -> Vec<f32>>(
         let got = vals.len();
         let want_n: usize = want.iter().product();
         if got != want_n {
-            return Err(format!("param {name}: source {spec} gives {got} elems, declared {want_n}"));
+            return Err(format!(
+                "param {name}: source {spec} gives {got} elems, declared {want_n}"
+            ));
         }
     }
     Ok(vals)
