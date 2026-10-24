@@ -684,6 +684,13 @@ impl Ck {
                     dims: vec![args[0].ty.dims[1]],
                 })
             }
+            "rsoftmax" => {
+                arity(1)?;
+                if args[0].ty.dims.len() != 2 {
+                    return diag("rsoftmax(x[R, C]) expects a rank-2 tensor", l, c);
+                }
+                Ok(args[0].ty.clone())
+            }
             "rmsnorm" => {
                 arity(2)?;
                 if args[0].ty.dims.len() != 1 || args[1].ty.dims.len() != 1

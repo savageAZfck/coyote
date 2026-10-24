@@ -410,6 +410,32 @@ impl<'a> Evaluator<'a> {
                         a.extend_from_slice(&b);
                         Ok(Val::V(a))
                     }
+                    "rsoftmax" => {
+                        // per-row softmax over the last dim — what
+                        // attention actually means. The flat `softmax`
+                        // normalizes over the whole tensor; this one
+                        // normalizes each row independently. Rows are
+                        // summed sequentially like the flat variant,
+                        // so a row-parallel backend stays bit-exact.
+                        let x = self.expr(&args[0])?.vec(n);
+                        let r = args[0].ty.dims[0] as usize;
+                        let c = args[0].ty.dims[1] as usize;
+                        let mut out = vec![0f32; n];
+                        for i in 0..r {
+                            let row = &x[i * c..(i + 1) * c];
+                            let m = row.iter().cloned().fold(f32::MIN, f32::max);
+                            let mut s = 0.0f32;
+                            for j in 0..c {
+                                let e = (row[j] - m).exp();
+                                out[i * c + j] = e;
+                                s += e;
+                            }
+                            for j in 0..c {
+                                out[i * c + j] /= s;
+                            }
+                        }
+                        Ok(Val::V(out))
+                    }
                     "rmsnorm" => {
                         let x = self.expr(&args[0])?.vec(n);
                         let w = match &args[1].e {
@@ -631,7 +657,15 @@ impl<'a> Evaluator<'a> {
                         }
                         return Ok(());
                     }
-                    let k = a.ty.dims[0] as usize;
+                    // contraction dim is the last lhs dim — works for
+                    // vector ([K]) and batched ([M,K]) operands. `m`
+                    // batch rows share the same rhs weight.
+                    let k = *a.ty.dims.last().unwrap_or(&1) as usize;
+                    let m = if a.ty.dims.len() == 2 {
+                        a.ty.dims[0] as usize
+                    } else {
+                        1
+                    };
                     let nn = b.ty.dims[1] as usize;
                     let pname = match &b.e {
                         TExpr::Ident(s) => Some(s.clone()),
@@ -642,26 +676,35 @@ impl<'a> Evaluator<'a> {
                         _ => None,
                     };
                     if self.needs_grad(a) {
-                        // dx_i = Σ_j adj_j · w[j,k+i] — w in [N,K] storage
+                        // dx[br,i] = Σ_j adj[br,j] · w[j,i] — w in
+                        // [N,K] storage, per batch row.
                         let w = self.fwd(b)?.vec(nn * k);
-                        let mut dx = vec![0f32; k];
-                        for i in 0..k {
-                            let mut acc = 0f32;
-                            for j in 0..nn {
-                                acc += adj[j] * w[j * k + i];
+                        let mut dx = vec![0f32; m * k];
+                        for br in 0..m {
+                            for i in 0..k {
+                                let mut acc = 0f32;
+                                for j in 0..nn {
+                                    acc += adj[br * nn + j] * w[j * k + i];
+                                }
+                                dx[br * k + i] = acc;
                             }
-                            dx[i] = acc;
                         }
                         self.back(a, &dx)?;
                     }
                     if let Some(p) = pname {
                         if self.is_param(&p).is_some() {
-                            let x = self.fwd(a)?.vec(k);
-                            // dW[n,k] = adj_n · x_k — [N,K] storage
+                            let x = self.fwd(a)?.vec(m * k);
+                            // dW[j,i] = Σ_br adj[br,j] · x[br,i] —
+                            // batch rows accumulate into the shared
+                            // [N,K] weight.
                             let mut dw = vec![0f32; nn * k];
                             for j in 0..nn {
                                 for i in 0..k {
-                                    dw[j * k + i] = adj[j] * x[i];
+                                    let mut acc = 0f32;
+                                    for br in 0..m {
+                                        acc += adj[br * nn + j] * x[br * k + i];
+                                    }
+                                    dw[j * k + i] = acc;
                                 }
                             }
                             self.acc(&p, dw);
@@ -729,6 +772,22 @@ impl<'a> Evaluator<'a> {
                         let dot: f32 = adj.iter().zip(&s).map(|(d, si)| d * si).sum();
                         let dx: Vec<f32> =
                             adj.iter().zip(&s).map(|(d, si)| si * (d - dot)).collect();
+                        self.back(x, &dx)?;
+                    }
+                    "rsoftmax" => {
+                        // per-row: dx_j = s_j·(adj_j − Σ_k adj_k·s_k)
+                        let s = self.fwd(e)?.vec(n);
+                        let (r, c) = (x.ty.dims[0] as usize, x.ty.dims[1] as usize);
+                        let mut dx = vec![0f32; n];
+                        for i in 0..r {
+                            let mut dot = 0f32;
+                            for j in 0..c {
+                                dot += adj[i * c + j] * s[i * c + j];
+                            }
+                            for j in 0..c {
+                                dx[i * c + j] = s[i * c + j] * (adj[i * c + j] - dot);
+                            }
+                        }
                         self.back(x, &dx)?;
                     }
                     "rmsnorm" => {

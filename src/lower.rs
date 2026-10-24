@@ -898,6 +898,11 @@ impl Lo {
                     taint,
                 ))
             }
+            "rsoftmax" => diag(
+                "rsoftmax lowers on the gpu stratum — ANE's channel-softmax layout covers [1,T,1,1], not [R,C] rows yet",
+                0,
+                0,
+            ),
             "mse" => diag(
                 "mse produces a host scalar — it only lowers as a `grad` target",
                 0,
