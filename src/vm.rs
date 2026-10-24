@@ -246,7 +246,7 @@ struct Frame {
 // ---------------------------------------------------------------- surface io
 
 /// write a declared-order row-major tensor into a runtime surface.
-fn write_surface(rt: &mut GraphRuntime, name: &str, dims: &[usize], data: &[f32]) {
+pub fn write_surface(rt: &mut GraphRuntime, name: &str, dims: &[usize], data: &[f32]) {
     let dc = data.to_vec();
     match dims.len() {
         1 => {
@@ -283,7 +283,7 @@ fn write_surface(rt: &mut GraphRuntime, name: &str, dims: &[usize], data: &[f32]
 }
 
 /// read a surface as declared-order row-major f32s.
-fn read_surface_dims(
+pub fn read_surface_dims(
     raw: &[u8],
     desc: &mil_infer::espresso::TensorDesc,
     dims: &[usize],
@@ -323,7 +323,7 @@ fn read_surface_dims(
     }
 }
 
-fn dims_usize(t: &CTy) -> Vec<usize> {
+pub fn dims_usize(t: &CTy) -> Vec<usize> {
     t.dims.iter().map(|d| *d as usize).collect()
 }
 
@@ -752,6 +752,13 @@ pub struct Vm {
     base_tensors: usize,
     /// global name → tensor handle (params, tables, state mirrors)
     gtensor: HashMap<String, u32>,
+    /// (prog, port) → tensor handle last staged to an ext backend.
+    /// After readback the host mirror holds the device values, so a
+    /// matching handle means the resident copy is already current —
+    /// restaging would just round-trip identical bytes (and, for
+    /// matrix params, redo a pointless [K,N]→[N,K] transpose).
+    /// Rebinds land on fresh handles, so identity is enough.
+    staged_ext: HashMap<(usize, String), u32>,
     progs: Vec<AneProg>,
     extern_fns: HashMap<String, ExternCb>,
     witness: Vec<Wit>,
@@ -850,6 +857,7 @@ impl Vm {
             tensors,
             base_tensors,
             gtensor,
+            staged_ext: HashMap::new(),
             progs,
             extern_fns: HashMap::new(),
             witness: Vec::new(),
@@ -1868,6 +1876,7 @@ impl Vm {
         let mut cpu_inputs: HashMap<String, Vec<f32>> = HashMap::new();
         let mut cpu_params: HashMap<String, Vec<f32>> = HashMap::new();
         let mut cpu_states: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut staged_now: Vec<(String, u32)> = Vec::new();
         {
             let prog = &self.progs[pi];
             for (i, (port, ty, _contig)) in prog.ins.iter().enumerate() {
@@ -1894,21 +1903,31 @@ impl Vm {
                     .get(pname)
                     .copied()
                     .ok_or_else(|| format!("no host tensor for {pname}"))?;
-                let data = self.tensors[h as usize].1.clone();
-                if ty.dims.len() == 2 {
-                    let (k, n) = (ty.dims[0] as usize, ty.dims[1] as usize);
-                    let mut t = vec![0f32; data.len()];
-                    for a in 0..n {
-                        for b in 0..k {
-                            t[a * k + b] = data[b * n + a];
+                // ext backends keep resident buffers — when the host
+                // handle is unchanged the device copy is already
+                // current (readback keeps the mirror equal), so
+                // restaging would only round-trip identical bytes
+                // and redo the [K,N]→[N,K] transpose for nothing.
+                let fresh = !matches!(prog.backend, ProgBackend::Ext(_))
+                    || self.staged_ext.get(&(pi, port.clone())) != Some(&h);
+                if fresh {
+                    let data = self.tensors[h as usize].1.clone();
+                    if ty.dims.len() == 2 {
+                        let (k, n) = (ty.dims[0] as usize, ty.dims[1] as usize);
+                        let mut t = vec![0f32; data.len()];
+                        for a in 0..n {
+                            for b in 0..k {
+                                t[a * k + b] = data[b * n + a];
+                            }
                         }
+                        cpu_params.insert(pname.clone(), t.clone());
+                        stages.push((port.clone(), vec![n, k], t));
+                    } else {
+                        cpu_params.insert(pname.clone(), data.clone());
+                        stages.push((port.clone(), dims_usize(ty), data));
                     }
-                    cpu_params.insert(pname.clone(), t.clone());
-                    stages.push((port.clone(), vec![n, k], t));
-                } else {
-                    cpu_params.insert(pname.clone(), data.clone());
-                    stages.push((port.clone(), dims_usize(ty), data));
                 }
+                staged_now.push((port.clone(), h));
             }
             // state fields — [T, D] declared-order both ways; the
             // host mirror is namespaced `prog.state.field`.
@@ -1919,9 +1938,14 @@ impl Vm {
                     .get(&gkey)
                     .copied()
                     .ok_or_else(|| format!("no host tensor for {gkey}"))?;
-                let data = self.tensors[h as usize].1.clone();
-                cpu_states.insert(port.clone(), data.clone());
-                stages.push((port.clone(), dims_usize(ty), data));
+                let fresh = !matches!(prog.backend, ProgBackend::Ext(_))
+                    || self.staged_ext.get(&(pi, port.clone())) != Some(&h);
+                if fresh {
+                    let data = self.tensors[h as usize].1.clone();
+                    cpu_states.insert(port.clone(), data.clone());
+                    stages.push((port.clone(), dims_usize(ty), data));
+                }
+                staged_now.push((port.clone(), h));
             }
         }
         let release_after = self.progs.len() > 2;
@@ -2010,7 +2034,38 @@ impl Vm {
                     let odata = rt
                         .run(&writes)
                         .map_err(|e| format!("ext run ({}): {e}", prog.name))?;
-                    (odata, oty, Vec::new(), Vec::new())
+                    // on-device updates ride back through `read` so the
+                    // host store feeds them forward — param surfaces
+                    // are [N,K], the host store is declared [K,N].
+                    let mut pouts = Vec::new();
+                    for (pname, mname, ty) in &prog.param_outs {
+                        if let Some(surf) = rt.read(mname) {
+                            if ty.dims.len() == 2 {
+                                let (n, k) = (ty.dims[1] as usize, ty.dims[0] as usize);
+                                let mut host = vec![0f32; surf.len()];
+                                for a in 0..n {
+                                    for b in 0..k {
+                                        host[b * n + a] = surf[a * k + b];
+                                    }
+                                }
+                                pouts.push((pname.clone(), host));
+                            } else {
+                                pouts.push((pname.clone(), surf));
+                            }
+                        }
+                    }
+                    let mut souts = Vec::new();
+                    for (port, mname, _ty) in &prog.state_outs {
+                        if let Some(v) = rt.read(mname) {
+                            souts.push((port.clone(), v));
+                        }
+                    }
+                    // mark every param/state port resident-current —
+                    // next call restages only rebound handles.
+                    for (p, h) in &staged_now {
+                        self.staged_ext.insert((pi, p.clone()), *h);
+                    }
+                    (odata, oty, pouts, souts)
                 }
             }
         };

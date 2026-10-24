@@ -35,6 +35,18 @@ pub trait BackendExec {
     /// Stage (port → f32 data) writes, dispatch, return the output
     /// row-major.
     fn run(&mut self, writes: &[(String, Vec<f32>)]) -> Result<Vec<f32>, String>;
+    /// Device-side duration of the last dispatch in milliseconds, if
+    /// the backend can measure it (Metal command-buffer timestamps).
+    fn device_ms(&self) -> Option<f64> {
+        None
+    }
+    /// Read a resident buffer (param/state port) back to the host —
+    /// backends that mutate weights or state on-device surface their
+    /// `param_outs`/`state_outs` this way so the host store can feed
+    /// the updated values forward to the next call.
+    fn read(&self, _port: &str) -> Option<Vec<f32>> {
+        None
+    }
 }
 
 /// A compute stratum: lower a typed program and produce its executor.
