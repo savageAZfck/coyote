@@ -613,7 +613,16 @@ impl P {
     // ---- declarations ----
 
     fn fn_decl(&mut self) -> CResult<Sp<Fn>> {
-        let (l, c) = self.at(); // at `fn`
+        self.fn_decl_target(crate::ast::Target::Ane)
+    }
+
+    /// `fn name<dims>(args) [-> ty] { ... }` — tensor stratum. The
+    /// `gpu` prefix sets the target: `gpu fn` lowers to a Metal kernel.
+    fn fn_decl_target(&mut self, target: crate::ast::Target) -> CResult<Sp<Fn>> {
+        let (l, c) = self.at(); // at `fn` / `gpu`
+        if target == crate::ast::Target::Gpu {
+            self.expect(&Tok::Gpu)?;
+        }
         self.expect(&Tok::Fn)?;
         let name = self.ident()?.v;
         let mut dims = Vec::new();
@@ -651,6 +660,7 @@ impl P {
         Ok(sp(
             Fn {
                 name,
+                target,
                 dims,
                 args,
                 ret,
@@ -797,6 +807,7 @@ impl P {
                     decls.push(Decl::Import(path));
                 }
                 Tok::Fn => decls.push(Decl::Fn(self.fn_decl()?)),
+                Tok::Gpu => decls.push(Decl::Fn(self.fn_decl_target(crate::ast::Target::Gpu)?)),
                 Tok::Host => decls.push(Decl::HostFn(self.host_fn_decl(DetMode::Auto)?)),
                 Tok::Det => {
                     self.bump();
@@ -1060,6 +1071,52 @@ pub fn parse_file(path: &std::path::Path) -> CResult<(String, Program)> {
     Ok((combined, Program { decls }))
 }
 
+/// Parse `src` as if it were the file at `path` — imports resolve
+/// relative to `path`'s directory (and CYO_PATH), without reading
+/// `path` itself. For tooling operating on unsaved buffers (LSP).
+pub fn parse_src_at(path: &std::path::Path, src: &str) -> CResult<(String, Program)> {
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    let mut combined = String::new();
+    let mut decls = Vec::new();
+    let prog = parse(src)?;
+    let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    for d in prog.decls {
+        match d {
+            Decl::Import(rel) => {
+                let rel_p = std::path::Path::new(&rel.v);
+                let mut names = vec![rel.v.clone()];
+                if rel_p.extension().is_none() {
+                    names.push(format!("{}.cy", rel.v));
+                }
+                let mut roots = vec![base.to_path_buf()];
+                if let Ok(p) = std::env::var("CYO_PATH") {
+                    for d in p.split(':').filter(|s| !s.is_empty()) {
+                        roots.push(std::path::PathBuf::from(d));
+                    }
+                }
+                let next = roots
+                    .iter()
+                    .flat_map(|r| names.iter().map(move |n| r.join(n)))
+                    .find(|c| c.is_file())
+                    .unwrap_or_else(|| roots[0].join(&names[0]));
+                load_recursive(
+                    &next,
+                    rel.line,
+                    rel.col,
+                    &mut seen,
+                    &mut combined,
+                    &mut decls,
+                )?;
+            }
+            other => decls.push(other),
+        }
+    }
+    combined.push_str(src);
+    combined.push('\n');
+    Ok((combined, Program { decls }))
+}
+
 fn load_recursive(
     path: &std::path::Path,
     l: usize,
@@ -1082,7 +1139,25 @@ fn load_recursive(
     for d in prog.decls {
         match d {
             Decl::Import(rel) => {
-                let next = base.join(&rel.v);
+                // resolution order: importing file's dir, then each
+                // `CYO_PATH` dir (colon-separated, like PYTHONPATH).
+                // `import "x"` with no extension also tries `x.cy`.
+                let rel_p = std::path::Path::new(&rel.v);
+                let mut names = vec![rel.v.clone()];
+                if rel_p.extension().is_none() {
+                    names.push(format!("{}.cy", rel.v));
+                }
+                let mut roots = vec![base.to_path_buf()];
+                if let Ok(p) = std::env::var("CYO_PATH") {
+                    for d in p.split(':').filter(|s| !s.is_empty()) {
+                        roots.push(std::path::PathBuf::from(d));
+                    }
+                }
+                let next = roots
+                    .iter()
+                    .flat_map(|r| names.iter().map(move |n| r.join(n)))
+                    .find(|c| c.is_file())
+                    .unwrap_or_else(|| roots[0].join(&names[0]));
                 load_recursive(&next, rel.line, rel.col, seen, combined, out)?;
             }
             other => out.push(other),

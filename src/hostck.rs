@@ -1715,10 +1715,15 @@ impl Hk {
     }
 }
 
-/// does this statement list definitely exit with a value?
+/// does every path through this statement list hit a `return` before
+/// reaching the end? any top-level `return` exits unconditionally —
+/// statements after it are dead code. a trailing bare expression is NOT
+/// a return (host fns return explicitly; expression statements discard).
 fn definitely_returns(stmts: &[HS]) -> bool {
+    if stmts.iter().any(|s| matches!(s, HS::Return(_))) {
+        return true;
+    }
     match stmts.last() {
-        Some(HS::Return(Some(_))) | Some(HS::Expr(_)) => true,
         Some(HS::If { then, els, .. }) => {
             !els.is_empty() && definitely_returns(then) && definitely_returns(els)
         }

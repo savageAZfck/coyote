@@ -158,16 +158,43 @@ JSON sidecar I/O).
 `examples/organism.cy` — structs, vectors, loops, recursion, and a
 program passed by value without needing a checkpoint.
 
+`examples/finetune.cy` — on-chip adapter fine-tuning: a frozen base
+weight plus a factorized residual adapter (`x @ w + relu(x @ a) @ b`),
+`adam` updates in the same binary, MSE 2.54 → 0.17 over 12 steps.
+
+`examples/lora8.cy` — true rank-8 LoRA on silicon via a masked
+bottleneck: `((x @ la) * sel) @ lb` zeroes coordinates ≥ 8 and gives
+the dead weights exactly zero gradient. `coyote-apple genmask sel:8:64`
+generates the selector; MSE 0.78 → 0.53 over 12 steps with only
+la[:, 0:8] and lb[0:8, :] moving.
+
 ## build + run
 
 ```sh
 cargo build
+cargo test          # soundness diags, host-vm eval, repl parsing, corpus gate
 ./target/debug/coyote check  examples/sovereign.cy    # parse + shape + constitutional check
 ./target/debug/coyote run    examples/sovereign.cy -o out/sovereign
 ./target/debug/coyote run    examples/sovereign.cy -o out/sovereign --cpu
 ./target/debug/coyote run    examples/train.cy -o out/train --steps 20
+./target/debug/coyote run    examples/finetune.cy -o out/finetune --steps 12
 ./target/debug/coyote run    examples/qwen28.cy -o out/qwen28
+./target/debug/coyote repl   examples/organism.cy --cpu   # interactive shell
 ```
+
+`coyote-apple` (sibling repo at `../coyote-apple`, path-dep on this
+crate) is the org profile: every verb above passes through unchanged, plus
+`spec`/`audit`/`package`/`verify`/`unpack`/`bench`/`oracle`/`genmask`/`diff`
+for capability matrices, hash-chained build provenance, `.cypack`
+distributables, pipeline/organism-exec timing, semantic parity gating,
+rank-selector mask generation, and build deltas. See
+`coyote-apple/APPLE.md`.
+
+`coyote repl [file.cy]` loads the organism once, then gives a prompt:
+`name(args)` calls host fns on the live VM, bare expressions evaluate,
+`host fn`/`struct`/`param` declarations extend the session, and
+`:fns`/`:progs`/`:params`/`:main`/`:step`/`:w`/`:load` introspect and
+drive it (`:help` for the rest).
 
 The qwen examples want a real checkpoint at `models/qwen3-0.6b/` —
 download `Qwen/Qwen3-0.6B` `model.safetensors` (BF16) from Hugging Face.

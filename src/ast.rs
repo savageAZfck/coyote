@@ -175,9 +175,30 @@ pub struct ExternFn {
     pub caps: Vec<Sp<String>>,
 }
 
+/// Which compute stratum a tensor `fn` lowers to: `fn` targets the
+/// neural engine, `gpu fn` declares a GPU-stratum program. Non-Ane
+/// targets resolve through `backend::register_backend` — the language
+/// carries the tag, a distribution provides the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Target {
+    Ane,
+    Gpu,
+}
+
+impl Target {
+    pub fn name(self) -> &'static str {
+        match self {
+            Target::Ane => "ane",
+            Target::Gpu => "gpu",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Fn {
     pub name: String,
+    /// compute stratum — `fn` is Ane, `gpu fn` is Gpu.
+    pub target: Target,
     /// generic dim names, e.g. `<M, K, N>`
     pub dims: Vec<Sp<String>>,
     pub args: Vec<(Sp<String>, Sp<Ty>)>,

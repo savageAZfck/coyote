@@ -212,11 +212,14 @@ pub struct Wit {
     pub hash: String,
 }
 
-/// Execution backend for a compiled tensor `fn` program: either native
-/// ANE silicon via `GraphRuntime`, or pure-Rust CPU evaluation via `Evaluator`.
+/// Execution backend for a compiled tensor `fn` program: native ANE
+/// silicon via `GraphRuntime`, pure-Rust CPU evaluation via
+/// `Evaluator`, or a registered external stratum (`gpu fn` and friends)
+/// via `BackendExec`.
 pub enum ProgBackend {
     Ane(GraphRuntime),
     Cpu(TProgram),
+    Ext(Box<dyn crate::backend::BackendExec>),
 }
 
 /// a loaded tensor program — the runtime half of a program value.
@@ -874,6 +877,66 @@ impl Vm {
     /// Names of all compiled tensor `fn` programs in this VM.
     pub fn prog_names(&self) -> Vec<&str> {
         self.progs.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// Host-stratum fns for introspection (repl/docs):
+    /// `(name, signature, is_reflex)`.
+    pub fn host_fns(&self) -> Vec<(String, String, bool)> {
+        self.h
+            .fns
+            .iter()
+            .map(|f| {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|(n, t)| format!("{n}: {}", t.show(&self.h.structs, &self.h.enums)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sig = format!(
+                    "{}({args}) -> {}",
+                    f.name,
+                    f.ret.show(&self.h.structs, &self.h.enums)
+                );
+                (f.name.clone(), sig, f.is_reflex)
+            })
+            .collect()
+    }
+
+    /// `(param name, declared dims, current values)` snapshot for
+    /// inspection — params/tables live in the persistent tensor prefix.
+    pub fn param_names(&self) -> Vec<String> {
+        self.gtensor.keys().cloned().collect()
+    }
+
+    /// Declared `io` ports of a compiled tensor program (name → dims),
+    /// for building calls interactively.
+    pub fn prog_ios(&self, name: &str) -> Option<Vec<(String, Vec<i64>)>> {
+        self.progs.iter().find(|p| p.name == name).map(|p| {
+            p.ins
+                .iter()
+                .map(|(n, t, _)| (n.clone(), t.dims.clone()))
+                .collect()
+        })
+    }
+
+    /// Look up an enum's (type idx, variant idx) by name — externs that
+    /// construct or inspect enum values resolve their indices here.
+    pub fn enum_variant(&self, en: &str, variant: &str) -> Option<(u32, u32)> {
+        let ei = self.h.enums.iter().position(|(n, _)| n == en)? as u32;
+        let vi = self.h.enums[ei as usize]
+            .1
+            .iter()
+            .position(|(n, _)| n == variant)? as u32;
+        Some((ei, vi))
+    }
+
+    /// Look up a host struct's type idx by name.
+    pub fn struct_index(&self, name: &str) -> Option<u32> {
+        self.h
+            .structs
+            .iter()
+            .position(|(n, _)| n == name)
+            .map(|i| i as u32)
     }
 
     /// Allocate a runtime f16 tensor in the VM store and return its `Val::T` handle.
@@ -1936,6 +1999,18 @@ impl Vm {
                         }
                     }
                     (odata, oty, pouts, souts)
+                }
+                ProgBackend::Ext(rt) => {
+                    // staged data is already in surface conventions —
+                    // ins declared-order, params [N,K], states [T,D].
+                    let writes: Vec<(String, Vec<f32>)> = stages
+                        .iter()
+                        .map(|(p, _, d)| (p.clone(), d.clone()))
+                        .collect();
+                    let odata = rt
+                        .run(&writes)
+                        .map_err(|e| format!("ext run ({}): {e}", prog.name))?;
+                    (odata, oty, Vec::new(), Vec::new())
                 }
             }
         };

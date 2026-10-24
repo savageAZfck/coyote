@@ -212,6 +212,23 @@ impl SafeTensors {
         Ok(out)
     }
 
+    /// all tensor names in the file, sorted
+    pub fn tensor_names(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.index.keys().map(String::as_str).collect();
+        v.sort();
+        v
+    }
+
+    /// dtype string for a tensor ("F32"/"F16"/"BF16")
+    pub fn dtype(&self, name: &str) -> Option<&str> {
+        self.index.get(name).map(|(_, _, _, d)| d.as_str())
+    }
+
+    /// payload byte length of a tensor
+    pub fn bytes(&self, name: &str) -> Option<usize> {
+        self.index.get(name).map(|(a, b, _, _)| b - a)
+    }
+
     /// decode the tensor to f32 (BF16/F16/F32 supported)
     pub fn f32s(&self, name: &str) -> Result<Vec<f32>, String> {
         let (a, b, _, dt) = self
@@ -338,4 +355,13 @@ pub fn resolve<F: Fn(&str, usize) -> Vec<f32>>(
         }
     }
     Ok(vals)
+}
+
+/// deterministic param init — the same bytes the emitted blobs and the
+/// CPU evaluator produce: name-seeded, f16-quantized.
+pub fn param_fallback(name: &str, numel: usize) -> Vec<f32> {
+    crate::lower::init_weight_pub(name, numel)
+        .iter()
+        .map(|&v| half::f16::from_f32(v).to_f32())
+        .collect()
 }

@@ -5,11 +5,14 @@
 //! typechecks; everything that typechecks lowers.
 
 pub mod ast;
+pub mod backend;
+pub mod cli;
 pub mod eval;
 pub mod hostck;
 pub mod lexer;
 pub mod lower;
 pub mod parser;
+pub mod repl;
 pub mod typeck;
 pub mod vm;
 pub mod wasm;
@@ -242,6 +245,40 @@ pub fn load_vm(
     for (name, tp) in &checked.ane {
         let dir2 = out_dir.join(name);
         let t0 = std::time::Instant::now();
+        if tp.target != ast::Target::Ane {
+            let be = backend::backend_for(tp.target)?;
+            let out = be.emit(&src, name, tp, &dir2)?;
+            let backend = if use_cpu {
+                vm::ProgBackend::Cpu(tp.clone())
+            } else {
+                let rt = be
+                    .load(tp, name, &out, &dir2)
+                    .map_err(|e| format!("ext load ({name}): {e}"))?;
+                if !quiet {
+                    println!(
+                        "✓ {name} — {} backend  (emit {:.1}s)",
+                        tp.target.name(),
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+                vm::ProgBackend::Ext(rt)
+            };
+            progs.push(vm::AneProg {
+                name: name.clone(),
+                backend,
+                ins: out.inputs,
+                trainable: out
+                    .trainable
+                    .into_iter()
+                    .map(|(p, port, ty, _)| (p, port, ty))
+                    .collect(),
+                states: out.states,
+                param_outs: out.param_outs,
+                state_outs: out.state_outs,
+                output: out.output,
+            });
+            continue;
+        }
         let out = emit_program(&src, tp, &dir2, rebuild)?;
         let t_emit = t0.elapsed();
         let backend = if use_cpu {

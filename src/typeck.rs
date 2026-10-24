@@ -134,6 +134,8 @@ pub struct TProgram {
     pub ret: Typed,
     /// state fields as runtime tensors: (key `kv.k`, port `kv_k`, ty)
     pub states: Vec<(String, String, CTy)>,
+    /// compute stratum this program lowers to.
+    pub target: crate::ast::Target,
 }
 
 type Env = HashMap<String, CTy>;
@@ -1485,6 +1487,7 @@ impl Ck {
             body,
             ret,
             states,
+            target: f.v.target,
         })
     }
 }
@@ -1649,6 +1652,7 @@ pub fn check(p: &Program) -> CResult<TProgram> {
         provenance,
         arg_ports,
         body,
+        target: main.v.target,
         ret,
         states,
     })
