@@ -48,9 +48,13 @@ impl DType {
 }
 
 /// A type: `dtype[dims]` tensor, or bare `dtype` scalar.
+/// `dt_var` is set when the dtype position holds a generic name —
+/// `fn f<D>(x: D[64])` — bound to a concrete dtype at each callsite
+/// the same way `Dim::Name` binds generic dims.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ty {
     pub dt: DType,
+    pub dt_var: Option<String>,
     pub dims: Vec<Dim>,
 }
 
@@ -114,7 +118,13 @@ pub enum IoDir {
 #[derive(Debug, Clone)]
 pub enum Decl {
     /// `import "other.cy"` — splice another coyote module's declarations.
-    Import(Sp<String>),
+    /// `import "other.cy" as m` — splice under namespace `m`: the
+    /// module's top-level names become `m::name`, and bare references
+    /// inside it that resolve to its own decls are renamed to match.
+    Import {
+        path: Sp<String>,
+        alias: Option<Sp<String>>,
+    },
     /// `invariant name` — constitutional clause, name recorded into artifact.
     Invariant(Sp<String>),
     /// `cap hear, see, net::send` — declared capabilities.
@@ -183,6 +193,7 @@ pub struct ExternFn {
 pub enum Target {
     Ane,
     Gpu,
+    Enc,
 }
 
 impl Target {
@@ -190,6 +201,7 @@ impl Target {
         match self {
             Target::Ane => "ane",
             Target::Gpu => "gpu",
+            Target::Enc => "enc",
         }
     }
 }
@@ -316,6 +328,10 @@ pub enum Expr {
     Index(Box<Sp<Expr>>, Vec<Sp<Index>>),
     /// `s.field` — struct/state field access.
     Field(Box<Sp<Expr>>, Sp<String>),
+    /// `e?` — try/propagate: on a `Result`-style enum (`Ok`/`Err`)
+    /// unwraps the Ok payload or returns the Err early. Only valid in
+    /// `let`/`var`/`assign` position on the host stratum.
+    Try(Box<Sp<Expr>>),
 }
 
 #[derive(Debug, Clone)]

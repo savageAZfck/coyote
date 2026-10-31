@@ -139,7 +139,16 @@ pub struct TProgram {
 }
 
 type Env = HashMap<String, CTy>;
-type Dims = HashMap<String, i64>;
+/// a generic binding — a `Dim::Name` binds a literal dim; a dtype
+/// param (`fn f<D>`) binds a concrete dtype. Both ride the same map
+/// and the same callsite unification.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Gen {
+    Dim(i64),
+    Dt(DType),
+}
+
+type Dims = HashMap<String, Gen>;
 
 pub(crate) struct Ck {
     pub(crate) fns: HashMap<String, Sp<Fn>>,
@@ -162,12 +171,17 @@ fn bind_dim(dims: &mut Dims, d: &Dim, v: i64, l: usize, c: usize) -> CResult<()>
             }
         }
         Dim::Name(s) => {
-            if let Some(&prev) = dims.get(s) {
-                if prev != v {
+            match dims.get(s) {
+                Some(Gen::Dim(prev)) if *prev != v => {
                     return diag(format!("dim {s} bound to both {prev} and {v}"), l, c);
                 }
-            } else {
-                dims.insert(s.clone(), v);
+                Some(Gen::Dt(_)) => {
+                    return diag(format!("{s} is a dtype param, not a dim"), l, c);
+                }
+                Some(Gen::Dim(_)) => {}
+                None => {
+                    dims.insert(s.clone(), Gen::Dim(v));
+                }
             }
             Ok(())
         }
@@ -175,21 +189,32 @@ fn bind_dim(dims: &mut Dims, d: &Dim, v: i64, l: usize, c: usize) -> CResult<()>
 }
 
 fn resolve_ty(dims: &Dims, ty: &Ty, l: usize, c: usize) -> CResult<CTy> {
+    let dt = match &ty.dt_var {
+        Some(v) => match dims.get(v) {
+            Some(Gen::Dt(d)) => *d,
+            Some(Gen::Dim(_)) => {
+                return diag(format!("{v} is a dim param, not a dtype"), l, c);
+            }
+            None => return diag(format!("unbound dtype param {v}"), l, c),
+        },
+        None => ty.dt,
+    };
     let mut out = Vec::new();
     for d in &ty.dims {
         match d {
             Dim::Lit(n) => out.push(*n),
-            Dim::Name(s) => out.push(*dims.get(s).ok_or(()).map_err(|_| Diag {
-                msg: format!("unbound dim {s}"),
-                line: l,
-                col: c,
-            })?),
+            Dim::Name(s) => match dims.get(s) {
+                Some(Gen::Dim(v)) => out.push(*v),
+                Some(Gen::Dt(_)) => {
+                    return diag(format!("{s} is a dtype param, not a dim"), l, c)
+                }
+                None => {
+                    return diag(format!("unbound dim {s}"), l, c);
+                }
+            },
         }
     }
-    Ok(CTy {
-        dt: ty.dt,
-        dims: out,
-    })
+    Ok(CTy { dt, dims: out })
 }
 
 /// unify a declared (possibly generic) arg type with a concrete arg type.
@@ -208,6 +233,25 @@ fn unify(dims: &mut Dims, decl: &Ty, act: &CTy, l: usize, c: usize) -> CResult<(
     }
     for (d, &v) in decl.dims.iter().zip(&act.dims) {
         bind_dim(dims, d, v, l, c)?;
+    }
+    // dtype param — `fn f<D>(x: D[64])` — binds like a dim would.
+    if let Some(v) = &decl.dt_var {
+        match dims.get(v) {
+            Some(Gen::Dt(d)) if *d != act.dt => {
+                return diag(
+                    format!("dtype param {v} bound to both {d:?} and {:?}", act.dt),
+                    l,
+                    c,
+                );
+            }
+            Some(Gen::Dim(_)) => {
+                return diag(format!("{v} is a dim param, not a dtype"), l, c);
+            }
+            Some(Gen::Dt(_)) => {}
+            None => {
+                dims.insert(v.clone(), Gen::Dt(act.dt));
+            }
+        }
     }
     Ok(())
 }
@@ -233,6 +277,7 @@ impl Ck {
         }
         let (l, c) = (e.line, e.col);
         match &e.v {
+            Expr::Try(_) => diag("`?` is host-stratum only — not a tensor op", l, c),
             Expr::Lit(f) => Ok(Typed {
                 e: TExpr::Lit(*f),
                 ty: CTy::scalar(DType::F32),
@@ -419,11 +464,14 @@ impl Ck {
     fn const_int(&mut self, e: &Sp<Expr>, dims: &Dims) -> CResult<i64> {
         match &e.v {
             Expr::Int(n) => Ok(*n),
-            Expr::Ident(s) => dims.get(s).copied().ok_or(()).map_err(|_| Diag {
-                msg: format!("index {s} is not a compile-time dim"),
-                line: e.line,
-                col: e.col,
-            }),
+            Expr::Ident(s) => match dims.get(s) {
+                Some(Gen::Dim(v)) => Ok(*v),
+                _ => diag(
+                    format!("index {s} is not a compile-time dim"),
+                    e.line,
+                    e.col,
+                ),
+            },
             Expr::Unary(UnOp::Neg, a) => Ok(-self.const_int(a, dims)?),
             _ => diag("index must be a constant or generic dim", e.line, e.col),
         }
@@ -1320,7 +1368,7 @@ pub(crate) fn collect(
     let mut tables = Vec::new();
     for d in &p.decls {
         match d {
-            Decl::Import(_) => {}
+            Decl::Import { .. } => {}
             Decl::Invariant(n) => invariants.push(n.v.clone()),
             Decl::Cap(cs) => caps.extend(cs.iter().map(|c| c.v.clone())),
             Decl::Provenance(kvs) => {
@@ -1541,7 +1589,10 @@ pub fn check_all(p: &Program) -> CResult<Checked> {
                 .iter()
                 .map(|(_, t)| t)
                 .chain(f.v.ret.iter())
-                .any(|t| t.v.dims.iter().any(|d| matches!(d, Dim::Name(_))));
+                .any(|t| {
+                    t.v.dt_var.is_some()
+                        || t.v.dims.iter().any(|d| matches!(d, Dim::Name(_)))
+                });
         if has_generic_ty {
             continue;
         }

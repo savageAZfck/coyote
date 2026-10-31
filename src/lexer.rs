@@ -15,6 +15,7 @@ pub enum Tok {
     Fn,
     Host,
     Gpu,
+    Enc,
     Reflex,
     Struct,
     Enum,
@@ -83,6 +84,7 @@ pub enum Tok {
     Ge,
     LtAngle, // < after fn name (generic dims)
     GtAngle, // > — same token as Gt; parser disambiguates
+    Question, // ? — try/propagate
     Eof,
 }
 
@@ -100,6 +102,7 @@ fn kw(s: &str) -> Option<Tok> {
         "fn" => Tok::Fn,
         "host" => Tok::Host,
         "gpu" => Tok::Gpu,
+        "enc" => Tok::Enc,
         "reflex" => Tok::Reflex,
         "struct" => Tok::Struct,
         "enum" => Tok::Enum,
@@ -339,6 +342,7 @@ pub fn lex(src: &str) -> CResult<Vec<Lexed>> {
             } else {
                 Tok::Gt
             }),
+            '?' => pushat!(Tok::Question),
             _ => return diag(format!("unexpected char {c:?}"), l, cl),
         }
     }

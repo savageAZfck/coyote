@@ -56,11 +56,12 @@ impl P {
             Tok::Ident(s) => s,
             t => return diag(format!("expected dtype, found {t:?}"), l, c),
         };
-        let dt = DType::parse(&name).ok_or(()).map_err(|_| crate::Diag {
-            msg: format!("unknown dtype {name:?}"),
-            line: l,
-            col: c,
-        })?;
+        // a name that isn't a concrete dtype is a generic dtype param —
+        // `fn f<D>(x: D[64])` — bound per callsite, checked by typeck.
+        let (dt, dt_var) = match DType::parse(&name) {
+            Some(d) => (d, None),
+            None => (DType::F16, Some(name)),
+        };
         let mut dims = Vec::new();
         if self.eat(&Tok::LBracket) {
             loop {
@@ -78,7 +79,7 @@ impl P {
             }
             self.expect(&Tok::RBracket)?;
         }
-        Ok(sp(Ty { dt, dims }, l, c))
+        Ok(sp(Ty { dt, dt_var, dims }, l, c))
     }
 
     /// host-stratum type: `i64` `f64` `bool` `str` `token` `dfa` `unit`,
@@ -143,7 +144,11 @@ impl P {
                             }
                             self.expect(&Tok::RBracket)?;
                         }
-                        HTy::Tensor(Ty { dt, dims })
+                        HTy::Tensor(Ty {
+                            dt,
+                            dt_var: None,
+                            dims,
+                        })
                     } else {
                         HTy::Struct(s)
                     }
@@ -256,6 +261,10 @@ impl P {
                 Tok::T => {
                     self.bump();
                     e = sp(Expr::Transpose(Box::new(e)), l, c);
+                }
+                Tok::Question => {
+                    self.bump();
+                    e = sp(Expr::Try(Box::new(e)), l, c);
                 }
                 Tok::Dot => {
                     self.bump();
@@ -619,9 +628,11 @@ impl P {
     /// `fn name<dims>(args) [-> ty] { ... }` — tensor stratum. The
     /// `gpu` prefix sets the target: `gpu fn` lowers to a Metal kernel.
     fn fn_decl_target(&mut self, target: crate::ast::Target) -> CResult<Sp<Fn>> {
-        let (l, c) = self.at(); // at `fn` / `gpu`
-        if target == crate::ast::Target::Gpu {
-            self.expect(&Tok::Gpu)?;
+        let (l, c) = self.at(); // at `fn` / `gpu` / `enc`
+        match target {
+            crate::ast::Target::Gpu => self.expect(&Tok::Gpu)?,
+            crate::ast::Target::Enc => self.expect(&Tok::Enc)?,
+            _ => {}
         }
         self.expect(&Tok::Fn)?;
         let name = self.ident()?.v;
@@ -803,11 +814,19 @@ impl P {
                             )
                         }
                     };
+                    // optional namespace alias: `import "x.cy" as m`
+                    let alias = if matches!(self.peek(), Tok::Ident(s) if s == "as") {
+                        self.bump();
+                        Some(self.ident()?)
+                    } else {
+                        None
+                    };
                     self.eat(&Tok::Semi);
-                    decls.push(Decl::Import(path));
+                    decls.push(Decl::Import { path, alias });
                 }
                 Tok::Fn => decls.push(Decl::Fn(self.fn_decl()?)),
                 Tok::Gpu => decls.push(Decl::Fn(self.fn_decl_target(crate::ast::Target::Gpu)?)),
+                Tok::Enc => decls.push(Decl::Fn(self.fn_decl_target(crate::ast::Target::Enc)?)),
                 Tok::Host => decls.push(Decl::HostFn(self.host_fn_decl(DetMode::Auto)?)),
                 Tok::Det => {
                     self.bump();
@@ -1083,11 +1102,12 @@ pub fn parse_src_at(path: &std::path::Path, src: &str) -> CResult<(String, Progr
     let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     for d in prog.decls {
         match d {
-            Decl::Import(rel) => {
+            Decl::Import { path: rel, alias } => {
                 let rel_p = std::path::Path::new(&rel.v);
                 let mut names = vec![rel.v.clone()];
                 if rel_p.extension().is_none() {
                     names.push(format!("{}.cy", rel.v));
+                    names.push(format!("{}/mod.cy", rel.v));
                 }
                 let mut roots = vec![base.to_path_buf()];
                 if let Ok(p) = std::env::var("CYO_PATH") {
@@ -1100,6 +1120,7 @@ pub fn parse_src_at(path: &std::path::Path, src: &str) -> CResult<(String, Progr
                     .flat_map(|r| names.iter().map(move |n| r.join(n)))
                     .find(|c| c.is_file())
                     .unwrap_or_else(|| roots[0].join(&names[0]));
+                let start = decls.len();
                 load_recursive(
                     &next,
                     rel.line,
@@ -1108,6 +1129,9 @@ pub fn parse_src_at(path: &std::path::Path, src: &str) -> CResult<(String, Progr
                     &mut combined,
                     &mut decls,
                 )?;
+                if let Some(a) = &alias {
+                    namespace_module(&mut decls[start..], &a.v);
+                }
             }
             other => decls.push(other),
         }
@@ -1138,7 +1162,7 @@ fn load_recursive(
     let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     for d in prog.decls {
         match d {
-            Decl::Import(rel) => {
+            Decl::Import { path: rel, alias } => {
                 // resolution order: importing file's dir, then each
                 // `CYO_PATH` dir (colon-separated, like PYTHONPATH).
                 // `import "x"` with no extension also tries `x.cy`.
@@ -1146,6 +1170,7 @@ fn load_recursive(
                 let mut names = vec![rel.v.clone()];
                 if rel_p.extension().is_none() {
                     names.push(format!("{}.cy", rel.v));
+                    names.push(format!("{}/mod.cy", rel.v));
                 }
                 let mut roots = vec![base.to_path_buf()];
                 if let Ok(p) = std::env::var("CYO_PATH") {
@@ -1158,7 +1183,11 @@ fn load_recursive(
                     .flat_map(|r| names.iter().map(move |n| r.join(n)))
                     .find(|c| c.is_file())
                     .unwrap_or_else(|| roots[0].join(&names[0]));
+                let start = out.len();
                 load_recursive(&next, rel.line, rel.col, seen, combined, out)?;
+                if let Some(a) = &alias {
+                    namespace_module(&mut out[start..], &a.v);
+                }
             }
             other => out.push(other),
         }
@@ -1166,4 +1195,213 @@ fn load_recursive(
     combined.push_str(&src);
     combined.push('\n');
     Ok(())
+}
+
+// --- module namespaces -------------------------------------------------------
+//
+// `import "x.cy" as m` splices the module under a namespace: every
+// top-level name becomes `m::name`, and unqualified references inside
+// the module's own bodies that resolve to its own decls are renamed to
+// match. Qualified references (`n::x` — from the module's own aliased
+// imports) are already stable names and stay untouched. Local bindings
+// shadowing a decl name are left alone — the rename is scope-aware,
+// not a blind string prefix.
+
+fn decl_name(d: &Decl) -> Option<String> {
+    match d {
+        Decl::Fn(f) => Some(f.v.name.clone()),
+        Decl::HostFn(f) => Some(f.v.name.clone()),
+        Decl::ExternFn(f) => Some(f.v.name.clone()),
+        Decl::Struct { name, .. } => Some(name.v.clone()),
+        Decl::Enum { name, .. } => Some(name.v.clone()),
+        Decl::Param { name, .. } => Some(name.v.clone()),
+        Decl::Table { name, .. } => Some(name.v.clone()),
+        Decl::Io { name, .. } => Some(name.v.clone()),
+        Decl::State { name, .. } => Some(name.v.clone()),
+        _ => None,
+    }
+}
+
+fn decl_name_mut<'a>(d: &'a mut Decl) -> Option<&'a mut String> {
+    match d {
+        Decl::Fn(f) => Some(&mut f.v.name),
+        Decl::HostFn(f) => Some(&mut f.v.name),
+        Decl::ExternFn(f) => Some(&mut f.v.name),
+        Decl::Struct { name, .. } => Some(&mut name.v),
+        Decl::Enum { name, .. } => Some(&mut name.v),
+        Decl::Param { name, .. } => Some(&mut name.v),
+        Decl::Table { name, .. } => Some(&mut name.v),
+        Decl::Io { name, .. } => Some(&mut name.v),
+        Decl::State { name, .. } => Some(&mut name.v),
+        _ => None,
+    }
+}
+
+fn collect_locals(stmts: &[Sp<Stmt>], out: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match &s.v {
+            Stmt::Let { name, expr, .. } => {
+                out.insert(name.v.clone());
+                let _ = expr;
+            }
+            Stmt::For { var, body, lo, hi } => {
+                out.insert(var.v.clone());
+                let _ = (lo, hi);
+                collect_locals(body, out);
+            }
+            Stmt::If { then, els, .. } => {
+                collect_locals(then, out);
+                collect_locals(els, out);
+            }
+            Stmt::While { body, .. } => collect_locals(body, out),
+            Stmt::Match { arms, .. } => {
+                for (p, body) in arms {
+                    if let Pat::Variant { binds, .. } = p {
+                        for b in binds {
+                            out.insert(b.v.clone());
+                        }
+                    }
+                    collect_locals(body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn rename_ref(s: &mut String, map: &std::collections::HashMap<String, String>, locals: &std::collections::HashSet<String>) {
+    if s.contains("::") {
+        return; // already qualified — stable name
+    }
+    if locals.contains(s) {
+        return; // shadowed local wins
+    }
+    if let Some(n) = map.get(s) {
+        *s = n.clone();
+    }
+}
+
+fn rename_expr(e: &mut Sp<Expr>, map: &std::collections::HashMap<String, String>, locals: &std::collections::HashSet<String>) {
+    match &mut e.v {
+        Expr::Ident(s) => rename_ref(s, map, locals),
+        Expr::Call(s, pos, named) => {
+            rename_ref(s, map, locals);
+            for a in pos {
+                rename_expr(a, map, locals);
+            }
+            for (_, a) in named {
+                rename_expr(a, map, locals);
+            }
+        }
+        Expr::StructLit(s, fields) => {
+            rename_ref(&mut s.v, map, locals);
+            for (_, f) in fields {
+                rename_expr(f, map, locals);
+            }
+        }
+        Expr::Unary(_, a) | Expr::Transpose(a) => rename_expr(a, map, locals),
+        Expr::Bin(_, a, b) => {
+            rename_expr(a, map, locals);
+            rename_expr(b, map, locals);
+        }
+        Expr::Index(a, _) => rename_expr(a, map, locals),
+        Expr::Field(a, _) => rename_expr(a, map, locals),
+        Expr::VecLit(vs) => {
+            for v in vs {
+                rename_expr(v, map, locals);
+            }
+        }
+        Expr::MapLit(kvs) => {
+            for (k, v) in kvs {
+                rename_expr(k, map, locals);
+                rename_expr(v, map, locals);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rename_stmt(s: &mut Sp<Stmt>, map: &std::collections::HashMap<String, String>, locals: &std::collections::HashSet<String>) {
+    match &mut s.v {
+        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr(expr) => {
+            rename_expr(expr, map, locals)
+        }
+        Stmt::Store { target, expr, .. } => {
+            rename_expr(target, map, locals);
+            rename_expr(expr, map, locals);
+        }
+        Stmt::If { cond, then, els } => {
+            rename_expr(cond, map, locals);
+            for s in then.iter_mut().chain(els.iter_mut()) {
+                rename_stmt(s, map, locals);
+            }
+        }
+        Stmt::Match { expr, arms } => {
+            rename_expr(expr, map, locals);
+            for (p, body) in arms {
+                if let Pat::Variant { name, .. } = p {
+                    // `Enum::Variant` — rename the enum's namespace prefix
+                    if let Some((pre, _)) = name.v.split_once("::") {
+                        if let Some(n) = map.get(pre) {
+                            name.v = format!("{}::{}", n, name.v.split("::").nth(1).unwrap());
+                        }
+                    } else if let Some(n) = map.get(&name.v) {
+                        name.v = n.clone();
+                    }
+                }
+                for s in body {
+                    rename_stmt(s, map, locals);
+                }
+            }
+        }
+        Stmt::While { cond, body } => {
+            rename_expr(cond, map, locals);
+            for s in body {
+                rename_stmt(s, map, locals);
+            }
+        }
+        Stmt::For { lo, hi, body, .. } => {
+            rename_expr(lo, map, locals);
+            rename_expr(hi, map, locals);
+            for s in body {
+                rename_stmt(s, map, locals);
+            }
+        }
+        Stmt::Return(Some(e)) => rename_expr(e, map, locals),
+        _ => {}
+    }
+}
+
+/// Namespace the spliced decls in `slice` under `alias`.
+fn namespace_module(slice: &mut [Decl], alias: &str) {
+    use std::collections::{HashMap, HashSet};
+    let mut map: HashMap<String, String> = HashMap::new();
+    for d in slice.iter() {
+        if let Some(n) = decl_name(d) {
+            map.insert(n.clone(), format!("{alias}::{n}"));
+        }
+    }
+    if map.is_empty() {
+        return;
+    }
+    for d in slice.iter_mut() {
+        if let Some(n) = decl_name_mut(d) {
+            if let Some(new) = map.get(n).cloned() {
+                *n = new;
+            }
+        }
+        // rename refs inside bodies
+        let body: Option<&mut Vec<Sp<Stmt>>> = match d {
+            Decl::Fn(f) => Some(&mut f.v.body),
+            Decl::HostFn(f) => Some(&mut f.v.body),
+            _ => None,
+        };
+        if let Some(stmts) = body {
+            let mut locals = HashSet::new();
+            collect_locals(stmts, &mut locals);
+            for s in stmts.iter_mut() {
+                rename_stmt(s, &map, &locals);
+            }
+        }
+    }
 }

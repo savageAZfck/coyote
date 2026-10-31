@@ -363,6 +363,11 @@ impl Hk {
         let _ = loops;
         let (l, c) = (e.line, e.col);
         match &e.v {
+            Expr::Try(_) => diag(
+                "`?` is only valid in let position — `let x = expr?`",
+                l,
+                c,
+            ),
             Expr::Int(n) => Ok(HT {
                 e: HE::I64(*n),
                 ty: RTy::I64,
@@ -1309,7 +1314,98 @@ impl Hk {
         loops: usize,
     ) -> CResult<Vec<HS>> {
         let mut out = Vec::new();
-        for s in body {
+        for (i, s) in body.iter().enumerate() {
+            // `let x = e?` — try/propagate. Desugars continuation-style:
+            //   match e { Enum::Ok(x) => { <rest of block> },
+            //             Enum::Err(__e) => { return Enum::Err(__e) } }
+            // the let-name binds in the Ok arm, so everything after the
+            // `?` sees it — the flat let-else scope, expressed with the
+            // existing match machinery.
+            if let Stmt::Let {
+                name,
+                expr,
+                mutable,
+                ..
+            } = &s.v
+            {
+                if let Expr::Try(inner) = &expr.v {
+                    let te = self.expr(inner, env, loops)?;
+                    let ei = match te.ty {
+                        RTy::Enum(ei) => ei as usize,
+                        _ => {
+                            return diag(
+                                format!(
+                                    "`?` needs a Result-style enum (Ok/Err), found {}",
+                                    self.show(&te.ty)
+                                ),
+                                expr.line,
+                                expr.col,
+                            )
+                        }
+                    };
+                    if *ret != RTy::Enum(ei as u32) {
+                        return diag(
+                            format!(
+                                "`?` propagates {} but this fn returns {}",
+                                self.show(&te.ty),
+                                self.show(ret)
+                            ),
+                            expr.line,
+                            expr.col,
+                        );
+                    }
+                    let (ename, variants) = self.enums[ei].clone();
+                    let ok_vi = variants.iter().position(|(v, _)| v == "Ok");
+                    let err_vi = variants.iter().position(|(v, _)| v == "Err");
+                    let (Some(ok_vi), Some(err_vi)) = (ok_vi, err_vi) else {
+                        return diag(
+                            format!("enum {ename} needs Ok and Err variants for `?`"),
+                            expr.line,
+                            expr.col,
+                        );
+                    };
+                    if variants[ok_vi].1.len() != 1 || variants[err_vi].1.len() != 1 {
+                        return diag(
+                            format!("`?` needs {ename}::Ok/Err to each carry one payload"),
+                            expr.line,
+                            expr.col,
+                        );
+                    }
+                    let ok_ty = variants[ok_vi].1[0].clone();
+                    let err_ty = variants[err_vi].1[0].clone();
+                    let err_expr = HT {
+                        e: HE::EnumLit(
+                            ei as u32,
+                            err_vi as u32,
+                            vec![HT {
+                                e: HE::Var("__try_e".into()),
+                                ty: err_ty.clone(),
+                            }],
+                        ),
+                        ty: RTy::Enum(ei as u32),
+                    };
+                    // the continuation checks inside the Ok arm's
+                    // scope — the let-name is bound there.
+                    env.push(HashMap::new());
+                    env.last_mut()
+                        .unwrap()
+                        .insert(name.v.clone(), (ok_ty.clone(), *mutable));
+                    let cont = self.stmts(&body[i + 1..], env, ret, loops)?;
+                    env.pop();
+                    out.push(HS::Match {
+                        expr: te,
+                        arms: vec![
+                            (Some(ok_vi as u32), vec![(name.v.clone(), ok_ty)], cont),
+                            (
+                                Some(err_vi as u32),
+                                vec![("__try_e".into(), err_ty)],
+                                vec![HS::Return(Some(err_expr))],
+                            ),
+                        ],
+                    });
+                    return Ok(out);
+                }
+            }
             out.push(self.stmt(s, env, ret, loops)?);
         }
         Ok(out)
@@ -2226,6 +2322,9 @@ fn resolve_ty_pub(ty: &Ty) -> CResult<CTy> {
             Dim::Lit(n) => dims.push(*n),
             Dim::Name(s) => return diag(format!("unbound dim {s} in host-visible type"), 0, 0),
         }
+    }
+    if let Some(v) = &ty.dt_var {
+        return diag(format!("dtype param {v} only valid inside generic fns"), 0, 0);
     }
     Ok(CTy { dt: ty.dt, dims })
 }
