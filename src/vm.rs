@@ -926,6 +926,40 @@ impl Vm {
         self.gtensor.keys().cloned().collect()
     }
 
+    /// Snapshot every declared `param` global for checkpoint export:
+    /// `(name, file-layout dims, file-layout f32 data, is_f16)`.
+    /// Rank-2 params transpose back to the `[N,K]` safetensors
+    /// orientation the `@ src` loader consumes — export inverts load
+    /// exactly. Tables, state mirrors, and program values are excluded:
+    /// they are program data, not weights.
+    pub fn params_snapshot(&self) -> Vec<(String, Vec<usize>, Vec<f32>, bool)> {
+        let mut out = Vec::new();
+        for (_slot, gv, _) in &self.h.globals {
+            let GVal::Param { name, ty, .. } = gv else {
+                continue;
+            };
+            let Some(&h) = self.gtensor.get(name) else {
+                continue;
+            };
+            let decl = dims_usize(ty);
+            let data = self.tensors[h as usize].1.clone();
+            let f16 = matches!(ty.dt, DType::F16);
+            if ty.dims.len() == 2 {
+                let (k, n) = (decl[0], decl[1]);
+                let mut t = vec![0f32; data.len()];
+                for a in 0..n {
+                    for b in 0..k {
+                        t[a * k + b] = data[b * n + a];
+                    }
+                }
+                out.push((name.clone(), vec![n, k], t, f16));
+            } else {
+                out.push((name.clone(), decl, data, f16));
+            }
+        }
+        out
+    }
+
     /// Declared `io` ports of a compiled tensor program (name → dims),
     /// for building calls interactively.
     pub fn prog_ios(&self, name: &str) -> Option<Vec<(String, Vec<i64>)>> {
