@@ -6,7 +6,7 @@ use crate::ast::{AssignOp, BinOp, DType, Qual, UnOp};
 use crate::lower::{init_weight_pub, q4_quantize};
 use crate::typeck::{CTy, TExpr, TIndex, TProgram, TStmt, Typed};
 use crate::{diag, CResult, Diag};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Standard Adam optimizer step ($\beta_1 = 0.9, \beta_2 = 0.999, \epsilon = 10^{-8}$),
 /// with updated weights rounded to fp16 to match the ANE surface representation.
@@ -64,6 +64,17 @@ pub struct Evaluator<'a> {
     /// Typed node → forward value (AD tape)
     defs: HashMap<usize, Val>,
     tape: HashMap<String, Typed>,
+    /// tape insertion order — the drain walks it in reverse so each
+    /// shared let's merged adjoint propagates exactly once.
+    tape_order: Vec<String>,
+    /// accumulated adjoints for tape-bound names (DAG, not tree)
+    tape_adj: HashMap<String, Vec<f32>>,
+    /// positive-only needs_grad memo — `true` is stable across query
+    /// depths; `false` is depth-dependent and never cached.
+    ng_memo: HashMap<String, bool>,
+    /// names on the needs_grad recursion stack — self-aliasing tape
+    /// defs (shadowing) would otherwise recurse forever.
+    ng_visiting: HashSet<String>,
     grads: HashMap<String, Val>,
     in_grad: bool,
     /// trainable param → updated value (post-run)
@@ -79,6 +90,10 @@ impl<'a> Evaluator<'a> {
             svals: HashMap::new(),
             defs: HashMap::new(),
             tape: HashMap::new(),
+            tape_order: Vec::new(),
+            tape_adj: HashMap::new(),
+            ng_memo: HashMap::new(),
+            ng_visiting: HashSet::new(),
             grads: HashMap::new(),
             in_grad: false,
             updates: Vec::new(),
@@ -113,7 +128,7 @@ impl<'a> Evaluator<'a> {
         // bind trainable params to their current weights ([N, K] storage)
         for tp in &self.p.params {
             if tp.qual == Qual::Trainable {
-                let n = (tp.ty.dims[0] * tp.ty.dims[1]) as usize;
+                let n = tp.ty.numel().max(1) as usize;
                 let v = self
                     .pvals
                     .get(&tp.name)
@@ -522,6 +537,7 @@ impl<'a> Evaluator<'a> {
                     if let TStmt::Let { name, expr } = s {
                         let v = self.expr(expr)?;
                         self.tape.insert(name.clone(), expr.clone());
+                        self.tape_order.push(name.clone());
                         self.env.last_mut().unwrap().insert(name.clone(), v);
                     } else {
                         self.stmt(s)?;
@@ -539,7 +555,15 @@ impl<'a> Evaluator<'a> {
     /// CPU mirror of the lowerer's tape backward.
     fn grad(&mut self, loss: &Typed, wrt: &str) -> CResult<Val> {
         self.env.push(HashMap::new());
+        // defs memoizes forward values by Typed pointer — entries from
+        // earlier evals would skip this grad's forward walk entirely,
+        // leaving the tape empty. Each grad re-evaluates its loss.
+        self.defs.clear();
         self.tape.clear();
+        self.tape_order.clear();
+        self.tape_adj.clear();
+        self.ng_memo.clear();
+        self.ng_visiting.clear();
         self.grads.clear();
         self.in_grad = true;
         let terminal: Typed = match &loss.e {
@@ -548,6 +572,7 @@ impl<'a> Evaluator<'a> {
                     if let TStmt::Let { name, expr } = s {
                         let v = self.expr(expr)?;
                         self.tape.insert(name.clone(), expr.clone());
+                        self.tape_order.push(name.clone());
                         self.env.last_mut().unwrap().insert(name.clone(), v);
                     } else {
                         self.stmt(s)?;
@@ -571,6 +596,32 @@ impl<'a> Evaluator<'a> {
             }
             _ => return diag("grad: v1 losses must end in mse", 0, 0),
         }
+        // shared lets form a DAG: the seed walk only accumulated
+        // adjoints at tape boundaries — now each def walks exactly
+        // once, in reverse definition order, with its merged adjoint.
+        let order = std::mem::take(&mut self.tape_order);
+        for name in order.iter().rev() {
+            if let Some(adj) = self.tape_adj.remove(name) {
+                if let Some(def) = self.tape.get(name).cloned() {
+                    // defs is keyed by Typed pointer — the per-let `.cloned()`
+                    // trees are dropped each iteration and the allocator
+                    // reuses their addresses, so a stale entry from a
+                    // previous def would be returned for a different node.
+                    // Each def's subtree is an independent clone: nothing
+                    // cached under it can be shared with the next def.
+                    self.defs.clear();
+                    self.back(&def, &adj)?;
+                }
+            }
+        }
+        if std::env::var("COYOTE_DEBUG_GRAD").is_ok() {
+            eprintln!(
+                "[grad {wrt}] tape_order={:?} tape_adj={:?} grads={:?}",
+                order,
+                self.tape_adj.keys().collect::<Vec<_>>(),
+                self.grads.keys().collect::<Vec<_>>()
+            );
+        }
         let out = self.grads.get(wrt).cloned().ok_or(()).map_err(|_| Diag {
             msg: format!("grad: loss does not depend on {wrt}"),
             line: 0,
@@ -578,6 +629,10 @@ impl<'a> Evaluator<'a> {
         })?;
         self.in_grad = false;
         self.tape.clear();
+        self.tape_order.clear();
+        self.tape_adj.clear();
+        self.ng_memo.clear();
+        self.ng_visiting.clear();
         self.env.pop();
         Ok(out)
     }
@@ -589,8 +644,8 @@ impl<'a> Evaluator<'a> {
             TExpr::Ident(s) => {
                 if self.is_param(s).is_some() {
                     self.acc(s, adj.to_vec());
-                } else if let Some(def) = self.tape.get(s).cloned() {
-                    self.back(&def, adj)?;
+                } else if self.tape.contains_key(s) {
+                    self.accum_tape_adj(s, adj);
                 }
             }
             TExpr::Lit(_) | TExpr::Int(_) => {}
@@ -648,12 +703,66 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 BinOp::MatMul => {
-                    // grad through state-field contractions lands in M3b
-                    let is_state_rhs = matches!(&b.e, TExpr::Field(..))
-                        || matches!(&b.e, TExpr::Transpose(i) if matches!(&i.e, TExpr::Field(..)));
-                    if is_state_rhs {
+                    // state-field rhs: `s @ kv.v` contracts the field's
+                    // T dim, `q @ kv.k.T` contracts its D dim. The field
+                    // itself takes no grad (cache isn't a param) — the
+                    // lhs adjoint is the same contraction with x/adj
+                    // swapped against the [T,D] row-major storage.
+                    let sf: Option<(String, bool)> = match &b.e {
+                        TExpr::Field(bx, f) => match &bx.e {
+                            TExpr::Ident(s) => Some((format!("{s}.{f}"), false)),
+                            _ => None,
+                        },
+                        TExpr::Transpose(i) => match &i.e {
+                            TExpr::Field(bx, f) => match &bx.e {
+                                TExpr::Ident(s) => Some((format!("{s}.{f}"), true)),
+                                _ => None,
+                            },
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((key, transposed)) = sf {
                         if self.needs_grad(a) {
-                            return diag("grad through cache/state ops lands in M3b", 0, 0);
+                            let (t, d) = match &b.e {
+                                TExpr::Field(..) => (b.ty.dims[0] as usize, b.ty.dims[1] as usize),
+                                TExpr::Transpose(i) => {
+                                    (i.ty.dims[0] as usize, i.ty.dims[1] as usize)
+                                }
+                                _ => unreachable!(),
+                            };
+                            let v = self
+                                .lookup(&key)
+                                .ok_or(())
+                                .map_err(|_| Diag {
+                                    msg: format!("unbound state {key}"),
+                                    line: 0,
+                                    col: 0,
+                                })?
+                                .vec(t * d);
+                            // dx mirrors the forward rule with adj in
+                            // x's seat: `x @ F` → dx[t]=Σ_d adj[d]·v[t,d];
+                            // `x @ F.T` → dx[d]=Σ_t adj[t]·v[t,d].
+                            // dx is x-shaped — a.ty.numel(), not adj.len().
+                            let mut dx = vec![0f32; a.ty.numel().max(1) as usize];
+                            if transposed {
+                                for d2 in 0..d {
+                                    let mut acc = 0f32;
+                                    for t2 in 0..t {
+                                        acc += adj[t2] * v[t2 * d + d2];
+                                    }
+                                    dx[d2] = acc;
+                                }
+                            } else {
+                                for t2 in 0..t {
+                                    let mut acc = 0f32;
+                                    for d2 in 0..d {
+                                        acc += adj[d2] * v[t2 * d + d2];
+                                    }
+                                    dx[t2] = acc;
+                                }
+                            }
+                            self.back(a, &dx)?;
                         }
                         return Ok(());
                     }
@@ -675,6 +784,7 @@ impl<'a> Evaluator<'a> {
                         },
                         _ => None,
                     };
+                    let xv = self.fwd(a)?.vec(m * k);
                     if self.needs_grad(a) {
                         // dx[br,i] = Σ_j adj[br,j] · w[j,i] — w in
                         // [N,K] storage, per batch row.
@@ -693,7 +803,7 @@ impl<'a> Evaluator<'a> {
                     }
                     if let Some(p) = pname {
                         if self.is_param(&p).is_some() {
-                            let x = self.fwd(a)?.vec(m * k);
+                            let x = &xv;
                             // dW[j,i] = Σ_br adj[br,j] · x[br,i] —
                             // batch rows accumulate into the shared
                             // [N,K] weight.
@@ -885,6 +995,20 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
+    /// accumulate an adjoint contribution for a tape-bound name —
+    /// consumers merge here; the reverse-order drain walks the def once.
+    fn accum_tape_adj(&mut self, name: &str, adj: &[f32]) {
+        match self.tape_adj.get(name) {
+            None => {
+                self.tape_adj.insert(name.to_string(), adj.to_vec());
+            }
+            Some(prev) => {
+                let sum: Vec<f32> = prev.iter().zip(adj).map(|(a, b)| a + b).collect();
+                self.tape_adj.insert(name.to_string(), sum);
+            }
+        }
+    }
+
     fn acc(&mut self, name: &str, dw: Vec<f32>) {
         match self.grads.get(name) {
             None => {
@@ -898,21 +1022,45 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn needs_grad(&self, e: &Typed) -> bool {
+    fn needs_grad(&mut self, e: &Typed) -> bool {
         self.needs_grad_d(e, 0)
     }
-    fn needs_grad_d(&self, e: &Typed, depth: usize) -> bool {
-        if depth > 32 {
+    fn needs_grad_d(&mut self, e: &Typed, depth: usize) -> bool {
+        // tape defs are acyclic — the guard only bounds pathological
+        // inputs; 32 truncated deep transformer paths and dropped grads.
+        if depth > 100_000 {
             return false;
+        }
+        if std::env::var("COYOTE_DEBUG_NG").is_ok() && depth > 0 && depth % 500 == 0 {
+            let tag = match &e.e {
+                TExpr::Ident(s) => format!("Ident({s})"),
+                TExpr::Call(n, ..) => format!("Call({n})"),
+                TExpr::Bin(op, ..) => format!("Bin({op:?})"),
+                TExpr::Block(..) => "Block".into(),
+                _ => "other".into(),
+            };
+            eprintln!("[ng depth {depth}] {tag}");
         }
         match &e.e {
             TExpr::Ident(s) => {
-                self.is_param(s).is_some()
-                    || self
-                        .tape
-                        .get(s)
-                        .map(|t| self.needs_grad_d(t, depth + 1))
-                        .unwrap_or(false)
+                if self.is_param(s).is_some() {
+                    return true;
+                }
+                if self.ng_memo.get(s).copied().unwrap_or(false) {
+                    return true;
+                }
+                if !self.ng_visiting.insert(s.clone()) {
+                    return false;
+                }
+                let def = self.tape.get(s).cloned();
+                let r = def
+                    .map(|t| self.needs_grad_d(&t, depth + 1))
+                    .unwrap_or(false);
+                self.ng_visiting.remove(s);
+                if r {
+                    self.ng_memo.insert(s.clone(), true);
+                }
+                r
             }
             TExpr::Unary(_, a) | TExpr::Transpose(a) => self.needs_grad_d(a, depth + 1),
             TExpr::Bin(_, a, b) => {
@@ -963,6 +1111,9 @@ impl<'a> Evaluator<'a> {
                         .last_mut()
                         .unwrap()
                         .insert(param.clone(), Val::V(nv));
+                    // param value changed — every memoized forward
+                    // value computed under the old weights is stale.
+                    self.defs.clear();
                 }
             }
             TStmt::AdamUpdate { param, grad, .. } => {
@@ -970,6 +1121,11 @@ impl<'a> Evaluator<'a> {
                     // Record the raw gradient `g` into `updates`; the driver's
                     // Adam moment loop (`adam_step`) updates `w`, `m`, `v` across steps.
                     let g = self.grad(loss, wrt)?.vec(grad.ty.numel() as usize);
+                    if std::env::var("COYOTE_DEBUG_GRAD").is_ok() {
+                        let n2: f32 = g.iter().map(|v| v * v).sum();
+                        let mx: f32 = g.iter().fold(0f32, |a, &b| a.max(b.abs()));
+                        eprintln!("[adam {param}] |g|={:.6} max={:.6}", n2.sqrt(), mx);
+                    }
                     if let Some(e) = self.updates.iter_mut().find(|(p, _)| p == param) {
                         e.1 = g;
                     } else {

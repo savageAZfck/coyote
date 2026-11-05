@@ -16,6 +16,9 @@ pub enum Tok {
     Host,
     Gpu,
     Enc,
+    Mesh,
+    Pcc,
+    Treaty,
     Reflex,
     Struct,
     Enum,
@@ -82,8 +85,8 @@ pub enum Tok {
     Gt,
     Le,
     Ge,
-    LtAngle, // < after fn name (generic dims)
-    GtAngle, // > — same token as Gt; parser disambiguates
+    LtAngle,  // < after fn name (generic dims)
+    GtAngle,  // > — same token as Gt; parser disambiguates
     Question, // ? — try/propagate
     Eof,
 }
@@ -103,6 +106,9 @@ fn kw(s: &str) -> Option<Tok> {
         "host" => Tok::Host,
         "gpu" => Tok::Gpu,
         "enc" => Tok::Enc,
+        "mesh" => Tok::Mesh,
+        "pcc" => Tok::Pcc,
+        "treaty" => Tok::Treaty,
         "reflex" => Tok::Reflex,
         "struct" => Tok::Struct,
         "enum" => Tok::Enum,

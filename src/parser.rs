@@ -50,6 +50,20 @@ impl P {
         }
     }
 
+    /// capability names are atoms — site/strata keywords double as caps
+    /// (`cap treaty`, `cap mesh`, `cap pcc`, `cap enc`).
+    fn cap_name(&mut self) -> CResult<Sp<String>> {
+        let (l, c) = self.at();
+        match self.bump() {
+            Tok::Ident(s) => Ok(sp(s, l, c)),
+            Tok::Treaty => Ok(sp("treaty".into(), l, c)),
+            Tok::Mesh => Ok(sp("mesh".into(), l, c)),
+            Tok::Pcc => Ok(sp("pcc".into(), l, c)),
+            Tok::Enc => Ok(sp("enc".into(), l, c)),
+            t => diag(format!("expected capability name, found {t:?}"), l, c),
+        }
+    }
+
     fn ty(&mut self) -> CResult<Sp<Ty>> {
         let (l, c) = self.at();
         let name = match self.bump() {
@@ -100,6 +114,7 @@ impl P {
                 self.expect(&Tok::RBrace)?;
                 HTy::Map(Box::new(kt.v), Box::new(vt.v))
             }
+            Tok::Det => HTy::Det(Box::new(self.hty()?.v)),
             Tok::Ident(s) => match s.as_str() {
                 "i64" => HTy::I64,
                 "f64" => HTy::F64,
@@ -107,6 +122,7 @@ impl P {
                 "str" => HTy::Str,
                 "token" => HTy::Token,
                 "dfa" => HTy::Dfa,
+                "peer" => HTy::Peer,
                 "unit" => HTy::Unit,
                 "ane" => {
                     self.expect(&Tok::LParen)?;
@@ -622,17 +638,39 @@ impl P {
     // ---- declarations ----
 
     fn fn_decl(&mut self) -> CResult<Sp<Fn>> {
-        self.fn_decl_target(crate::ast::Target::Ane)
+        self.fn_decl_target(crate::ast::Site::Local, crate::ast::Target::Ane)
     }
 
-    /// `fn name<dims>(args) [-> ty] { ... }` — tensor stratum. The
-    /// `gpu` prefix sets the target: `gpu fn` lowers to a Metal kernel.
-    fn fn_decl_target(&mut self, target: crate::ast::Target) -> CResult<Sp<Fn>> {
-        let (l, c) = self.at(); // at `fn` / `gpu` / `enc`
-        match target {
-            crate::ast::Target::Gpu => self.expect(&Tok::Gpu)?,
-            crate::ast::Target::Enc => self.expect(&Tok::Enc)?,
+    /// `[site] [engine] fn name<dims>(args) [-> ty] { ... }` — tensor
+    /// stratum. Site prefixes (`mesh`, `pcc`) pick the execution site;
+    /// engine prefixes (`gpu`, `enc`) pick the compute stratum. A site
+    /// may carry an engine: `pcc enc fn` is ciphertext on an attested
+    /// remote, `mesh gpu fn` is Metal math on a peer.
+    fn fn_decl_target(
+        &mut self,
+        site: crate::ast::Site,
+        mut target: crate::ast::Target,
+    ) -> CResult<Sp<Fn>> {
+        let (l, c) = self.at(); // at `fn` / site / engine qualifier
+        match site {
+            crate::ast::Site::Mesh => self.expect(&Tok::Mesh)?,
+            crate::ast::Site::Pcc => self.expect(&Tok::Pcc)?,
             _ => {}
+        }
+        if site != crate::ast::Site::Local {
+            if self.peek() == &Tok::Enc {
+                self.bump();
+                target = crate::ast::Target::Enc;
+            } else if self.peek() == &Tok::Gpu {
+                self.bump();
+                target = crate::ast::Target::Gpu;
+            }
+        } else {
+            match target {
+                crate::ast::Target::Gpu => self.expect(&Tok::Gpu)?,
+                crate::ast::Target::Enc => self.expect(&Tok::Enc)?,
+                _ => {}
+            }
         }
         self.expect(&Tok::Fn)?;
         let name = self.ident()?.v;
@@ -672,6 +710,7 @@ impl P {
             Fn {
                 name,
                 target,
+                site,
                 dims,
                 args,
                 ret,
@@ -703,6 +742,8 @@ impl P {
             loop {
                 let an = self.ident()?;
                 self.expect(&Tok::Colon)?;
+                // `name: det ty` — the param demands det provenance; a
+                // stoch-produced value at the callsite is a compile error.
                 let at = self.hty()?;
                 args.push((an, at));
                 if self.eat(&Tok::Comma) {
@@ -720,9 +761,9 @@ impl P {
         let caps = if self.eat(&Tok::Cap) {
             let mut cs = Vec::new();
             if self.peek() != &Tok::LBrace {
-                cs.push(self.ident()?);
+                cs.push(self.cap_name()?);
                 while self.eat(&Tok::Comma) {
-                    cs.push(self.ident()?);
+                    cs.push(self.cap_name()?);
                 }
             }
             Some(cs)
@@ -758,6 +799,8 @@ impl P {
             loop {
                 let an = self.ident()?;
                 self.expect(&Tok::Colon)?;
+                // `name: det ty` — the param demands det provenance; a
+                // stoch-produced value at the callsite is a compile error.
                 let at = self.hty()?;
                 args.push((an, at));
                 if self.eat(&Tok::Comma) {
@@ -825,8 +868,51 @@ impl P {
                     decls.push(Decl::Import { path, alias });
                 }
                 Tok::Fn => decls.push(Decl::Fn(self.fn_decl()?)),
-                Tok::Gpu => decls.push(Decl::Fn(self.fn_decl_target(crate::ast::Target::Gpu)?)),
-                Tok::Enc => decls.push(Decl::Fn(self.fn_decl_target(crate::ast::Target::Enc)?)),
+                Tok::Gpu => decls.push(Decl::Fn(
+                    self.fn_decl_target(crate::ast::Site::Local, crate::ast::Target::Gpu)?,
+                )),
+                Tok::Enc => decls.push(Decl::Fn(
+                    self.fn_decl_target(crate::ast::Site::Local, crate::ast::Target::Enc)?,
+                )),
+                Tok::Mesh => decls.push(Decl::Fn(
+                    self.fn_decl_target(crate::ast::Site::Mesh, crate::ast::Target::Ane)?,
+                )),
+                Tok::Pcc => decls.push(Decl::Fn(
+                    self.fn_decl_target(crate::ast::Site::Pcc, crate::ast::Target::Ane)?,
+                )),
+                Tok::Treaty => {
+                    self.bump();
+                    let name = self.ident()?;
+                    self.expect(&Tok::LBrace)?;
+                    let mut allow = Vec::new();
+                    let mut deny = Vec::new();
+                    while self.peek() != &Tok::RBrace && self.peek() != &Tok::Eof {
+                        let kw = self.ident()?;
+                        let list = match kw.v.as_str() {
+                            "allow" => &mut allow,
+                            "deny" => &mut deny,
+                            other => {
+                                return diag(
+                                    format!(
+                                        "treaty clause must be `allow` or `deny`, found `{other}`"
+                                    ),
+                                    kw.line,
+                                    kw.col,
+                                )
+                            }
+                        };
+                        loop {
+                            list.push(self.ident()?);
+                            if self.eat(&Tok::Comma) {
+                                continue;
+                            }
+                            break;
+                        }
+                        self.eat(&Tok::Semi);
+                    }
+                    self.expect(&Tok::RBrace)?;
+                    decls.push(Decl::Treaty { name, allow, deny });
+                }
                 Tok::Host => decls.push(Decl::HostFn(self.host_fn_decl(DetMode::Auto)?)),
                 Tok::Det => {
                     self.bump();
@@ -871,9 +957,9 @@ impl P {
                     let mut caps = Vec::new();
                     if self.eat(&Tok::Cap) {
                         if self.peek() != &Tok::Semi {
-                            caps.push(self.ident()?);
+                            caps.push(self.cap_name()?);
                             while self.eat(&Tok::Comma) {
-                                caps.push(self.ident()?);
+                                caps.push(self.cap_name()?);
                             }
                         }
                     }
@@ -938,9 +1024,9 @@ impl P {
                 }
                 Tok::Cap => {
                     self.bump();
-                    let mut caps = vec![self.ident()?];
+                    let mut caps = vec![self.cap_name()?];
                     while self.eat(&Tok::Comma) {
-                        caps.push(self.ident()?);
+                        caps.push(self.cap_name()?);
                     }
                     decls.push(Decl::Cap(caps));
                 }
@@ -1005,11 +1091,20 @@ impl P {
                     } else {
                         None
                     };
+                    // `lineage key` — cite a `provenance { key: ... }`
+                    // entry; the typechecker rejects undeclared lineage.
+                    let lineage = if self.peek() == &Tok::Ident("lineage".to_string()) {
+                        self.bump();
+                        Some(self.ident()?)
+                    } else {
+                        None
+                    };
                     decls.push(Decl::Param {
                         name: n,
                         qual,
                         ty,
                         src,
+                        lineage,
                     });
                 }
                 Tok::Table => {
@@ -1269,7 +1364,11 @@ fn collect_locals(stmts: &[Sp<Stmt>], out: &mut std::collections::HashSet<String
     }
 }
 
-fn rename_ref(s: &mut String, map: &std::collections::HashMap<String, String>, locals: &std::collections::HashSet<String>) {
+fn rename_ref(
+    s: &mut String,
+    map: &std::collections::HashMap<String, String>,
+    locals: &std::collections::HashSet<String>,
+) {
     if s.contains("::") {
         return; // already qualified — stable name
     }
@@ -1281,7 +1380,11 @@ fn rename_ref(s: &mut String, map: &std::collections::HashMap<String, String>, l
     }
 }
 
-fn rename_expr(e: &mut Sp<Expr>, map: &std::collections::HashMap<String, String>, locals: &std::collections::HashSet<String>) {
+fn rename_expr(
+    e: &mut Sp<Expr>,
+    map: &std::collections::HashMap<String, String>,
+    locals: &std::collections::HashSet<String>,
+) {
     match &mut e.v {
         Expr::Ident(s) => rename_ref(s, map, locals),
         Expr::Call(s, pos, named) => {
@@ -1321,7 +1424,11 @@ fn rename_expr(e: &mut Sp<Expr>, map: &std::collections::HashMap<String, String>
     }
 }
 
-fn rename_stmt(s: &mut Sp<Stmt>, map: &std::collections::HashMap<String, String>, locals: &std::collections::HashSet<String>) {
+fn rename_stmt(
+    s: &mut Sp<Stmt>,
+    map: &std::collections::HashMap<String, String>,
+    locals: &std::collections::HashSet<String>,
+) {
     match &mut s.v {
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr(expr) => {
             rename_expr(expr, map, locals)

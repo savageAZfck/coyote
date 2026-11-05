@@ -28,6 +28,8 @@ pub enum RTy {
     Enum(u32),
     /// `ane(args) -> ret` — a program value.
     AneFn(Vec<RTy>, Box<RTy>),
+    /// `peer` — a treaty-bound handle to another organism.
+    Peer,
 }
 
 pub type StructDef = (String, Vec<(String, RTy)>);
@@ -56,6 +58,7 @@ impl RTy {
                     .join(", "),
                 r.show(structs, enums),
             ),
+            RTy::Peer => "peer".into(),
         }
     }
 }
@@ -257,6 +260,9 @@ pub struct HProgram {
     pub globals: Vec<(String, GVal, RTy)>,
     /// `main`'s index into fns, if present.
     pub entry: Option<usize>,
+    /// declared `treaty` terms: name → (allow verbs, deny verbs).
+    /// Peer externs negotiate against this table at connect time.
+    pub treaties: HashMap<String, (Vec<String>, Vec<String>)>,
 }
 
 struct Hk {
@@ -304,6 +310,7 @@ impl Hk {
             HTy::Unit => RTy::Unit,
             HTy::Token => RTy::Token,
             HTy::Dfa => RTy::Dfa,
+            HTy::Peer => RTy::Peer,
             HTy::Tensor(ty) => {
                 let mut dims = Vec::new();
                 for d in &ty.dims {
@@ -333,6 +340,9 @@ impl Hk {
                 let rv = self.resolve(vt, l, c)?;
                 RTy::Map(Box::new(rk), Box::new(rv))
             }
+            // `det T` resolves to T — the qualifier is a flow contract
+            // enforced by the provenance pass, not a distinct type.
+            HTy::Det(inner) => self.resolve(inner, l, c)?,
             HTy::Struct(name) => {
                 if let Some(i) = self.structs.iter().position(|(n, _)| n == name) {
                     RTy::Struct(i as u32)
@@ -363,11 +373,7 @@ impl Hk {
         let _ = loops;
         let (l, c) = (e.line, e.col);
         match &e.v {
-            Expr::Try(_) => diag(
-                "`?` is only valid in let position — `let x = expr?`",
-                l,
-                c,
-            ),
+            Expr::Try(_) => diag("`?` is only valid in let position — `let x = expr?`", l, c),
             Expr::Int(n) => Ok(HT {
                 e: HE::I64(*n),
                 ty: RTy::I64,
@@ -680,6 +686,15 @@ impl Hk {
             Expr::Call(name, pos, named) => {
                 if !named.is_empty() {
                     return diag("host calls are positional — no named args", l, c);
+                }
+                // `verify(e)` — the det attestation intrinsic: zero-cost
+                // elision to `e`; the provenance pass treats the result
+                // as det. The programmer asserts the value was checked.
+                if name == "verify" {
+                    if pos.len() != 1 {
+                        return diag("verify takes exactly one arg", l, c);
+                    }
+                    return self.expr(&pos[0], env, loops);
                 }
                 self.call(name, pos, env, loops, l, c)
             }
@@ -1832,7 +1847,7 @@ fn definitely_returns(stmts: &[HS]) -> bool {
 
 /// check the host stratum against the ane programs it can call.
 pub(crate) fn check(
-    _p: &Program,
+    p: &Program,
     hostfns: &[Sp<HFn>],
     externs: &[Sp<ExternFn>],
     structs: &[(String, Vec<(String, HTy)>)],
@@ -2222,6 +2237,203 @@ pub(crate) fn check(
         }
     }
 
+    // ---- Determinism flow: `det` param qualifiers --------------------
+    // A `det`-marked param refuses stoch-provenance values — sampled
+    // output cannot reach deterministic sinks without crossing `verify`.
+    {
+        use crate::ast::{Expr, Stmt};
+        let name_idx: HashMap<&str, usize> = hk
+            .fndecl
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
+        let det_params: Vec<Vec<usize>> = hk
+            .fndecl
+            .iter()
+            .map(|f| {
+                f.args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, t))| matches!(t.v, crate::ast::HTy::Det(_)))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .collect();
+        // prov(e, vars): does this expression's value derive from stoch?
+        fn prov(
+            e: &Expr,
+            vars: &HashMap<String, bool>,
+            name_idx: &HashMap<&str, usize>,
+            is_stoch: &[Option<(String, usize, usize)>],
+            det_params: &[Vec<usize>],
+            fnames: &[String],
+        ) -> CResult<bool> {
+            Ok(match e {
+                Expr::Lit(_) | Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => false,
+                Expr::Ident(n) => vars.get(n.as_str()).copied().unwrap_or(false),
+                Expr::VecLit(es) => es
+                    .iter()
+                    .map(|x| prov(&x.v, vars, name_idx, is_stoch, det_params, fnames))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .any(|b| b),
+                Expr::MapLit(kvs) => {
+                    let mut s = false;
+                    for (k, v) in kvs {
+                        s = s
+                            || prov(&k.v, vars, name_idx, is_stoch, det_params, fnames)?
+                            || prov(&v.v, vars, name_idx, is_stoch, det_params, fnames)?;
+                    }
+                    s
+                }
+                Expr::StructLit(_, fs) => fs
+                    .iter()
+                    .map(|(_, x)| prov(&x.v, vars, name_idx, is_stoch, det_params, fnames))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .any(|b| b),
+                Expr::Unary(_, x) | Expr::Transpose(x) | Expr::Try(x) => {
+                    prov(&x.v, vars, name_idx, is_stoch, det_params, fnames)?
+                }
+                Expr::Bin(_, a, b) => {
+                    prov(&a.v, vars, name_idx, is_stoch, det_params, fnames)?
+                        || prov(&b.v, vars, name_idx, is_stoch, det_params, fnames)?
+                }
+                Expr::Index(b, idxs) => {
+                    let mut s = prov(&b.v, vars, name_idx, is_stoch, det_params, fnames)?;
+                    for i in idxs {
+                        match &i.v {
+                            crate::ast::Index::Expr(ie) => {
+                                s = s || prov(&ie.v, vars, name_idx, is_stoch, det_params, fnames)?
+                            }
+                            crate::ast::Index::Range(lo, hi) => {
+                                if let Some(x) = lo {
+                                    s = s
+                                        || prov(
+                                            &x.v, vars, name_idx, is_stoch, det_params, fnames,
+                                        )?;
+                                }
+                                if let Some(x) = hi {
+                                    s = s
+                                        || prov(
+                                            &x.v, vars, name_idx, is_stoch, det_params, fnames,
+                                        )?;
+                                }
+                            }
+                        }
+                    }
+                    s
+                }
+                Expr::Field(b, _) => prov(&b.v, vars, name_idx, is_stoch, det_params, fnames)?,
+                Expr::Call(n, args, named) => {
+                    if n == "verify" {
+                        // attestation: the programmer asserts the value was
+                        // verified — the one sanctioned det bridge.
+                        false
+                    } else {
+                        let mut s = name_idx
+                            .get(n.as_str())
+                            .map(|&ci| is_stoch[ci].is_some())
+                            .unwrap_or(false);
+                        for (j, a) in args.iter().enumerate() {
+                            let ap = prov(&a.v, vars, name_idx, is_stoch, det_params, fnames)?;
+                            s = s || ap;
+                            if ap {
+                                if let Some(&ci) = name_idx.get(n.as_str()) {
+                                    if det_params[ci].contains(&j) {
+                                        return diag(
+                                            format!(
+                                                "stoch value into `det` param of `{}` — route it through verify() or a det source",
+                                                fnames[ci]
+                                            ),
+                                            a.line,
+                                            a.col,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        for (_, a) in named {
+                            s = s || prov(&a.v, vars, name_idx, is_stoch, det_params, fnames)?;
+                        }
+                        s
+                    }
+                }
+            })
+        }
+        fn walk(
+            stmts: &[crate::ast::Sp<Stmt>],
+            vars: &mut HashMap<String, bool>,
+            name_idx: &HashMap<&str, usize>,
+            is_stoch: &[Option<(String, usize, usize)>],
+            det_params: &[Vec<usize>],
+            fnames: &[String],
+        ) -> CResult<()> {
+            for st in stmts {
+                let check = |e: &Expr, vars: &HashMap<String, bool>| -> CResult<()> {
+                    prov(e, vars, name_idx, is_stoch, det_params, fnames).map(|_| ())
+                };
+                match &st.v {
+                    Stmt::Let { name, expr, .. } => {
+                        check(&expr.v, vars)?;
+                        let p = prov(&expr.v, vars, name_idx, is_stoch, det_params, fnames)?;
+                        vars.insert(name.v.clone(), p);
+                    }
+                    Stmt::Assign { name, expr, .. } => {
+                        let p = prov(&expr.v, vars, name_idx, is_stoch, det_params, fnames)?;
+                        vars.insert(name.v.clone(), p);
+                    }
+                    Stmt::Store { target, expr, .. } => {
+                        check(&target.v, vars)?;
+                        check(&expr.v, vars)?;
+                    }
+                    Stmt::If { cond, then, els } => {
+                        check(&cond.v, vars)?;
+                        walk(then, vars, name_idx, is_stoch, det_params, fnames)?;
+                        walk(els, vars, name_idx, is_stoch, det_params, fnames)?;
+                    }
+                    Stmt::Match { expr, arms } => {
+                        check(&expr.v, vars)?;
+                        for (_, body) in arms {
+                            walk(body, vars, name_idx, is_stoch, det_params, fnames)?;
+                        }
+                    }
+                    Stmt::While { cond, body } => {
+                        check(&cond.v, vars)?;
+                        walk(body, vars, name_idx, is_stoch, det_params, fnames)?;
+                    }
+                    Stmt::For { var, lo, hi, body } => {
+                        check(&lo.v, vars)?;
+                        check(&hi.v, vars)?;
+                        vars.insert(var.v.clone(), false);
+                        walk(body, vars, name_idx, is_stoch, det_params, fnames)?;
+                    }
+                    Stmt::Return(Some(e)) | Stmt::Expr(e) => {
+                        check(&e.v, vars)?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        let fnames: Vec<String> = hk.fndecl.iter().map(|f| f.name.clone()).collect();
+        for f in &hk.fndecl {
+            let mut vars: HashMap<String, bool> = HashMap::new();
+            for (an, _) in &f.args {
+                vars.insert(an.v.clone(), false);
+            }
+            walk(
+                &f.body,
+                &mut vars,
+                &name_idx,
+                &is_stoch,
+                &det_params,
+                &fnames,
+            )?;
+        }
+    }
+
     let top_caps: HashSet<String> = declared_caps.iter().map(|c| norm_cap(c)).collect();
     for i in 0..nfns {
         let f = &hk.fndecl[i];
@@ -2304,6 +2516,18 @@ pub(crate) fn check(
     }
 
     let entry = hk.fns.get("main").copied().map(|i| i as usize);
+    let mut treaties = HashMap::new();
+    for d in &p.decls {
+        if let Decl::Treaty { name, allow, deny } = d {
+            treaties.insert(
+                name.v.clone(),
+                (
+                    allow.iter().map(|a| a.v.clone()).collect(),
+                    deny.iter().map(|a| a.v.clone()).collect(),
+                ),
+            );
+        }
+    }
     Ok(HProgram {
         fns,
         externs: hk.externs,
@@ -2311,6 +2535,7 @@ pub(crate) fn check(
         enums: hk.enums,
         globals: hk.glist,
         entry,
+        treaties,
     })
 }
 
@@ -2324,7 +2549,11 @@ fn resolve_ty_pub(ty: &Ty) -> CResult<CTy> {
         }
     }
     if let Some(v) = &ty.dt_var {
-        return diag(format!("dtype param {v} only valid inside generic fns"), 0, 0);
+        return diag(
+            format!("dtype param {v} only valid inside generic fns"),
+            0,
+            0,
+        );
     }
     Ok(CTy { dt: ty.dt, dims })
 }

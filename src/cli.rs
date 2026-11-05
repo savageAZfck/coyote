@@ -186,6 +186,7 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                             .collect(),
                         states: out.states,
                         param_outs: out.param_outs,
+                        adam_lrs: Vec::new(),
                         state_outs: out.state_outs,
                         output: out.output,
                     });
@@ -226,6 +227,7 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                         .collect(),
                     states: out.states,
                     param_outs: out.param_outs,
+                    adam_lrs: out.adam_lrs,
                     state_outs: out.state_outs,
                     output: out.output,
                 });

@@ -245,6 +245,43 @@ pub fn load_vm(
     for (name, tp) in &checked.ane {
         let dir2 = out_dir.join(name);
         let t0 = std::time::Instant::now();
+        if tp.site != ast::Site::Local {
+            // remote-site strata — `mesh fn` / `pcc fn` emit a dispatch
+            // manifest and load a wire-dispatching executor.
+            let se = backend::site_backend_for(tp.site)?;
+            let out = se.emit(&src, name, tp, &dir2)?;
+            let backend = if use_cpu {
+                vm::ProgBackend::Cpu(tp.clone())
+            } else {
+                let rt = se
+                    .load(tp, name, &out, &dir2)
+                    .map_err(|e| format!("site load ({name}): {e}"))?;
+                if !quiet {
+                    println!(
+                        "✓ {name} — {} site  (emit {:.1}s)",
+                        tp.site.name(),
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+                vm::ProgBackend::Ext(rt)
+            };
+            progs.push(vm::AneProg {
+                name: name.clone(),
+                backend,
+                ins: out.inputs,
+                trainable: out
+                    .trainable
+                    .into_iter()
+                    .map(|(p, port, ty, _)| (p, port, ty))
+                    .collect(),
+                states: out.states,
+                param_outs: out.param_outs,
+                adam_lrs: Vec::new(),
+                state_outs: out.state_outs,
+                output: out.output,
+            });
+            continue;
+        }
         if tp.target != ast::Target::Ane {
             let be = backend::backend_for(tp.target)?;
             let out = be.emit(&src, name, tp, &dir2)?;
@@ -274,6 +311,7 @@ pub fn load_vm(
                     .collect(),
                 states: out.states,
                 param_outs: out.param_outs,
+                adam_lrs: Vec::new(),
                 state_outs: out.state_outs,
                 output: out.output,
             });
@@ -318,6 +356,7 @@ pub fn load_vm(
                 .collect(),
             states: out.states,
             param_outs: out.param_outs,
+            adam_lrs: out.adam_lrs,
             state_outs: out.state_outs,
             output: out.output,
         });

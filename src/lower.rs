@@ -8,7 +8,7 @@
 use crate::ast::{AssignOp, BinOp, DType, IoDir, Qual, UnOp};
 use crate::typeck::{CTy, TExpr, TIndex, TParam, TProgram, TStmt, Typed};
 use crate::{diag, CResult, Diag};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 /// Blockwise symmetric Q4 quantization (`block = 32`, $q \in [-7, 7]$,
@@ -99,6 +99,21 @@ struct Lo {
     grads: HashMap<String, V>,
     /// let-bound names → defining expr (tape for backward continuation)
     tape: HashMap<String, crate::typeck::Typed>,
+    /// memoized `needs_grad` answers per tape-bound ident — shared
+    /// subexpressions resolve once, not once per path
+    ng_memo: HashMap<String, bool>,
+    /// names currently on the needs_grad recursion stack — tape defs
+    /// can self-alias (`let x = <expr mentioning x>` shadowing), which
+    /// would otherwise recurse forever.
+    ng_visiting: HashSet<String>,
+    /// merged adjoint mil-name per taped let — contributions are
+    /// `add`-accumulated so each let-def walks once, not once per edge.
+    adjs: HashMap<String, String>,
+    /// tape insertion order — let's are emitted in program order, so
+    /// reversed it is the backward topological order.
+    tape_order: Vec<String>,
+    /// active differentiation target inside `grad_scaled`
+    cur_wrt: String,
     in_grad: bool,
     scalar_blobs: usize,
     n: usize,
@@ -572,6 +587,7 @@ impl Lo {
                     if let TStmt::Let { name, expr } = s {
                         let v = self.expr(expr)?;
                         self.tape.insert(name.clone(), expr.clone());
+                        self.tape_order.push(name.clone());
                         self.bind(name, v);
                     } else {
                         self.stmt(s)?;
@@ -877,9 +893,14 @@ impl Lo {
             }
             "rmsnorm" => {
                 let x = arg(0, &vals, self)?;
-                // w: param gamma → vector const, or any named value
+                // w: non-trainable param gamma → vector const; trainable
+                // params and expressions use their runtime value.
                 let w = match &vals[1] {
-                    V::Named { name, .. } if self.params.contains_key(name) => {
+                    V::Named { name, .. }
+                        if self.params.get(name).map(|(q, _, _)| *q)
+                            != Some(Qual::Trainable)
+                            && self.params.contains_key(name) =>
+                    {
                         self.param_ref(name, "vec")?.0
                     }
                     v => self.named(v.clone(), &args[1].ty)?.0,
@@ -912,19 +933,41 @@ impl Lo {
         }
     }
 
-    /// does this subtree reach a param (through idents and let-defs)?
-    fn needs_grad(&self, e: &Typed, depth: usize) -> bool {
-        if depth > 32 {
+    /// does this subtree reach the active `wrt` param (through idents and let-defs)?
+    fn needs_grad(&mut self, e: &Typed, depth: usize) -> bool {
+        // tape defs are acyclic, so recursion always terminates — the
+        // guard only exists for pathological inputs. 32 truncated real
+        // transformer graphs mid-path, silently dropping gradient terms.
+        if depth > 100_000 {
             return false;
         }
         match &e.e {
             TExpr::Ident(s) => {
-                self.params.contains_key(s)
-                    || self
-                        .tape
-                        .get(s)
-                        .map(|t| self.needs_grad(t, depth + 1))
-                        .unwrap_or(false)
+                if s == &self.cur_wrt {
+                    return true;
+                }
+                if let Some(&b) = self.ng_memo.get(s) {
+                    return b;
+                }
+                if !self.ng_visiting.insert(s.clone()) {
+                    // self-referential tape def (shadowed/arg alias) —
+                    // the alias is opaque to the tape; treat as leaf.
+                    return false;
+                }
+                let b = match self.tape.get(s).cloned() {
+                    Some(t) => self.needs_grad(&t, depth + 1),
+                    None => false,
+                };
+                self.ng_visiting.remove(s);
+                // the answer for an ident is intrinsic to its def
+                // subtree — cache both polarities. Negatives were the
+                // killer at scale: most nodes never reach `wrt`, and
+                // re-walking those subtrees per query made lowering
+                // exponential on ~30k-node train tapes. The 100k depth
+                // cap stays a backstop; real tapes are ~30k deep max
+                // and `ng_visiting` already guards cycles.
+                self.ng_memo.insert(s.clone(), b);
+                b
             }
             TExpr::Unary(_, a) | TExpr::Transpose(a) => self.needs_grad(a, depth + 1),
             TExpr::Bin(_, a, b) => self.needs_grad(a, depth + 1) || self.needs_grad(b, depth + 1),
@@ -965,6 +1008,11 @@ impl Lo {
         self.env.push(HashMap::new());
         self.tape.clear();
         self.grads.clear();
+        self.ng_memo.clear();
+        self.ng_visiting.clear();
+        self.adjs.clear();
+        self.tape_order.clear();
+        self.cur_wrt = wrt.to_string();
         self.in_grad = true;
         // forward: emit the loss block's lets, recording each name's
         // defining expr on the tape for backward continuation.
@@ -974,6 +1022,7 @@ impl Lo {
                     if let TStmt::Let { name, expr } = s {
                         let v = self.expr(expr)?;
                         self.tape.insert(name.clone(), expr.clone());
+                        self.tape_order.push(name.clone());
                         self.bind(name, v);
                     } else {
                         self.stmt(s)?;
@@ -997,6 +1046,30 @@ impl Lo {
                 let seed = self.emit_op(&args[0].ty, format!("mul(x = {sn}, y = {scale})"), pt);
                 let seedn = self.named(seed.clone(), &args[0].ty)?.0;
                 self.back(&args[0], &seedn)?;
+                // drain merged adjoints in reverse def order: every
+                // contributor of a let is defined after it, so all of
+                // a let's adjoint edges are merged before its def is
+                // walked — each def walks at most once, and only if
+                // it actually reaches `cur_wrt`.
+                let order: Vec<String> = self.tape_order.iter().rev().cloned().collect();
+                for name in order {
+                    if let Some(adjn) = self.adjs.remove(&name) {
+                        if let Some(def) = self.tape.get(&name).cloned() {
+                            if self.needs_grad(&def, 0) {
+                                // defs is keyed by Typed pointer — each
+                                // `.cloned()` def is dropped after its walk
+                                // and the allocator reuses the addresses, so
+                                // a stale ptr→tensor-name entry would wire
+                                // the wrong forward value into this def's
+                                // backward. Def subtrees are independent
+                                // clones: nothing cached under one can be
+                                // shared with the next.
+                                self.defs.clear();
+                                self.back(&def, &adjn)?;
+                            }
+                        }
+                    }
+                }
             }
             _ => return diag("grad: v1 losses must end in mse(pred, target)", 0, 0),
         }
@@ -1006,9 +1079,33 @@ impl Lo {
             col: 0,
         })?;
         self.in_grad = false;
+        self.cur_wrt.clear();
         self.tape.clear();
         self.env.pop();
         Ok(out)
+    }
+
+    /// merge an adjoint contribution into a taped let's accumulated
+    /// adjoint — first contribution stores directly, later ones emit
+    /// an `add` so the def is walked once against the summed adjoint.
+    fn accum_adj(&mut self, name: &str, adj: String, ty: &CTy) -> CResult<()> {
+        match self.adjs.remove(name) {
+            None => {
+                self.adjs.insert(name.to_string(), adj);
+                Ok(())
+            }
+            Some(prev) => {
+                let sum = if ty.dims.len() == 2 {
+                    let shape = format!("[1, {}, 1, {}]", ty.dims[1], ty.dims[0]);
+                    self.emit_shaped(&shape, format!("add(x = {prev}, y = {adj})"), ty, false)
+                } else {
+                    self.emit_op(ty, format!("add(x = {prev}, y = {adj})"), false)
+                };
+                let sn = self.named(sum, ty)?.0;
+                self.adjs.insert(name.to_string(), sn);
+                Ok(())
+            }
+        }
     }
 
     /// accumulate an adjoint contribution for a param.
@@ -1048,31 +1145,50 @@ impl Lo {
         };
         match &e.e {
             TExpr::Ident(s) => {
-                if self.params.contains_key(s) {
+                if s == &self.cur_wrt {
                     self.acc(s, adjv())?;
-                } else if let Some(def) = self.tape.get(s).cloned() {
-                    self.back(&def, adj)?;
+                } else if self.tape.contains_key(s) && self.needs_grad(e, 0) {
+                    // merge: the adjoint contribution is accumulated
+                    // into the let's merged adjoint — the def itself is
+                    // walked once when the drain reaches it in reverse
+                    // def order.
+                    let ty = self
+                        .tape
+                        .get(s)
+                        .map(|t| t.ty.clone())
+                        .unwrap_or(adjty.clone());
+                    self.accum_adj(s, adj.to_string(), &ty)?;
                 }
             }
             TExpr::Lit(_) | TExpr::Int(_) => {}
             TExpr::Unary(UnOp::Neg, a) => {
-                let neg = self.bcast(-1.0, adjty.numel().max(1) as usize);
-                let v = self.emit_op(&adjty, format!("mul(x = {adj}, y = {neg})"), false);
-                let vn = self.named(v, &adjty)?.0;
-                self.back(a, &vn)?;
+                if self.needs_grad(a, 0) {
+                    let neg = self.bcast(-1.0, adjty.numel().max(1) as usize);
+                    let v = self.emit_op(&adjty, format!("mul(x = {adj}, y = {neg})"), false);
+                    let vn = self.named(v, &adjty)?.0;
+                    self.back(a, &vn)?;
+                }
             }
             TExpr::Unary(UnOp::Not, _) => return diag("back: `!` is host-stratum", 0, 0),
             TExpr::Bin(op, a, b) => match op {
                 BinOp::Add => {
-                    self.back(a, adj)?;
-                    self.back(b, adj)?;
+                    if self.needs_grad(a, 0) {
+                        self.back(a, adj)?;
+                    }
+                    if self.needs_grad(b, 0) {
+                        self.back(b, adj)?;
+                    }
                 }
                 BinOp::Sub => {
-                    self.back(a, adj)?;
-                    let neg = self.bcast(-1.0, adjty.numel().max(1) as usize);
-                    let v = self.emit_op(&adjty, format!("mul(x = {adj}, y = {neg})"), false);
-                    let vn = self.named(v, &adjty)?.0;
-                    self.back(b, &vn)?;
+                    if self.needs_grad(a, 0) {
+                        self.back(a, adj)?;
+                    }
+                    if self.needs_grad(b, 0) {
+                        let neg = self.bcast(-1.0, adjty.numel().max(1) as usize);
+                        let v = self.emit_op(&adjty, format!("mul(x = {adj}, y = {neg})"), false);
+                        let vn = self.named(v, &adjty)?.0;
+                        self.back(b, &vn)?;
+                    }
                 }
                 BinOp::Mul => {
                     if self.needs_grad(a, 0) {
@@ -1136,36 +1252,94 @@ impl Lo {
                     let k = a.ty.dims[0];
                     let n = b.ty.dims[1];
                     if self.needs_grad(a, 0) {
-                        // dx = adj @ Wᵀ — transpose_x matvec (attn·V route)
-                        let wn = self.w_name(b)?;
+                        // dx = adj @ Wᵀ — adjoint matvec. The rhs name
+                        // resolves the same places forward does (params,
+                        // param.T, state fields); the transpose flag swaps
+                        // x↔y versus the forward use — a @ Field.T forward
+                        // becomes adj @ Field, and vice versa.
+                        let (wn, flag) = match &b.e {
+                            TExpr::Field(base, f) => {
+                                let port = match &base.e {
+                                    TExpr::Ident(s) => {
+                                        self.state_ports.get(&format!("{s}.{f}")).cloned()
+                                    }
+                                    _ => None,
+                                }
+                                .ok_or(())
+                                .map_err(|_| Diag {
+                                    msg: "matmul rhs state field not found".into(),
+                                    line: 0,
+                                    col: 0,
+                                })?;
+                                (port, "transpose_y")
+                            }
+                            TExpr::Transpose(inner) => match &inner.e {
+                                TExpr::Field(base, f) => {
+                                    let port = match &base.e {
+                                        TExpr::Ident(s) => {
+                                            self.state_ports.get(&format!("{s}.{f}")).cloned()
+                                        }
+                                        _ => None,
+                                    }
+                                    .ok_or(())
+                                    .map_err(|_| Diag {
+                                        msg: "matmul rhs state field not found".into(),
+                                        line: 0,
+                                        col: 0,
+                                    })?;
+                                    (port, "transpose_x")
+                                }
+                                // non-trainable param: static const matvec route
+                                TExpr::Ident(s)
+                                    if self.params.get(s).map(|(q, _, _)| *q)
+                                        != Some(Qual::Trainable)
+                                        && self.params.contains_key(s) =>
+                                {
+                                    (self.param_ref(s, "mat")?.0, "transpose_y")
+                                }
+                                _ => (self.w_name(b)?, "transpose_x"),
+                            },
+                            // non-trainable param: static const mat_t route;
+                            // trainable param: runtime tensor attn·V route.
+                            TExpr::Ident(s)
+                                if self.params.get(s).map(|(q, _, _)| *q)
+                                    != Some(Qual::Trainable)
+                                    && self.params.contains_key(s) =>
+                            {
+                                (self.param_ref(s, "mat_t")?.0, "transpose_y")
+                            }
+                            _ => (self.w_name(b)?, "transpose_x"),
+                        };
                         let dty = CTy {
                             dt: DType::F16,
                             dims: vec![k],
                         };
                         let v = self.emit_shaped(
                             &format!("[1, 1, 1, {k}]"),
-                            format!("matmul(x = {adj}, y = {wn}, transpose_x = __bt)"),
+                            format!("matmul(x = {adj}, y = {wn}, {flag} = __bt)"),
                             &dty,
                             false,
                         );
                         let vn = self.named(v, &dty)?.0;
                         self.back(a, &vn)?;
                     }
-                    // dW = outer(adj, a) — transpose_x outer (packed route)
+                    // dW = outer(adj, a) — only emitted for the active `wrt`
                     let pname = self.matmul_param(b)?;
                     if let Some(p) = pname {
-                        let (an, _) = self.fwd_name(a)?;
-                        let dty = CTy {
-                            dt: DType::F16,
-                            dims: vec![k, n],
-                        };
-                        let v = self.emit_shaped(
-                            &format!("[1, {n}, 1, {k}]"),
-                            format!("matmul(x = {adj}, y = {an}, transpose_x = __bt)"),
-                            &dty,
-                            false,
-                        );
-                        self.acc(&p, v)?;
+                        if p == self.cur_wrt {
+                            let (an, _) = self.fwd_name(a)?;
+                            let dty = CTy {
+                                dt: DType::F16,
+                                dims: vec![k, n],
+                            };
+                            let v = self.emit_shaped(
+                                &format!("[1, {n}, 1, {k}]"),
+                                format!("matmul(x = {adj}, y = {an}, transpose_x = __bt)"),
+                                &dty,
+                                false,
+                            );
+                            self.acc(&p, v)?;
+                        }
                     }
                 }
                 _ => {}
@@ -1362,7 +1536,11 @@ impl Lo {
                         let (xn, _) = self.fwd_name(x)?;
                         let w_arg = &args[1];
                         let wn = match &w_arg.e {
-                            TExpr::Ident(s) if self.params.contains_key(s) => {
+                            TExpr::Ident(s)
+                                if self.params.get(s).map(|(q, _, _)| *q)
+                                    != Some(Qual::Trainable)
+                                    && self.params.contains_key(s) =>
+                            {
                                 self.param_ref(s, "vec")?.0
                             }
                             _ => self.fwd_name(w_arg)?.0,
@@ -1373,7 +1551,7 @@ impl Lo {
                             .0;
                         let rvec = format!("{xhat}_rvec");
                         if let TExpr::Ident(wp) = &w_arg.e {
-                            if self.params.contains_key(wp) {
+                            if wp == &self.cur_wrt {
                                 let dw = self.emit_op(
                                     &dty,
                                     format!("mul(x = {adj}, y = {xhat})"),
@@ -1841,6 +2019,11 @@ pub fn lower(p: &TProgram, _out_dir: &str, source_sha: &str) -> CResult<MilOut> 
         state_outs: Vec::new(),
         grads: HashMap::new(),
         tape: HashMap::new(),
+        ng_memo: HashMap::new(),
+        ng_visiting: HashSet::new(),
+        adjs: HashMap::new(),
+        tape_order: Vec::new(),
+        cur_wrt: String::new(),
         in_grad: false,
         scalar_blobs: 0,
         n: 0,

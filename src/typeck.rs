@@ -136,6 +136,9 @@ pub struct TProgram {
     pub states: Vec<(String, String, CTy)>,
     /// compute stratum this program lowers to.
     pub target: crate::ast::Target,
+    /// execution site — `Local` runs here, `Mesh`/`Pcc` dispatch over
+    /// the treaty wire to a registered site backend.
+    pub site: crate::ast::Site,
 }
 
 type Env = HashMap<String, CTy>;
@@ -205,9 +208,7 @@ fn resolve_ty(dims: &Dims, ty: &Ty, l: usize, c: usize) -> CResult<CTy> {
             Dim::Lit(n) => out.push(*n),
             Dim::Name(s) => match dims.get(s) {
                 Some(Gen::Dim(v)) => out.push(*v),
-                Some(Gen::Dt(_)) => {
-                    return diag(format!("{s} is a dtype param, not a dim"), l, c)
-                }
+                Some(Gen::Dt(_)) => return diag(format!("{s} is a dtype param, not a dim"), l, c),
                 None => {
                     return diag(format!("unbound dim {s}"), l, c);
                 }
@@ -1366,6 +1367,20 @@ pub(crate) fn collect(
     let mut structs = Vec::new();
     let mut enums = Vec::new();
     let mut tables = Vec::new();
+    // provenance keys must be known before params cite them — a
+    // `lineage k` clause may only reference a declared key.
+    let prov_keys: std::collections::HashSet<String> = p
+        .decls
+        .iter()
+        .filter_map(|d| {
+            if let Decl::Provenance(kvs) = d {
+                Some(kvs.iter().map(|(k, _)| k.v.clone()))
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
     for d in &p.decls {
         match d {
             Decl::Import { .. } => {}
@@ -1379,7 +1394,20 @@ pub(crate) fn collect(
                 qual,
                 ty,
                 src,
+                lineage,
             } => {
+                if let Some(k) = lineage {
+                    if !prov_keys.contains(&k.v) {
+                        return diag(
+                            format!(
+                                "param `{}` claims lineage `{}` — not declared in `provenance {{ }}`",
+                                name.v, k.v
+                            ),
+                            k.line,
+                            k.col,
+                        );
+                    }
+                }
                 ck.params.insert(
                     name.v.clone(),
                     (*qual, ty.v.clone(), src.as_ref().map(|s| s.v.clone())),
@@ -1428,6 +1456,7 @@ pub(crate) fn collect(
             Decl::HostFn(f) => {
                 hostfns.push(f.clone());
             }
+            Decl::Treaty { .. } => {}
             Decl::Table { name, ty, src } => {
                 tables.push((
                     name.v.clone(),
@@ -1543,6 +1572,7 @@ impl Ck {
             ret,
             states,
             target: f.v.target,
+            site: f.v.site,
         })
     }
 }
@@ -1584,15 +1614,13 @@ pub fn check_all(p: &Program) -> CResult<Checked> {
         if !f.v.dims.is_empty() {
             continue; // inline-only — generic fns can't be programs
         }
-        let has_generic_ty =
-            f.v.args
-                .iter()
-                .map(|(_, t)| t)
-                .chain(f.v.ret.iter())
-                .any(|t| {
-                    t.v.dt_var.is_some()
-                        || t.v.dims.iter().any(|d| matches!(d, Dim::Name(_)))
-                });
+        let has_generic_ty = f
+            .v
+            .args
+            .iter()
+            .map(|(_, t)| t)
+            .chain(f.v.ret.iter())
+            .any(|t| t.v.dt_var.is_some() || t.v.dims.iter().any(|d| matches!(d, Dim::Name(_))));
         if has_generic_ty {
             continue;
         }
@@ -1711,6 +1739,7 @@ pub fn check(p: &Program) -> CResult<TProgram> {
         arg_ports,
         body,
         target: main.v.target,
+        site: main.v.site,
         ret,
         states,
     })

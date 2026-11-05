@@ -184,6 +184,9 @@ pub enum Val {
         id: u64,
         epoch: u64,
     },
+    /// treaty-bound peer handle — index into the distribution's peer
+    /// table (coyote-apple `peer_*` externs).
+    Peer(u32),
 }
 
 impl Val {
@@ -233,6 +236,7 @@ pub struct AneProg {
     /// state fields: (key, port, ty)
     pub states: Vec<(String, String, CTy)>,
     pub param_outs: Vec<(String, String, CTy)>,
+    pub adam_lrs: Vec<(String, f64)>,
     pub state_outs: Vec<(String, String, CTy)>,
     pub output: (String, CTy),
 }
@@ -759,6 +763,10 @@ pub struct Vm {
     /// matrix params, redo a pointless [K,N]→[N,K] transpose).
     /// Rebinds land on fresh handles, so identity is enough.
     staged_ext: HashMap<(usize, String), u32>,
+    /// param → (step, m, v) for host-side adam updates on readback grads
+    adam_state: HashMap<String, (usize, Vec<f32>, Vec<f32>)>,
+    /// currently resident ANE program index — evicted on program switch
+    active_ane: Option<usize>,
     progs: Vec<AneProg>,
     extern_fns: HashMap<String, ExternCb>,
     witness: Vec<Wit>,
@@ -858,6 +866,8 @@ impl Vm {
             base_tensors,
             gtensor,
             staged_ext: HashMap::new(),
+            adam_state: HashMap::new(),
+            active_ane: None,
             progs,
             extern_fns: HashMap::new(),
             witness: Vec::new(),
@@ -1219,6 +1229,12 @@ impl Vm {
         f: impl FnMut(&[Val]) -> Result<Val, String> + 'static,
     ) {
         self.extern_fns.insert(name.to_string(), Box::new(f));
+    }
+
+    /// Declared `treaty` terms from the program — distributions bind
+    /// `peer_*` externs against this table.
+    pub fn treaties(&self) -> &HashMap<String, (Vec<String>, Vec<String>)> {
+        &self.h.treaties
     }
 
     /// Invoke any `host fn` or `reflex` by name with `args` and run to
@@ -1769,6 +1785,7 @@ impl Vm {
             Val::T(_) => "tensor",
             Val::Ane(_) => "ane",
             Val::Tok { .. } => "token",
+            Val::Peer(_) => "peer",
         }
     }
 
@@ -1844,6 +1861,7 @@ impl Vm {
             }
             Val::Ane(i) => format!("<ane {}>", self.progs[*i as usize].name),
             Val::Tok { id, epoch } => format!("token#{id:016x}:e{epoch}"),
+            Val::Peer(h) => format!("<peer#{h}>"),
         }
     }
 
@@ -1948,9 +1966,15 @@ impl Vm {
                 staged_now.push((port.clone(), h));
             }
         }
-        let release_after = self.progs.len() > 2;
+        if let Some(prev) = self.active_ane {
+            if prev != pi {
+                if let ProgBackend::Ane(rt) = &mut self.progs[prev].backend {
+                    rt.release_all();
+                }
+            }
+        }
         // ---- drive the program ----
-        let (odata, oty, pouts, souts) = {
+        let (odata, oty, pouts, souts, remote_wit) = {
             let prog = &mut self.progs[pi];
             let (oname, oty) = prog.output.clone();
             match &mut prog.backend {
@@ -1973,14 +1997,19 @@ impl Vm {
                             .ok_or_else(|| format!("update node {mname} missing"))?;
                         let desc = rt.out_desc(idx);
                         let raw = rt.output(idx).to_vec();
-                        let (n, k) = (ty.dims[1] as usize, ty.dims[0] as usize);
-                        let surf = read_surface_dims(&raw, &desc, &[n, k]);
-                        let mut host = vec![0f32; surf.len()];
-                        for a in 0..n {
-                            for b in 0..k {
-                                host[b * n + a] = surf[a * k + b];
+                        let host = if ty.dims.len() == 2 {
+                            let (n, k) = (ty.dims[1] as usize, ty.dims[0] as usize);
+                            let surf = read_surface_dims(&raw, &desc, &[n, k]);
+                            let mut h = vec![0f32; surf.len()];
+                            for a in 0..n {
+                                for b in 0..k {
+                                    h[b * n + a] = surf[a * k + b];
+                                }
                             }
-                        }
+                            h
+                        } else {
+                            read_surface_dims(&raw, &desc, &dims_usize(ty))
+                        };
                         pouts.push((pname.clone(), host));
                     }
                     let mut souts = Vec::new();
@@ -1993,10 +2022,7 @@ impl Vm {
                         let surf = read_surface_dims(&raw, &desc, &dims_usize(ty));
                         souts.push((port.clone(), surf));
                     }
-                    if release_after {
-                        rt.release_all();
-                    }
-                    (odata, oty, pouts, souts)
+                    (odata, oty, pouts, souts, Vec::new())
                 }
                 ProgBackend::Cpu(tp) => {
                     let mut ev = Evaluator::new(tp);
@@ -2010,19 +2036,24 @@ impl Vm {
                     for (name, vals) in ev.param_updates() {
                         if let Some((_, _, ty)) = prog.param_outs.iter().find(|(p, _, _)| p == name)
                         {
-                            let (n, k) = (ty.dims[1] as usize, ty.dims[0] as usize);
-                            let mut host = vec![0f32; vals.len()];
-                            for a in 0..n {
-                                for b in 0..k {
-                                    host[b * n + a] = vals[a * k + b];
+                            let host = if ty.dims.len() == 2 {
+                                let (n, k) = (ty.dims[1] as usize, ty.dims[0] as usize);
+                                let mut h = vec![0f32; vals.len()];
+                                for a in 0..n {
+                                    for b in 0..k {
+                                        h[b * n + a] = vals[a * k + b];
+                                    }
                                 }
-                            }
+                                h
+                            } else {
+                                vals.clone()
+                            };
                             pouts.push((name.clone(), host));
                         } else if prog.state_outs.iter().any(|(port, _, _)| port == name) {
                             souts.push((name.clone(), vals.clone()));
                         }
                     }
-                    (odata, oty, pouts, souts)
+                    (odata, oty, pouts, souts, Vec::new())
                 }
                 ProgBackend::Ext(rt) => {
                     // staged data is already in surface conventions —
@@ -2034,6 +2065,10 @@ impl Vm {
                     let odata = rt
                         .run(&writes)
                         .map_err(|e| format!("ext run ({}): {e}", prog.name))?;
+                    // dispatch sites return remote witness entries — the
+                    // VM lands them on its own chain below so one
+                    // computation across N nodes reads as one log.
+                    let remote_wit = rt.drain_remote();
                     // on-device updates ride back through `read` so the
                     // host store feeds them forward — param surfaces
                     // are [N,K], the host store is declared [K,N].
@@ -2065,17 +2100,36 @@ impl Vm {
                     for (p, h) in &staged_now {
                         self.staged_ext.insert((pi, p.clone()), *h);
                     }
-                    (odata, oty, pouts, souts)
+                    (odata, oty, pouts, souts, remote_wit)
                 }
             }
         };
+        if matches!(self.progs[pi].backend, ProgBackend::Ane(_)) {
+            self.active_ane = Some(pi);
+        }
+        // one computation, one ledger — remote-node witness entries land
+        // on the local hash chain in dispatch order.
+        for (tag, val) in remote_wit {
+            self.wit(&tag, &val);
+        }
         // ---- land the results in the host store ----
         self.tensors.push((oty, odata));
         let th = self.tensors.len() as u32 - 1;
         self.stack.push(Val::T(th));
         for (pname, host) in pouts {
             if let Some(&h) = self.gtensor.get(&pname) {
-                self.tensors[h as usize].1 = host;
+                if let Some(&(_, lr)) = self.progs[pi].adam_lrs.iter().find(|(p, _)| p == &pname) {
+                    let w_cur = &mut self.tensors[h as usize].1;
+                    let n = w_cur.len();
+                    let (step, m, v) = self
+                        .adam_state
+                        .entry(pname)
+                        .or_insert_with(|| (0, vec![0.0; n], vec![0.0; n]));
+                    crate::eval::adam_step(w_cur, &host, m, v, *step, lr);
+                    *step += 1;
+                } else {
+                    self.tensors[h as usize].1 = host;
+                }
             }
         }
         for (port, surf) in souts {
@@ -2695,6 +2749,12 @@ fn snap_val(
 ) {
     match v {
         Val::Unit => out.push(0),
+        // peer handles are live connections — they don't survive a
+        // snapshot; on resume they re-treaty via peer_connect.
+        Val::Peer(h) => {
+            out.push(11);
+            out.extend_from_slice(&h.to_le_bytes());
+        }
         Val::I(i) => {
             out.push(1);
             out.extend_from_slice(&i.to_le_bytes());
@@ -2883,6 +2943,12 @@ fn unsnap_val(
             let (id, np) = take64(p)?;
             let (epoch, np2) = take64(np)?;
             (Val::Tok { id, epoch }, np2)
+        }
+        11 => {
+            // peer handles are connection-scoped — a resumed peer is a
+            // dead handle until peer_connect re-treaties it.
+            let h = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+            (Val::Peer(h), p + 4)
         }
         t => return Err(format!("snap: bad val tag {t}")),
     })

@@ -87,6 +87,13 @@ pub enum HTy {
     Struct(String),
     /// `ane(t1, t2) -> r` — a first-class compiled program value.
     AneFn(Vec<HTy>, Box<HTy>),
+    /// `peer` — a treaty-bound handle to another organism. Opaque,
+    /// unordered, non-arithmetic; created by extern, checked by treaty.
+    Peer,
+    /// `det T` — determinism-qualified param type: a value with `stoch`
+    /// provenance may not enter a `det` param. Transparent for type
+    /// identity — the qualifier is a flow contract, not a new type.
+    Det(Box<HTy>),
 }
 
 /// Declared determinism mode on a host function.
@@ -139,6 +146,10 @@ pub enum Decl {
         qual: Qual,
         ty: Sp<Ty>,
         src: Option<Sp<String>>,
+        /// `lineage <key>` — cite a key from the program's `provenance`
+        /// block; checked at compile time so a weight can only carry
+        /// lineage the program itself attests.
+        lineage: Option<Sp<String>>,
     },
     /// `io x: in f16[K]` / `io y: out f16[N]` — function boundary.
     Io {
@@ -172,6 +183,14 @@ pub enum Decl {
     /// host/FFI function bound from Rust or Swift, checked under the
     /// same constitutional rules as native functions.
     ExternFn(Sp<ExternFn>),
+    /// `treaty Name { allow a, b; deny c, d; }` — the terms a peer
+    /// connection is negotiated under. Compiled into the build; a
+    /// treaty name is the handle `peer_connect` binds at runtime.
+    Treaty {
+        name: Sp<String>,
+        allow: Vec<Sp<String>>,
+        deny: Vec<Sp<String>>,
+    },
     Fn(Sp<Fn>),
     HostFn(Sp<HFn>),
 }
@@ -206,11 +225,35 @@ impl Target {
     }
 }
 
+/// Where a tensor `fn` executes: `Local` on this machine's silicon,
+/// `Mesh` across treaty-verified peers on the federation wire,
+/// `Pcc` inside an attested remote enclave. The site is orthogonal
+/// to the compute stratum — `pcc enc fn` runs the ciphertext engine
+/// on attested remote hardware, `mesh fn` runs ANE math on a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Site {
+    Local,
+    Mesh,
+    Pcc,
+}
+
+impl Site {
+    pub fn name(self) -> &'static str {
+        match self {
+            Site::Local => "local",
+            Site::Mesh => "mesh",
+            Site::Pcc => "pcc",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Fn {
     pub name: String,
     /// compute stratum — `fn` is Ane, `gpu fn` is Gpu.
     pub target: Target,
+    /// execution site — bare `fn` is Local, `mesh fn`/`pcc fn` dispatch.
+    pub site: Site,
     /// generic dim names, e.g. `<M, K, N>`
     pub dims: Vec<Sp<String>>,
     pub args: Vec<(Sp<String>, Sp<Ty>)>,

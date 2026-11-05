@@ -47,6 +47,14 @@ pub trait BackendExec {
     fn read(&self, _port: &str) -> Option<Vec<f32>> {
         None
     }
+    /// Remote-witness drain — dispatch backends (mesh/pcc sites) queue
+    /// witness entries the remote node produced during `run`; the VM
+    /// pulls them after each dispatch and lands them on its own
+    /// hash-chained log, so one computation across N nodes produces
+    /// one verifiable chain.
+    fn drain_remote(&mut self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// A compute stratum: lower a typed program and produce its executor.
@@ -79,4 +87,23 @@ pub fn backend_for(target: crate::ast::Target) -> Result<Arc<dyn Backend>, Strin
     g.as_ref()
         .and_then(|m| m.get(&target).cloned())
         .ok_or_else(|| format!("no backend registered for {} programs", target.name()))
+}
+
+/// Execution-site registry — `mesh fn`/`pcc fn` programs lower through
+/// the same Backend seam but their "engine" is a wire dispatch to a
+/// remote node. Registered by the distribution, never upstream.
+static SITES: RwLock<Option<HashMap<crate::ast::Site, Arc<dyn Backend>>>> = RwLock::new(None);
+
+/// Register a dispatch backend for an execution site.
+pub fn register_site(site: crate::ast::Site, b: Arc<dyn Backend>) {
+    let mut g = SITES.write().unwrap();
+    g.get_or_insert_with(HashMap::new).insert(site, b);
+}
+
+/// Fetch the registered site backend, if any.
+pub fn site_backend_for(site: crate::ast::Site) -> Result<Arc<dyn Backend>, String> {
+    let g = SITES.read().unwrap();
+    g.as_ref()
+        .and_then(|m| m.get(&site).cloned())
+        .ok_or_else(|| format!("no site backend registered for {} programs", site.name()))
 }
