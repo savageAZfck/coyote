@@ -47,6 +47,12 @@ pub trait BackendExec {
     fn read(&self, _port: &str) -> Option<Vec<f32>> {
         None
     }
+    /// Read for checkpoint export — lazy executors may hold no device
+    /// state between dispatches, so this variant is allowed to
+    /// materialize the runtime on demand. Default: plain `read`.
+    fn read_for_export(&mut self, port: &str) -> Option<Vec<f32>> {
+        self.read(port)
+    }
     /// Remote-witness drain — dispatch backends (mesh/pcc sites) queue
     /// witness entries the remote node produced during `run`; the VM
     /// pulls them after each dispatch and lands them on its own
@@ -54,6 +60,82 @@ pub trait BackendExec {
     /// one verifiable chain.
     fn drain_remote(&mut self) -> Vec<(String, String)> {
         Vec::new()
+    }
+    /// Drop resident device state so the executor can be re-materialized
+    /// later (bounded GPU residency). Returns false when the executor
+    /// holds nothing evictable.
+    fn evict(&mut self) -> bool {
+        false
+    }
+    /// Whether the executor currently holds device resources. Lazy
+    /// executors report false until first dispatch.
+    fn resident(&self) -> bool {
+        true
+    }
+}
+
+/// Executor that defers `load` to first dispatch and supports eviction
+/// — large GPU programs share a memory-constrained device by
+/// materializing a bounded set at a time. Params survive eviction in
+/// the backend's shared arena; scratch/adjoint buffers re-derive on
+/// reload and host-mirrored state restages on next dispatch.
+pub struct LazyExec<F>
+where
+    F: FnMut() -> Result<Box<dyn BackendExec>, String>,
+{
+    load: F,
+    inner: Option<Box<dyn BackendExec>>,
+}
+
+impl<F> LazyExec<F>
+where
+    F: FnMut() -> Result<Box<dyn BackendExec>, String>,
+{
+    pub fn new(load: F) -> Self {
+        Self { load, inner: None }
+    }
+
+    fn ensure(&mut self) -> Result<&mut Box<dyn BackendExec>, String> {
+        if self.inner.is_none() {
+            self.inner = Some((self.load)()?);
+        }
+        Ok(self.inner.as_mut().unwrap())
+    }
+}
+
+impl<F> BackendExec for LazyExec<F>
+where
+    F: FnMut() -> Result<Box<dyn BackendExec>, String>,
+{
+    fn run(&mut self, writes: &[(String, Vec<f32>)]) -> Result<Vec<f32>, String> {
+        self.ensure()?.run(writes)
+    }
+    fn device_ms(&self) -> Option<f64> {
+        self.inner.as_ref().and_then(|r| r.device_ms())
+    }
+    fn read(&self, port: &str) -> Option<Vec<f32>> {
+        self.inner.as_ref().and_then(|r| r.read(port))
+    }
+    fn read_for_export(&mut self, port: &str) -> Option<Vec<f32>> {
+        // export must see device-trained values even after eviction —
+        // materialize, read, and let the caller evict again.
+        self.ensure().ok()?.read(port)
+    }
+    fn drain_remote(&mut self) -> Vec<(String, String)> {
+        self.inner
+            .as_mut()
+            .map(|r| r.drain_remote())
+            .unwrap_or_default()
+    }
+    fn evict(&mut self) -> bool {
+        if self.inner.take().is_some() {
+            true
+        } else {
+            false
+        }
+    }
+    fn resident(&self) -> bool {
+        self.inner.is_some()
     }
 }
 

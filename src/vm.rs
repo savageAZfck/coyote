@@ -775,6 +775,14 @@ pub struct Vm {
     pending_params: HashMap<u32, (String, Vec<usize>, Option<String>)>,
     /// currently resident ANE program index — evicted on program switch
     active_ane: Option<usize>,
+    /// max simultaneously-resident ext (gpu) executors — 0 = unbounded.
+    /// `CYO_GPU_RESIDENT=N` enables lazy load + LRU eviction so a model
+    /// with more gpu programs than fit in device memory can still run:
+    /// params persist in the backend arena, scratch re-derives.
+    gpu_capacity: usize,
+    /// ext program indices in dispatch order, least-recent first —
+    /// eviction candidates beyond `gpu_capacity`.
+    gpu_lru: Vec<usize>,
     progs: Vec<AneProg>,
     extern_fns: HashMap<String, ExternCb>,
     witness: Vec<Wit>,
@@ -896,6 +904,11 @@ impl Vm {
             adam_state: HashMap::new(),
             pending_params,
             active_ane: None,
+            gpu_capacity: std::env::var("CYO_GPU_RESIDENT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            gpu_lru: Vec::new(),
             progs,
             extern_fns: HashMap::new(),
             witness: Vec::new(),
@@ -1041,6 +1054,60 @@ impl Vm {
                 _ => None,
             })
             .collect();
+        // device-authoritative params live in ext runtimes that may
+        // have been evicted — read each owning program once
+        // (materializing lazy executors on demand), then evict it so
+        // export residency stays bounded like the training loop.
+        let mut dev_params: HashMap<String, Vec<f32>> = HashMap::new();
+        for pi in 0..self.progs.len() {
+            let owned: Vec<(String, String, CTy)> = {
+                let prog = &self.progs[pi];
+                if !matches!(prog.backend, ProgBackend::Ext(_)) {
+                    continue;
+                }
+                prog.param_outs
+                    .iter()
+                    .filter(|(pn, _, _)| {
+                        self.gtensor
+                            .get(pn)
+                            .map(|&h| self.pending_params.contains_key(&h))
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            if owned.is_empty() {
+                continue;
+            }
+            for (pn, mname, pty) in &owned {
+                let prog = &mut self.progs[pi];
+                let pname = prog.name.clone();
+                let ProgBackend::Ext(rt) = &mut prog.backend else {
+                    continue;
+                };
+                let Some(surf) = rt.read_for_export(mname) else {
+                    return Err(format!("param export: {pn} unreadable on {pname}"));
+                };
+                // param surfaces are [N,K]; the host store is declared
+                // [K,N] — transpose back, same as the dispatch path.
+                let data = if pty.dims.len() == 2 {
+                    let (n, k) = (pty.dims[1] as usize, pty.dims[0] as usize);
+                    let mut host = vec![0f32; surf.len()];
+                    for a in 0..n {
+                        for b in 0..k {
+                            host[b * n + a] = surf[a * k + b];
+                        }
+                    }
+                    host
+                } else {
+                    surf
+                };
+                dev_params.insert(pn.clone(), data);
+            }
+            if let ProgBackend::Ext(rt) = &mut self.progs[pi].backend {
+                rt.evict();
+            }
+        }
         let mut out = Vec::new();
         for (name, ty) in &param_decls {
             let Some(&h) = self.gtensor.get(name) else {
@@ -1050,42 +1117,10 @@ impl Vm {
             let data: Vec<f32> = if self.tensors[h as usize].1.is_empty()
                 && self.pending_params.contains_key(&h)
             {
-                // trained-on-device? the owning prog's param_outs maps
-                // param name → runtime buffer name.
-                let mut dev: Option<Vec<f32>> = None;
-                for prog in &self.progs {
-                    let ProgBackend::Ext(_) = &prog.backend else {
-                        continue;
-                    };
-                    for (pn, mname, pty) in &prog.param_outs {
-                        if pn != name {
-                            continue;
-                        }
-                        if let ProgBackend::Ext(rt) = &prog.backend {
-                            if let Some(surf) = rt.read(mname) {
-                                dev = Some(if pty.dims.len() == 2 {
-                                    let (n, k) =
-                                        (pty.dims[1] as usize, pty.dims[0] as usize);
-                                    let mut host = vec![0f32; surf.len()];
-                                    for a in 0..n {
-                                        for b in 0..k {
-                                            host[b * n + a] = surf[a * k + b];
-                                        }
-                                    }
-                                    host
-                                } else {
-                                    surf
-                                });
-                            }
-                        }
-                        break;
-                    }
-                    if dev.is_some() {
-                        break;
-                    }
-                }
-                match dev {
-                    Some(d) => d,
+                // trained-on-device values were read back per-program
+                // above; a param no runtime claims keeps its init.
+                match dev_params.get(name) {
+                    Some(d) => d.clone(),
                     None => {
                         self.materialize_param(h)?;
                         self.tensors[h as usize].1.clone()
@@ -2178,6 +2213,9 @@ impl Vm {
                 }
             }
         }
+        // bound resident ext executors before dispatch — lazy gpu
+        // programs materialize on demand and evict LRU under pressure.
+        self.evict_gpu_for(pi);
         // ---- drive the program ----
         let (odata, oty, pouts, souts, remote_wit) = {
             let prog = &mut self.progs[pi];
@@ -2270,6 +2308,11 @@ impl Vm {
                     let odata = rt
                         .run(&writes)
                         .map_err(|e| format!("ext run ({}): {e}", prog.name))?;
+                    if std::env::var("CYO_PROF").is_ok() {
+                        if let Some(ms) = rt.device_ms() {
+                            eprintln!("prof {} device {:.1}ms", prog.name, ms);
+                        }
+                    }
                     // dispatch sites return remote witness entries — the
                     // VM lands them on its own chain below so one
                     // computation across N nodes reads as one log.
@@ -2361,6 +2404,53 @@ impl Vm {
             }
         }
         Ok(())
+    }
+
+    /// Bound resident ext executors: evict least-recently-used lazy
+    /// execs until the incoming program fits under `gpu_capacity`.
+    /// Params persist in the backend arena across eviction; dropping
+    /// `staged_ext` entries forces host-mirrored state to restage on
+    /// the next dispatch.
+    fn evict_gpu_for(&mut self, pi: usize) {
+        if self.gpu_capacity == 0
+            || !matches!(self.progs[pi].backend, ProgBackend::Ext(_))
+        {
+            return;
+        }
+        self.gpu_lru.retain(|&x| x != pi);
+        self.gpu_lru.push(pi);
+        loop {
+            let mut others = 0usize;
+            for (i, p) in self.progs.iter().enumerate() {
+                if i != pi {
+                    if let ProgBackend::Ext(rt) = &p.backend {
+                        if rt.resident() {
+                            others += 1;
+                        }
+                    }
+                }
+            }
+            if others + 1 <= self.gpu_capacity {
+                break;
+            }
+            let cand = self.gpu_lru.iter().copied().find(|&c| {
+                c != pi
+                    && matches!(&self.progs[c].backend, ProgBackend::Ext(rt) if rt.resident())
+            });
+            let mut evicted = false;
+            if let Some(c) = cand {
+                if let ProgBackend::Ext(rt) = &mut self.progs[c].backend {
+                    if rt.evict() {
+                        self.staged_ext.retain(|(p, _), _| *p != c);
+                        self.gpu_lru.retain(|&x| x != c);
+                        evicted = true;
+                    }
+                }
+            }
+            if !evicted {
+                break;
+            }
+        }
     }
 
     // ------------------------------------------------- natives

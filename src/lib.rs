@@ -236,7 +236,13 @@ pub fn load_vm(
     quiet: bool,
 ) -> Result<vm::Vm, String> {
     let (src, ast) = parser::parse_file(file).map_err(|d| d.to_string())?;
+    if !quiet {
+        eprintln!("parse done — typecheck start");
+    }
     let checked = typeck::check_all(&ast).map_err(|d| d.to_string())?;
+    if !quiet {
+        eprintln!("typeck done — {} programs", checked.ane.len());
+    }
     let host = checked
         .host
         .as_ref()
@@ -284,9 +290,54 @@ pub fn load_vm(
         }
         if tp.target != ast::Target::Ane {
             let be = backend::backend_for(tp.target)?;
+            if !quiet {
+                eprintln!("emit {name} start");
+            }
             let out = be.emit(&src, name, tp, &dir2)?;
+            if !quiet {
+                eprintln!("emit {name} done ({:.1}s)", t0.elapsed().as_secs_f64());
+            }
+            // CYO_GPU_RESIDENT=N bounds simultaneously-materialized gpu
+            // executors — load (Metal compile + buffer alloc) defers to
+            // first dispatch and the VM evicts LRU under pressure, so a
+            // model with more gpu programs than fit in device memory
+            // still trains. Params persist in the backend arena.
+            let lazy = tp.target == ast::Target::Gpu
+                && std::env::var("CYO_GPU_RESIDENT")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0)
+                > 0;
+            // plan fields cloned up front so the lazy path can move the
+            // whole emit payload into its reload closure — emit runs
+            // once per program per `run`, not once per eviction cycle.
+            let prog_ins = out.inputs.clone();
+            let prog_trainable: Vec<(String, String, typeck::CTy)> = out
+                .trainable
+                .iter()
+                .map(|(p, port, ty, _)| (p.clone(), port.clone(), ty.clone()))
+                .collect();
+            let prog_states = out.states.clone();
+            let prog_param_outs = out.param_outs.clone();
+            let prog_state_outs = out.state_outs.clone();
+            let prog_output = out.output.clone();
             let backend = if use_cpu {
                 vm::ProgBackend::Cpu(tp.clone())
+            } else if lazy {
+                let be2 = be.clone();
+                let tp2 = tp.clone();
+                let name2 = name.clone();
+                let dir3 = dir2.clone();
+                let mut emit_slot = Some(out);
+                let rt = backend::LazyExec::new(move || {
+                    let e = emit_slot
+                        .take()
+                        .ok_or_else(|| "gpu emit payload consumed".to_string())?;
+                    let r = be2.load(&tp2, &name2, &e, &dir3);
+                    emit_slot = Some(e);
+                    r
+                });
+                vm::ProgBackend::Ext(Box::new(rt))
             } else {
                 let rt = be
                     .load(tp, name, &out, &dir2)
@@ -303,17 +354,13 @@ pub fn load_vm(
             progs.push(vm::AneProg {
                 name: name.clone(),
                 backend,
-                ins: out.inputs,
-                trainable: out
-                    .trainable
-                    .into_iter()
-                    .map(|(p, port, ty, _)| (p, port, ty))
-                    .collect(),
-                states: out.states,
-                param_outs: out.param_outs,
+                ins: prog_ins,
+                trainable: prog_trainable,
+                states: prog_states,
+                param_outs: prog_param_outs,
                 adam_lrs: Vec::new(),
-                state_outs: out.state_outs,
-                output: out.output,
+                state_outs: prog_state_outs,
+                output: prog_output,
             });
             continue;
         }
