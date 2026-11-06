@@ -1023,17 +1023,77 @@ impl Vm {
     /// orientation the `@ src` loader consumes — export inverts load
     /// exactly. Tables, state mirrors, and program values are excluded:
     /// they are program data, not weights.
-    pub fn params_snapshot(&self) -> Vec<(String, Vec<usize>, Vec<f32>, bool)> {
+    ///
+    /// Deferred params (`CYO_LAZY_PARAMS`) resolve per-param: values
+    /// an ext runtime trained stay device-authoritative and are read
+    /// back through `param_outs`; params no prog updates materialize
+    /// to their init weights. The host store never has to hold the
+    /// whole model at once.
+    pub fn params_snapshot(&mut self) -> Result<Vec<(String, Vec<usize>, Vec<f32>, bool)>, String> {
+        // collect decls up front — the loop mutates self (lazy
+        // materialization, device reads) so it can't hold &self.h.
+        let param_decls: Vec<(String, CTy)> = self
+            .h
+            .globals
+            .iter()
+            .filter_map(|(_, gv, _)| match gv {
+                GVal::Param { name, ty, .. } => Some((name.clone(), ty.clone())),
+                _ => None,
+            })
+            .collect();
         let mut out = Vec::new();
-        for (_slot, gv, _) in &self.h.globals {
-            let GVal::Param { name, ty, .. } = gv else {
-                continue;
-            };
+        for (name, ty) in &param_decls {
             let Some(&h) = self.gtensor.get(name) else {
                 continue;
             };
             let decl = dims_usize(ty);
-            let data = self.tensors[h as usize].1.clone();
+            let data: Vec<f32> = if self.tensors[h as usize].1.is_empty()
+                && self.pending_params.contains_key(&h)
+            {
+                // trained-on-device? the owning prog's param_outs maps
+                // param name → runtime buffer name.
+                let mut dev: Option<Vec<f32>> = None;
+                for prog in &self.progs {
+                    let ProgBackend::Ext(_) = &prog.backend else {
+                        continue;
+                    };
+                    for (pn, mname, pty) in &prog.param_outs {
+                        if pn != name {
+                            continue;
+                        }
+                        if let ProgBackend::Ext(rt) = &prog.backend {
+                            if let Some(surf) = rt.read(mname) {
+                                dev = Some(if pty.dims.len() == 2 {
+                                    let (n, k) =
+                                        (pty.dims[1] as usize, pty.dims[0] as usize);
+                                    let mut host = vec![0f32; surf.len()];
+                                    for a in 0..n {
+                                        for b in 0..k {
+                                            host[b * n + a] = surf[a * k + b];
+                                        }
+                                    }
+                                    host
+                                } else {
+                                    surf
+                                });
+                            }
+                        }
+                        break;
+                    }
+                    if dev.is_some() {
+                        break;
+                    }
+                }
+                match dev {
+                    Some(d) => d,
+                    None => {
+                        self.materialize_param(h)?;
+                        self.tensors[h as usize].1.clone()
+                    }
+                }
+            } else {
+                self.tensors[h as usize].1.clone()
+            };
             let f16 = matches!(ty.dt, DType::F16);
             if ty.dims.len() == 2 {
                 let (k, n) = (decl[0], decl[1]);
@@ -1048,7 +1108,7 @@ impl Vm {
                 out.push((name.clone(), decl, data, f16));
             }
         }
-        out
+        Ok(out)
     }
 
     /// Declared `io` ports of a compiled tensor program (name → dims),
@@ -2219,6 +2279,17 @@ impl Vm {
                     // are [N,K], the host store is declared [K,N].
                     let mut pouts = Vec::new();
                     for (pname, mname, ty) in &prog.param_outs {
+                        // device-authoritative deferred params never
+                        // round-trip the host store — trained values
+                        // stay in the runtime buffer and export reads
+                        // them back per-param. Skipping here also
+                        // avoids materializing a multi-GB `host` vec
+                        // per param on large models.
+                        if let Some(&h) = self.gtensor.get(pname) {
+                            if self.pending_params.contains_key(&h) {
+                                continue;
+                            }
+                        }
                         if let Some(surf) = rt.read(mname) {
                             if ty.dims.len() == 2 {
                                 let (n, k) = (ty.dims[1] as usize, ty.dims[0] as usize);
@@ -2263,6 +2334,12 @@ impl Vm {
         self.stack.push(Val::T(th));
         for (pname, host) in pouts {
             if let Some(&h) = self.gtensor.get(&pname) {
+                // device-authoritative — the ext runtime owns trained
+                // values for deferred params; the host slot stays
+                // empty rather than absorbing a multi-GB mirror.
+                if self.pending_params.contains_key(&h) {
+                    continue;
+                }
                 if let Some(&(_, lr)) = self.progs[pi].adam_lrs.iter().find(|(p, _)| p == &pname) {
                     let w_cur = &mut self.tensors[h as usize].1;
                     let n = w_cur.len();
