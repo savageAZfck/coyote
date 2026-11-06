@@ -331,6 +331,60 @@ pub fn dims_usize(t: &CTy) -> Vec<usize> {
     t.dims.iter().map(|d| *d as usize).collect()
 }
 
+/// one entry in a param export stream — see `Vm::param_export_plan`.
+/// `dims` are the EXPORTED dims (2-D params store reversed, matching
+/// `params_snapshot`'s historical layout).
+pub struct ParamExport {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub f16: bool,
+    pub src: PExportSrc,
+}
+
+/// where an exported param's f32 payload comes from.
+pub enum PExportSrc {
+    /// device-authoritative — read back through `param_outs`/`mname`
+    /// on Ext program `prog` (programs are contiguous in plan order).
+    Device {
+        prog: usize,
+        mname: String,
+        pty: CTy,
+    },
+    /// already-materialized host tensor data.
+    Host { h: u32 },
+    /// deferred param — `materialize_param` fills the host slot first.
+    Pending { h: u32 },
+}
+
+/// host-side tail of the export: declared-layout f32 data → exported
+/// layout. 2-D params transpose (exported dims are the reversed decl
+/// dims); everything else passes through. One param at a time — the
+/// transpose buffer drops when `f` returns.
+fn emit_host_data<F>(
+    name: &str,
+    dims: &[usize],
+    data: Vec<f32>,
+    f16: bool,
+    f: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, &[usize], &[f32], bool) -> Result<(), String>,
+{
+    if dims.len() == 2 {
+        // exported dims are [n, k] = reversed declared [k, n]
+        let (n, k) = (dims[0], dims[1]);
+        let mut t = vec![0f32; data.len()];
+        for a in 0..n {
+            for b in 0..k {
+                t[a * k + b] = data[b * n + a];
+            }
+        }
+        f(name, dims, &t, f16)
+    } else {
+        f(name, dims, &data, f16)
+    }
+}
+
 // ---------------------------------------------------------------- compiler
 
 struct Bc {
@@ -1144,6 +1198,160 @@ impl Vm {
             }
         }
         Ok(out)
+    }
+
+    /// Export plan — every param's name, exported dims, dtype flag and
+    /// source, in file order, WITHOUT reading any param data. The
+    /// safetensors header is computable from this alone, which is what
+    /// lets `param_export_emit` stream tensors out one at a time
+    /// instead of materializing the whole model as f32 on the host
+    /// (3.78B params × 4B ≈ 15GB — the old `params_snapshot` tripled
+    /// that and wedged on 16GB machines).
+    pub fn param_export_plan(&self) -> Result<Vec<ParamExport>, String> {
+        let param_decls: Vec<(String, CTy)> = self
+            .h
+            .globals
+            .iter()
+            .filter_map(|(_, gv, _)| match gv {
+                GVal::Param { name, ty, .. } => Some((name.clone(), ty.clone())),
+                _ => None,
+            })
+            .collect();
+        let export_dims = |dims: &[usize]| -> Vec<usize> {
+            if dims.len() == 2 {
+                vec![dims[1], dims[0]]
+            } else {
+                dims.to_vec()
+            }
+        };
+        let mut plan = Vec::new();
+        // params are shared across programs — every train_blk
+        // forwards the whole model, so param_outs overlap heavily.
+        // first owner wins; values are identical mid-export anyway.
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // device-authoritative params first, program order — same order
+        // `params_snapshot` drained runtimes in.
+        for (pi, prog) in self.progs.iter().enumerate() {
+            if !matches!(prog.backend, ProgBackend::Ext(_)) {
+                continue;
+            }
+            for (pn, mname, pty) in &prog.param_outs {
+                let Some(&h) = self.gtensor.get(pn) else {
+                    continue;
+                };
+                // snapshot only consumed device values when the host
+                // tensor slot was empty — replicate that exactly.
+                if !self.pending_params.contains_key(&h)
+                    || !self.tensors[h as usize].1.is_empty()
+                    || !seen.insert(pn.clone())
+                {
+                    continue;
+                }
+                let pd: Vec<usize> =
+                    pty.dims.iter().map(|&x| x as usize).collect();
+                plan.push(ParamExport {
+                    name: pn.clone(),
+                    dims: export_dims(&pd),
+                    f16: matches!(pty.dt, DType::F16),
+                    src: PExportSrc::Device {
+                        prog: pi,
+                        mname: mname.clone(),
+                        pty: pty.clone(),
+                    },
+                });
+            }
+        }
+        for (name, ty) in &param_decls {
+            if seen.contains(name) {
+                continue;
+            }
+            let Some(&h) = self.gtensor.get(name) else {
+                continue;
+            };
+            let decl = dims_usize(ty);
+            let f16 = matches!(ty.dt, DType::F16);
+            let src = if self.tensors[h as usize].1.is_empty()
+                && self.pending_params.contains_key(&h)
+            {
+                PExportSrc::Pending { h }
+            } else {
+                PExportSrc::Host { h }
+            };
+            plan.push(ParamExport {
+                name: name.clone(),
+                dims: export_dims(&decl),
+                f16,
+                src,
+            });
+        }
+        Ok(plan)
+    }
+
+    /// Stream every planned param to `f(name, exported_dims, f32 data,
+    /// is_f16)` in plan order. Data is produced one param at a time —
+    /// device reads, host clones and lazy materializations all drop
+    /// after the callback returns. Device 2-D params emit their raw
+    /// surface: the snapshot's surf→declared→exported transpose pair
+    /// cancels exactly (verified index-for-index), so the surface IS
+    /// the exported tensor under reversed dims.
+    pub fn param_export_emit<F>(
+        &mut self,
+        plan: &[ParamExport],
+        mut f: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&str, &[usize], &[f32], bool) -> Result<(), String>,
+    {
+        let mut cur_prog: i64 = -1;
+        for item in plan {
+            match &item.src {
+                PExportSrc::Device {
+                    prog,
+                    mname,
+                    pty,
+                } => {
+                    if *prog as i64 != cur_prog {
+                        if cur_prog >= 0 {
+                            if let ProgBackend::Ext(rt) =
+                                &mut self.progs[cur_prog as usize].backend
+                            {
+                                rt.evict();
+                            }
+                        }
+                        cur_prog = *prog as i64;
+                    }
+                    let ProgBackend::Ext(rt) = &mut self.progs[*prog].backend else {
+                        continue;
+                    };
+                    let Some(surf) = rt.read_for_export(mname) else {
+                        return Err(format!(
+                            "param export: {} unreadable",
+                            item.name
+                        ));
+                    };
+                    // exported tensor == raw surface under reversed
+                    // dims for 2-D (the old double-transpose cancels);
+                    // 1-D/scalar surfaces pass through as-is.
+                    f(&item.name, &item.dims, &surf, item.f16)?;
+                }
+                PExportSrc::Host { h } => {
+                    let data = self.tensors[*h as usize].1.clone();
+                    emit_host_data(&item.name, &item.dims, data, item.f16, &mut f)?;
+                }
+                PExportSrc::Pending { h } => {
+                    self.materialize_param(*h)?;
+                    let data = self.tensors[*h as usize].1.clone();
+                    emit_host_data(&item.name, &item.dims, data, item.f16, &mut f)?;
+                }
+            }
+        }
+        if cur_prog >= 0 {
+            if let ProgBackend::Ext(rt) = &mut self.progs[cur_prog as usize].backend {
+                rt.evict();
+            }
+        }
+        Ok(())
     }
 
     /// Declared `io` ports of a compiled tensor program (name → dims),
