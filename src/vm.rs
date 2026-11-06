@@ -765,6 +765,14 @@ pub struct Vm {
     staged_ext: HashMap<(usize, String), u32>,
     /// param → (step, m, v) for host-side adam updates on readback grads
     adam_state: HashMap<String, (usize, Vec<f32>, Vec<f32>)>,
+    /// tensor handle → (name, file-layout expect dims, src) for params
+    /// whose f32 host mirror was deferred at load (`CYO_LAZY_PARAMS`).
+    /// GPU-resident params never need the 4-byte host copy — the
+    /// device buffer is authoritative — so a 3.78B-param organism
+    /// doesn't die to a 15GB eager `Vec<f32>` store. Materialized
+    /// on demand: CPU/ANE prog staging, host `Op::Global` reads, and
+    /// `materialize_all_params` (export/snapshot).
+    pending_params: HashMap<u32, (String, Vec<usize>, Option<String>)>,
     /// currently resident ANE program index — evicted on program switch
     active_ane: Option<usize>,
     progs: Vec<AneProg>,
@@ -797,6 +805,9 @@ impl Vm {
         let mut tensors = Vec::new();
         let mut gtensor = HashMap::new();
         let mut globals = Vec::new();
+        let lazy_params = std::env::var_os("CYO_LAZY_PARAMS").is_some();
+        let mut pending_params: HashMap<u32, (String, Vec<usize>, Option<String>)> =
+            HashMap::new();
         for (_name, gv, _) in &h.globals {
             let v = match gv {
                 GVal::Prog { idx } => Val::Ane(*idx),
@@ -811,6 +822,22 @@ impl Vm {
                     } else {
                         decl.clone()
                     };
+                    let idx = tensors.len() as u32;
+                    if is_param && lazy_params {
+                        // defer the f32 host mirror — the tensor slot
+                        // stays empty until something actually reads
+                        // it (CPU/ANE staging, host global loads,
+                        // export). GPU progs resolve weights inside
+                        // their own runtime and never touch this.
+                        tensors.push((ty.clone(), Vec::new()));
+                        gtensor.insert(name.clone(), idx);
+                        pending_params.insert(
+                            idx,
+                            (name.clone(), expect, src.clone()),
+                        );
+                        globals.push(Val::T(idx));
+                        continue;
+                    }
                     let mut data = crate::weights::resolve(
                         name,
                         Some(&expect),
@@ -855,7 +882,7 @@ impl Vm {
                 .unwrap_or([0u8; 8]),
         ) | 1;
         let base_tensors = tensors.len();
-        Ok(Self {
+        let mut vm = Self {
             h,
             code,
             nslots,
@@ -867,6 +894,7 @@ impl Vm {
             gtensor,
             staged_ext: HashMap::new(),
             adam_state: HashMap::new(),
+            pending_params,
             active_ane: None,
             progs,
             extern_fns: HashMap::new(),
@@ -875,7 +903,70 @@ impl Vm {
             sha: sha.to_string(),
             halted: false,
             result: None,
-        })
+        };
+        // host code can pull any global onto the stack via Op::Global —
+        // a param tensor read there would see the deferred empty slot.
+        // Materialize exactly the pending params host ops can reach.
+        let mut needed: Vec<u32> = Vec::new();
+        for ops in &vm.code {
+            for op in ops {
+                if let Op::Global(gi) = op {
+                    if let Val::T(t) = vm.globals[*gi as usize] {
+                        if vm.pending_params.contains_key(&t) {
+                            needed.push(t);
+                        }
+                    }
+                }
+            }
+        }
+        needed.sort_unstable();
+        needed.dedup();
+        for t in needed {
+            vm.materialize_param(t)?;
+        }
+        Ok(vm)
+    }
+
+    /// resolve a deferred param's weights into its tensor slot —
+    /// identical math to the eager load path (resolve → f16 round →
+    /// [N,K]→declared-order transpose for rank-2).
+    fn materialize_param(&mut self, tidx: u32) -> Result<(), String> {
+        let Some((name, expect, src)) = self.pending_params.remove(&tidx) else {
+            return Ok(());
+        };
+        let ty = self.tensors[tidx as usize].0.clone();
+        let mut data = crate::weights::resolve(
+            &name,
+            Some(&expect),
+            src.as_deref(),
+            init_weight_pub,
+        )
+        .map_err(|e| e.to_string())?;
+        for v in data.iter_mut() {
+            *v = half::f16::from_f32(*v).to_f32();
+        }
+        if ty.dims.len() == 2 {
+            let (n, k) = (expect[0], expect[1]);
+            let mut t = vec![0f32; data.len()];
+            for a in 0..n {
+                for b in 0..k {
+                    t[b * n + a] = data[a * k + b];
+                }
+            }
+            data = t;
+        }
+        self.tensors[tidx as usize].1 = data;
+        Ok(())
+    }
+
+    /// force every deferred param into the host store — export and
+    /// snapshot paths need real values, not empty slots.
+    pub fn materialize_all_params(&mut self) -> Result<(), String> {
+        let ts: Vec<u32> = self.pending_params.keys().copied().collect();
+        for t in ts {
+            self.materialize_param(t)?;
+        }
+        Ok(())
     }
 
     pub fn witness_log(&self) -> &[Wit] {
@@ -1922,6 +2013,17 @@ impl Vm {
     /// trainable weights ride the host store — written before the run,
     /// read back after.
     fn call_ane(&mut self, pi: usize, args: Vec<Val>) -> Result<(), String> {
+        // deferred params (`CYO_LAZY_PARAMS`): CPU/ANE evaluators read
+        // the host f32 store, so every pending param materializes
+        // before they run. Ext (gpu) progs resolve weights inside
+        // their own runtime — empty slots are skipped at staging and
+        // the device buffer stays authoritative.
+        if !matches!(self.progs[pi].backend, ProgBackend::Ext(_)) {
+            let ts: Vec<u32> = self.pending_params.keys().copied().collect();
+            for t in ts {
+                self.materialize_param(t)?;
+            }
+        }
         // ---- gather staging data first (borrows of self.tensors end
         // before self.progs is borrowed mutably) ----
         let mut stages: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
@@ -1963,6 +2065,15 @@ impl Vm {
                 let fresh = !matches!(prog.backend, ProgBackend::Ext(_))
                     || self.staged_ext.get(&(pi, port.clone())) != Some(&h);
                 if fresh {
+                    // deferred param with no host mirror yet — the ext
+                    // runtime already staged init values at load and
+                    // readback keeps the device authoritative; staging
+                    // an empty slot would clobber them.
+                    if self.tensors[h as usize].1.is_empty()
+                        && self.pending_params.contains_key(&h)
+                    {
+                        continue;
+                    }
                     let data = self.tensors[h as usize].1.clone();
                     if ty.dims.len() == 2 {
                         let (k, n) = (ty.dims[0] as usize, ty.dims[1] as usize);
