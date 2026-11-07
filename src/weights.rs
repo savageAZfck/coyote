@@ -288,15 +288,14 @@ fn json_nums(obj: &str, key: &str) -> Vec<u64> {
 /// `expect` is the FILE-side shape (storage order: `[N, K]` for matvec
 /// weights) — mismatched orientation is a hard error, not a silent
 /// transpose.
-pub fn resolve<F: Fn(&str, usize) -> Vec<f32>>(
+pub fn resolve<F: Fn(&str, &[usize]) -> Vec<f32>>(
     name: &str,
     expect: Option<&[usize]>,
     src: Option<&str>,
     fallback: F,
 ) -> Result<Vec<f32>, String> {
-    let numel = expect.map(|s| s.iter().product()).unwrap_or(0);
     let Some(src) = src else {
-        return Ok(fallback(name, numel));
+        return Ok(fallback(name, expect.unwrap_or(&[])));
     };
     let (path, spec) = src
         .split_once("::")
@@ -358,9 +357,11 @@ pub fn resolve<F: Fn(&str, usize) -> Vec<f32>>(
 }
 
 /// deterministic param init — the same bytes the emitted blobs and the
-/// CPU evaluator produce: name-seeded, f16-quantized.
-pub fn param_fallback(name: &str, numel: usize) -> Vec<f32> {
-    crate::lower::init_weight_pub(name, numel)
+/// CPU evaluator produce: name-seeded, fan-in-scaled, f16-quantized.
+/// `dims` is storage order (`[N, K]` for rank-2) — see
+/// `lower::init_weight_dims`.
+pub fn param_fallback(name: &str, dims: &[usize]) -> Vec<f32> {
+    crate::lower::init_weight_dims(name, dims)
         .iter()
         .map(|&v| half::f16::from_f32(v).to_f32())
         .collect()

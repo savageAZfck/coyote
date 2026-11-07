@@ -401,7 +401,7 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                         pname,
                         Some(&[n, k]),
                         src.as_deref(),
-                        init_weight_pub,
+                        crate::lower::init_weight_dims,
                     )
                     .map_err(|e| e.to_string())?;
                     let wc = w.clone();

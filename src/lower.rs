@@ -147,10 +147,24 @@ fn f16_bytes(vals: &[f32]) -> Vec<u8> {
 /// deterministic weight init — xorshift64 seeded from the param's
 /// name and shape so the same program always compiles the same artifact.
 pub fn init_weight_pub(name: &str, numel: usize) -> Vec<f32> {
-    init_weight(name, numel)
+    init_weight_dims(name, &[numel])
 }
 
-fn init_weight(name: &str, numel: usize) -> Vec<f32> {
+/// dims are storage-order (`[N, K]` = `[fan_out, fan_in]` for matvec
+/// weights) — fan-in is the LAST dim for rank ≥ 2. Rank ≥ 2 scales to
+/// ±√3/√fan_in (uniform std 1/√fan_in, Xavier); rank < 2 keeps the
+/// legacy ±0.5 bound for norm gains and io tensors. The xorshift
+/// stream is unchanged — only the bound moves, so same-name params
+/// keep their random sequence at the new scale. (own4b's f0 residual
+/// hit ±600 after one layer at ±0.5 — 36 layers of that is f16
+/// overflow, not a model.)
+pub fn init_weight_dims(name: &str, dims: &[usize]) -> Vec<f32> {
+    let numel: usize = dims.iter().product();
+    let bound = if dims.len() >= 2 {
+        3.0f64.sqrt() / (dims[dims.len() - 1].max(1) as f64).sqrt()
+    } else {
+        0.5
+    };
     let mut s: u64 = 0x9E3779B97F4A7C15;
     for b in name.bytes() {
         s ^= b as u64;
@@ -162,7 +176,7 @@ fn init_weight(name: &str, numel: usize) -> Vec<f32> {
             s ^= s << 13;
             s ^= s >> 7;
             s ^= s << 17;
-            (s as f64 / u64::MAX as f64 - 0.5) as f32
+            ((s as f64 / u64::MAX as f64 - 0.5) * 2.0 * bound) as f32
         })
         .collect()
 }
@@ -264,7 +278,7 @@ impl Lo {
         // real weights via `@ "file::tensor"`; deterministic init otherwise
         let is_q4 = ty.dt == DType::Q4;
         let init = |expect: &[usize]| -> CResult<Vec<f32>> {
-            let mut v = crate::weights::resolve(name, Some(expect), src.as_deref(), init_weight)
+            let mut v = crate::weights::resolve(name, Some(expect), src.as_deref(), init_weight_dims)
                 .map_err(|m| Diag {
                     msg: m,
                     line: 0,
@@ -536,7 +550,7 @@ impl Lo {
                                     pname,
                                     Some(&[d_dim, v_dim]),
                                     src.as_deref(),
-                                    init_weight,
+                                    init_weight_dims,
                                 )
                                 .map_err(|m| Diag {
                                     msg: m,
@@ -637,7 +651,7 @@ impl Lo {
                             })?;
                     let expect = if is_trans { vec![k, n] } else { vec![n, k] };
                     let mut w =
-                        crate::weights::resolve(&pname, Some(&expect), src.as_deref(), init_weight)
+                        crate::weights::resolve(&pname, Some(&expect), src.as_deref(), init_weight_dims)
                             .map_err(|e| Diag {
                                 msg: e,
                                 line: 0,

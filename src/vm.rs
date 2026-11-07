@@ -10,7 +10,7 @@
 use crate::ast::{AssignOp, BinOp, DType, UnOp};
 use crate::eval::Evaluator;
 use crate::hostck::{GVal, HFnT, HProgram, RTy, StoreT, HE, HS, HT, NATIVE_NAMES};
-use crate::lower::{init_weight_pub, sha256_hex};
+use crate::lower::{init_weight_dims, sha256_hex};
 use crate::typeck::{CTy, TProgram};
 use mil_infer::graph::GraphRuntime;
 use std::cell::RefCell;
@@ -904,7 +904,7 @@ impl Vm {
                         name,
                         Some(&expect),
                         src.as_deref(),
-                        init_weight_pub,
+                        init_weight_dims,
                     )
                     .map_err(|e| e.to_string())?;
                     // file sources arrive f32 — round through f16 like
@@ -1006,7 +1006,7 @@ impl Vm {
             &name,
             Some(&expect),
             src.as_deref(),
-            init_weight_pub,
+            init_weight_dims,
         )
         .map_err(|e| e.to_string())?;
         for v in data.iter_mut() {

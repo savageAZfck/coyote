@@ -3,7 +3,7 @@
 //! Implements the same `grad` backward rules the lowerer emits.
 
 use crate::ast::{AssignOp, BinOp, DType, Qual, UnOp};
-use crate::lower::{init_weight_pub, q4_quantize};
+use crate::lower::{init_weight_dims, q4_quantize};
 use crate::typeck::{CTy, TExpr, TIndex, TProgram, TStmt, Typed};
 use crate::{diag, CResult, Diag};
 use std::collections::{HashMap, HashSet};
@@ -47,8 +47,8 @@ impl Val {
 }
 
 /// f16-quantized weights — identical bytes to the emitted blobs.
-fn qw(name: &str, numel: usize) -> Vec<f32> {
-    init_weight_pub(name, numel)
+fn qw(name: &str, dims: &[usize]) -> Vec<f32> {
+    init_weight_dims(name, dims)
         .iter()
         .map(|&v| half::f16::from_f32(v).to_f32())
         .collect()
@@ -129,11 +129,16 @@ impl<'a> Evaluator<'a> {
         for tp in &self.p.params {
             if tp.qual == Qual::Trainable {
                 let n = tp.ty.numel().max(1) as usize;
+                let ed: Vec<usize> = if tp.ty.dims.len() == 2 {
+                    vec![tp.ty.dims[1] as usize, tp.ty.dims[0] as usize]
+                } else {
+                    vec![n]
+                };
                 let v = self
                     .pvals
                     .get(&tp.name)
                     .cloned()
-                    .unwrap_or_else(|| qw(&tp.name, n));
+                    .unwrap_or_else(|| qw(&tp.name, &ed));
                 self.env[0].insert(tp.name.clone(), Val::V(v));
             }
         }
