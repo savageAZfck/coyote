@@ -17,3 +17,4 @@ path = "src/main.rs"
 [dependencies]
 mil_infer = { git = "https://github.com/savageAZfck/mil_spec" }
 half = "2"
+serde = { version = "1", features = ["derive"] }

@@ -9,7 +9,7 @@ use crate::{diag, CResult, Diag};
 use std::collections::HashMap;
 
 /// Concrete type: dtype + literal dims.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CTy {
     pub dt: DType,
     pub dims: Vec<i64>,

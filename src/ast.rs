@@ -19,7 +19,7 @@ pub enum Dim {
 }
 
 /// Element dtypes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DType {
     F16,
     F32,
