@@ -991,6 +991,7 @@ impl Vm {
         for t in needed {
             vm.materialize_param(t)?;
         }
+        crate::weights::clear_cache();
         Ok(vm)
     }
 
@@ -1230,36 +1231,42 @@ impl Vm {
         // first owner wins; values are identical mid-export anyway.
         let mut seen: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        // device-authoritative params first, program order — same order
-        // `params_snapshot` drained runtimes in.
-        for (pi, prog) in self.progs.iter().enumerate() {
-            if !matches!(prog.backend, ProgBackend::Ext(_)) {
-                continue;
-            }
-            for (pn, mname, pty) in &prog.param_outs {
-                let Some(&h) = self.gtensor.get(pn) else {
+        // device-authoritative params first, preferring already-resident
+        // Ext programs so `ckpt` reads from the active trainer instead
+        // of compiling/loading a second program (`forward`) on top of it.
+        for prefer_resident in [true, false] {
+            for (pi, prog) in self.progs.iter().enumerate() {
+                let ProgBackend::Ext(rt) = &prog.backend else {
                     continue;
                 };
-                // snapshot only consumed device values when the host
-                // tensor slot was empty — replicate that exactly.
-                if !self.pending_params.contains_key(&h)
-                    || !self.tensors[h as usize].1.is_empty()
-                    || !seen.insert(pn.clone())
-                {
+                if rt.resident() != prefer_resident {
                     continue;
                 }
-                let pd: Vec<usize> =
-                    pty.dims.iter().map(|&x| x as usize).collect();
-                plan.push(ParamExport {
-                    name: pn.clone(),
-                    dims: export_dims(&pd),
-                    f16: matches!(pty.dt, DType::F16),
-                    src: PExportSrc::Device {
-                        prog: pi,
-                        mname: mname.clone(),
-                        pty: pty.clone(),
-                    },
-                });
+                for (pn, mname, pty) in &prog.param_outs {
+                    let Some(&h) = self.gtensor.get(pn) else {
+                        continue;
+                    };
+                    // snapshot only consumed device values when the host
+                    // tensor slot was empty — replicate that exactly.
+                    if !self.pending_params.contains_key(&h)
+                        || !self.tensors[h as usize].1.is_empty()
+                        || !seen.insert(pn.clone())
+                    {
+                        continue;
+                    }
+                    let pd: Vec<usize> =
+                        pty.dims.iter().map(|&x| x as usize).collect();
+                    plan.push(ParamExport {
+                        name: pn.clone(),
+                        dims: export_dims(&pd),
+                        f16: matches!(pty.dt, DType::F16),
+                        src: PExportSrc::Device {
+                            prog: pi,
+                            mname: mname.clone(),
+                            pty: pty.clone(),
+                        },
+                    });
+                }
             }
         }
         for (name, ty) in &param_decls {
@@ -1304,15 +1311,16 @@ impl Vm {
         F: FnMut(&str, &[usize], &[f32], bool) -> Result<(), String>,
     {
         let mut cur_prog: i64 = -1;
+        let mut cur_was_resident = false;
         for item in plan {
             match &item.src {
                 PExportSrc::Device {
                     prog,
                     mname,
-                    pty,
+                    pty: _,
                 } => {
                     if *prog as i64 != cur_prog {
-                        if cur_prog >= 0 {
+                        if cur_prog >= 0 && !cur_was_resident {
                             if let ProgBackend::Ext(rt) =
                                 &mut self.progs[cur_prog as usize].backend
                             {
@@ -1320,6 +1328,10 @@ impl Vm {
                             }
                         }
                         cur_prog = *prog as i64;
+                        cur_was_resident = matches!(
+                            &self.progs[*prog].backend,
+                            ProgBackend::Ext(rt) if rt.resident()
+                        );
                     }
                     let ProgBackend::Ext(rt) = &mut self.progs[*prog].backend else {
                         continue;
@@ -1340,18 +1352,135 @@ impl Vm {
                     emit_host_data(&item.name, &item.dims, data, item.f16, &mut f)?;
                 }
                 PExportSrc::Pending { h } => {
-                    self.materialize_param(*h)?;
-                    let data = self.tensors[*h as usize].1.clone();
-                    emit_host_data(&item.name, &item.dims, data, item.f16, &mut f)?;
+                    // If a device runtime is already resident, read the
+                    // frozen param straight from its resident buffer so
+                    // we never re-open a multi-GB safetensors file mid-run.
+                    if cur_prog >= 0 {
+                        if let ProgBackend::Ext(rt) =
+                            &mut self.progs[cur_prog as usize].backend
+                        {
+                            if let Some(surf) = rt.read_for_export(&item.name) {
+                                f(&item.name, &item.dims, &surf, item.f16)?;
+                                continue;
+                            }
+                        }
+                    }
+                    // Otherwise resolve into a temporary vec that drops
+                    // immediately — do NOT call `self.materialize_param(*h)`,
+                    // which permanently stores f32 weights in `self.tensors`.
+                    let Some((name, expect, src)) =
+                        self.pending_params.get(h).cloned()
+                    else {
+                        return Err(format!("param export: missing pending slot {h}"));
+                    };
+                    let mut data = crate::weights::resolve(
+                        &name,
+                        Some(&expect),
+                        src.as_deref(),
+                        init_weight_dims,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    for v in data.iter_mut() {
+                        *v = half::f16::from_f32(*v).to_f32();
+                    }
+                    f(&item.name, &item.dims, &data, item.f16)?;
                 }
             }
         }
-        if cur_prog >= 0 {
+        if cur_prog >= 0 && !cur_was_resident {
             if let ProgBackend::Ext(rt) = &mut self.progs[cur_prog as usize].backend {
                 rt.evict();
             }
         }
+        crate::weights::clear_cache();
         Ok(())
+    }
+
+    /// Streaming safetensors checkpoint — the same plan/emit split as
+    /// `run --export`, written to `path.tmp` then renamed so a crash
+    /// mid-write never leaves a truncated file at `path`. Peak host
+    /// memory stays one param. Returns the tensor count.
+    ///
+    /// `checkpoint` mode (periodic `ckpt` calls): aborts the write the
+    /// moment any non-finite param value is seen — returns `Ok(0)` and
+    /// leaves any previous checkpoint untouched — and rotates the
+    /// outgoing file to `path.prev` before installing the new one, so
+    /// a divergent run can never destroy the last good weights.
+    pub fn export_safetensors(
+        &mut self,
+        path: &str,
+        checkpoint: bool,
+    ) -> Result<usize, String> {
+        let plan = self.param_export_plan()?;
+        let mut hdr = String::from("{");
+        let mut off = 0u64;
+        for (i, it) in plan.iter().enumerate() {
+            if i > 0 {
+                hdr.push(',');
+            }
+            let esz = if it.f16 { 2u64 } else { 4u64 };
+            let nb = it.dims.iter().product::<usize>() as u64 * esz;
+            let shape_s = it
+                .dims
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            hdr.push_str(&format!(
+                "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{}, {}]}}",
+                it.name,
+                if it.f16 { "F16" } else { "F32" },
+                shape_s,
+                off,
+                off + nb
+            ));
+            off += nb;
+        }
+        hdr.push('}');
+        let pad = (8 - (hdr.len() % 8)) % 8;
+        hdr.push_str(&" ".repeat(pad));
+        let tmp = format!("{path}.tmp");
+        let mut file = std::io::BufWriter::new(
+            std::fs::File::create(&tmp).map_err(|e| e.to_string())?,
+        );
+        use std::io::Write;
+        file.write_all(&(hdr.len() as u64).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        file.write_all(hdr.as_bytes()).map_err(|e| e.to_string())?;
+        let n = plan.len();
+        const NONFINITE: &str = "CYO_CKPT_NONFINITE";
+        let emit_res = self.param_export_emit(&plan, |_, _, data, f16| {
+            if f16 {
+                for v in data {
+                    if checkpoint && !v.is_finite() {
+                        return Err(NONFINITE.to_string());
+                    }
+                    file.write_all(&half::f16::from_f32(*v).to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                }
+            } else {
+                for v in data {
+                    if checkpoint && !v.is_finite() {
+                        return Err(NONFINITE.to_string());
+                    }
+                    file.write_all(&v.to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = emit_res {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            if e == NONFINITE {
+                return Ok(0);
+            }
+            return Err(e);
+        }
+        file.flush().map_err(|e| e.to_string())?;
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+        Ok(n)
     }
 
     /// Declared `io` ports of a compiled tensor program (name → dims),
@@ -2316,16 +2445,30 @@ impl Vm {
     /// trainable weights ride the host store — written before the run,
     /// read back after.
     fn call_ane(&mut self, pi: usize, args: Vec<Val>) -> Result<(), String> {
-        // deferred params (`CYO_LAZY_PARAMS`): CPU/ANE evaluators read
-        // the host f32 store, so every pending param materializes
-        // before they run. Ext (gpu) progs resolve weights inside
-        // their own runtime — empty slots are skipped at staging and
-        // the device buffer stays authoritative.
-        if !matches!(self.progs[pi].backend, ProgBackend::Ext(_)) {
-            let ts: Vec<u32> = self.pending_params.keys().copied().collect();
-            for t in ts {
-                self.materialize_param(t)?;
+        // deferred params (`CYO_LAZY_PARAMS`): the CPU evaluator reads
+        // every weight from the host f32 store; ANE only stages
+        // `trainable` params (frozen weights live in compiled `.macho`
+        // blobs + deferred `ConstFill::Blob` reads); Ext (gpu) progs
+        // resolve weights inside their own runtime.
+        match &self.progs[pi].backend {
+            ProgBackend::Cpu(_) => {
+                let ts: Vec<u32> = self.pending_params.keys().copied().collect();
+                for t in ts {
+                    self.materialize_param(t)?;
+                }
             }
+            ProgBackend::Ane(_) => {
+                let ts: Vec<u32> = self.progs[pi]
+                    .trainable
+                    .iter()
+                    .filter_map(|(pn, _, _)| self.gtensor.get(pn).copied())
+                    .filter(|h| self.pending_params.contains_key(h))
+                    .collect();
+                for t in ts {
+                    self.materialize_param(t)?;
+                }
+            }
+            ProgBackend::Ext(_) => {}
         }
         // ---- gather staging data first (borrows of self.tensors end
         // before self.progs is borrowed mutably) ----
@@ -2418,6 +2561,16 @@ impl Vm {
             if prev != pi {
                 if let ProgBackend::Ane(rt) = &mut self.progs[prev].backend {
                     rt.release_all();
+                    // unloadModel is async — aned drains ~1k programs
+                    // and their bound surfaces per layer. Give the queue
+                    // a head start or the next layer's surface creates
+                    // hit the live-surface ceiling mid-materialization.
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        match std::env::var("CYO_ANE_DRAIN_MS") {
+                            Ok(v) => v.parse().unwrap_or(1500),
+                            Err(_) => 1500,
+                        },
+                    ));
                 }
             }
         }
@@ -2797,6 +2950,24 @@ impl Vm {
             }
             "migrate" => {
                 Err("migrate must run in the dispatch loop — it freezes stack state".into())
+            }
+            "ckpt" => {
+                let path = match &args[0] {
+                    Val::S(s) => s.to_string(),
+                    v => {
+                        return Err(format!(
+                            "ckpt path must be str, found {}",
+                            self.kind(v)
+                        ))
+                    }
+                };
+                let n = self.export_safetensors(&path, true)?;
+                if n == 0 {
+                    self.wit("ckpt", &format!("skipped — non-finite params, kept {path}"));
+                } else {
+                    self.wit("ckpt", &format!("{n} tensors → {path}"));
+                }
+                Ok(Val::Unit)
             }
             "rand" => {
                 // xorshift64* — deterministic, seeded by lineage.

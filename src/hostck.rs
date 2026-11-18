@@ -97,6 +97,7 @@ pub const NATIVE_NAMES: &[&str] = &[
     "cortex_ask", // (str prompt) -> str — SLICKS bridge (cap `cortex`, stoch)
     "sha256", // (str) -> str — hex sha-256, det (firing chain, dedupe fingerprints)
     "parse_num", // (str) -> f64 — NaN on non-numeric, det (threshold triggers)
+    "ckpt",     // (str path) -> unit — streaming safetensors param checkpoint
 ];
 
 /// Capability required by a native, if any.
@@ -104,7 +105,7 @@ pub fn native_cap(name: &str) -> Option<&'static str> {
     Some(match name {
         "propose_patch" => "patch",
         "erase" => "erase",
-        "read_file" | "write_file" => "fs",
+        "read_file" | "write_file" | "ckpt" => "fs",
         "cortex_ask" => "cortex",
         _ => return None,
     })
@@ -1247,6 +1248,13 @@ impl Hk {
                     return diag(format!("{name}(s: str) expected"), l, c);
                 }
                 Ok(if name == "sha256" { RTy::Str } else { RTy::F64 })
+            }
+            "ckpt" => {
+                arity(1)?;
+                if args[0].ty != RTy::Str {
+                    return diag("ckpt(path: str)", l, c);
+                }
+                Ok(RTy::Unit)
             }
             "dfa_compile" => {
                 arity(1)?;

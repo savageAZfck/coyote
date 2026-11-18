@@ -5,3 +5,4 @@
 coyote_out/
 mask.safetensors
 coyote_bench/
+.cargo/

@@ -1,5 +1,5 @@
 [package]
-name = "coyote"
+name = "coyote-lang"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -15,6 +15,6 @@ name = "coyote"
 path = "src/main.rs"
 
 [dependencies]
-mil_infer = { git = "https://github.com/savageAZfck/mil_spec" }
+mil_infer = { git = "https://github.com/savageAZfck/mil_spec", version = "0.6" }
 half = "2"
 serde = { version = "1", features = ["derive"] }

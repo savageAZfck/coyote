@@ -24,6 +24,12 @@ fn st_cached(path: &str) -> Result<Rc<SafeTensors>, String> {
     Ok(s)
 }
 
+/// Drop cached safetensors byte buffers once a load/export pass
+/// finishes so multi-GB checkpoints do not stay resident in host RAM.
+pub fn clear_cache() {
+    ST_FILES.with(|c| c.borrow_mut().clear());
+}
+
 /// minimal safetensors index — name → (data range, shape, dtype)
 pub struct SafeTensors {
     buf: Vec<u8>,
