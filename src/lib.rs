@@ -412,6 +412,28 @@ pub fn load_vm(
     vm::Vm::new(host, progs, &src_sha)
 }
 
+/// One-line hint for an ANE program-load failure. coyote emits ANE binaries
+/// for the M4's Neural Engine (h16); other ANE generations reject them at
+/// load with `Program load failure (0x170004)`, which says nothing about why.
+pub fn ane_error_hint(err: &str) -> Option<String> {
+    if !err.contains("Program load failure (0x170004)") {
+        return None;
+    }
+    let chip = std::process::Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "this Mac".to_string());
+    Some(format!(
+        "hint: the Neural Engine on {chip} refused the program binary. coyote's ANE \
+         binaries target the M4 Neural Engine (h16); other ANE generations can't load \
+         them. `--cpu` runs the CPU reference evaluator instead."
+    ))
+}
+
 // ------------------------------------------------ C / Swift FFI (`cdylib`)
 
 thread_local! {

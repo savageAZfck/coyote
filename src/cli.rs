@@ -2,10 +2,12 @@
 //!
 //!   coyote check  <file.cy>          parse + shape-check only
 //!   coyote build  <file.cy> [-o dir] emit .mil + blobs, compile to ANE binaries
-//!   coyote run    <file.cy> [-o dir] [--steps N]
+//!   coyote run    <file.cy> [-o dir] [--steps N] [--cpu]
 //!                                   build + execute on ANE + diff vs CPU;
 //!                                   with trainable params, N steps of the
 //!                                   weight-feedback loop = on-chip training.
+//!                                   --cpu: CPU reference evaluator only, no
+//!                                   ANE compile/load (any Mac).
 
 use crate::emit_program;
 use crate::eval::Evaluator;
@@ -41,6 +43,28 @@ fn rebuild_arg(args: &[String]) -> bool {
 
 fn cpu_arg(args: &[String]) -> bool {
     args.iter().any(|a| a == "--cpu")
+}
+
+/// ANE surface write that is a no-op without a runtime (`run --cpu`), so
+/// the run loop's many input/param/state writes stay unconditional.
+trait ExtWrite {
+    fn write_ext(
+        &mut self,
+        name: &str,
+        f: impl Fn(&mut [u8], &mil_infer::espresso::TensorDesc) + 'static,
+    );
+}
+
+impl ExtWrite for Option<mil_infer::graph::GraphRuntime> {
+    fn write_ext(
+        &mut self,
+        name: &str,
+        f: impl Fn(&mut [u8], &mil_infer::espresso::TensorDesc) + 'static,
+    ) {
+        if let Some(rt) = self {
+            rt.write_ext(name, f);
+        }
+    }
 }
 
 fn wasm_arg(args: &[String]) -> bool {
@@ -94,7 +118,7 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
         eprintln!("coyote — bare-metal language for sovereign computation");
         eprintln!("  coyote check <file.cy>");
         eprintln!("  coyote build <file.cy> [-o dir]");
-        eprintln!("  coyote run   <file.cy> [-o dir] [--steps N]");
+        eprintln!("  coyote run   <file.cy> [-o dir] [--steps N] [--cpu]");
         eprintln!("  coyote repl  [file.cy] [-o dir] [--cpu]");
         return Err(2);
     }
@@ -110,6 +134,9 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
         let use_cpu = cpu_arg(&args[2..]);
         if let Err(e) = crate::repl::run(file.as_deref(), &dir, use_cpu, rebuild) {
             eprintln!("✗ {e}");
+            if let Some(h) = crate::ane_error_hint(&e) {
+                eprintln!("  {h}");
+            }
             return Err(1);
         }
         return Ok(());
@@ -359,18 +386,31 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                 };
                 println!("✓ {verb} → {}", dir.join("net.mil").display());
                 println!("  mil sha256: {}", &out.mil_sha[..16]);
-                let plan = mil_infer::graph::compile_graph(
-                    dir.join("net.mil").to_str().unwrap(),
-                    dir.to_str().unwrap(),
-                )
-                .map_err(|e| format!("compile_graph: {e}"))?;
-                println!("✓ compiled — {} program nodes", plan.nodes.len());
-                if cmd == "build" {
-                    return Ok(());
-                }
-                // ---- run on ANE ----
-                let mut rt = mil_infer::graph::GraphRuntime::load(plan)
-                    .map_err(|e| format!("runtime load: {e}"))?;
+                // `run --cpu`: the reference evaluator alone — no ANE compile
+                // or load, so `run` works on Macs whose ANE can't load these
+                // binaries. `rt` is then `None`: ANE writes are no-ops
+                // (`ExtWrite`) and the evaluator's results stand in for the
+                // silicon readbacks below.
+                let cpu_only = use_cpu && cmd == "run";
+                let mut rt = if cpu_only {
+                    println!("✓ cpu backend — ANE compile skipped (--cpu)");
+                    None
+                } else {
+                    let plan = mil_infer::graph::compile_graph(
+                        dir.join("net.mil").to_str().unwrap(),
+                        dir.to_str().unwrap(),
+                    )
+                    .map_err(|e| format!("compile_graph: {e}"))?;
+                    println!("✓ compiled — {} program nodes", plan.nodes.len());
+                    if cmd == "build" {
+                        return Ok(());
+                    }
+                    // ---- run on ANE ----
+                    Some(
+                        mil_infer::graph::GraphRuntime::load(plan)
+                            .map_err(|e| format!("runtime load: {e}"))?,
+                    )
+                };
                 let mut inputs: HashMap<String, Vec<f32>> = HashMap::new();
                 for (name, ty, _contig) in &out.inputs {
                     let n = ty.numel() as usize;
@@ -562,13 +602,26 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                             });
                         }
                     }
-                    rt.run().map_err(|e| format!("ane run: {e}"))?;
-                    let idx = rt
-                        .out_node(oname)
-                        .ok_or_else(|| format!("output node {oname} not found"))?;
-                    let desc = rt.out_desc(idx);
-                    let raw = rt.output(idx).to_vec();
-                    let ane = read_surface(&raw, &desc, n, 1);
+                    // ---- CPU reference ----
+                    let mut ev = Evaluator::new(&prog);
+                    if training {
+                        ev.set_params(cpu_w.clone());
+                        ev.set_states(cpu_s.clone());
+                    }
+                    let cpu = ev.run(&inputs).map_err(|d| format!("cpu eval: {d}"))?;
+                    // ---- ANE (under --cpu the reference stands in) ----
+                    let ane = match rt.as_mut() {
+                        Some(rt) => {
+                            rt.run().map_err(|e| format!("ane run: {e}"))?;
+                            let idx = rt
+                                .out_node(oname)
+                                .ok_or_else(|| format!("output node {oname} not found"))?;
+                            let desc = rt.out_desc(idx);
+                            let raw = rt.output(idx).to_vec();
+                            read_surface(&raw, &desc, n, 1)
+                        }
+                        None => cpu.clone(),
+                    };
                     if decode {
                         let (tok, logit) = ane
                             .iter()
@@ -579,13 +632,6 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                         println!("  step {step:>3}  tok {tok}  (logit {logit:.3})");
                         next_tok = Some(tok);
                     }
-                    // ---- CPU reference ----
-                    let mut ev = Evaluator::new(&prog);
-                    if training {
-                        ev.set_params(cpu_w.clone());
-                        ev.set_states(cpu_s.clone());
-                    }
-                    let cpu = ev.run(&inputs).map_err(|d| format!("cpu eval: {d}"))?;
                     let maxdiff = ane
                         .iter()
                         .zip(&cpu)
@@ -605,13 +651,7 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                         // read updated weights, feed back
                         let mut wdiff = 0f32;
                         for (pname, mname, cty) in &out.param_outs {
-                            let pidx = rt
-                                .out_node(mname)
-                                .ok_or_else(|| format!("update node {mname} missing"))?;
-                            let pdesc = rt.out_desc(pidx);
-                            let praw = rt.output(pidx).to_vec();
                             let (nn, kk) = (cty.dims[1] as usize, cty.dims[0] as usize);
-                            let mut wnew = read_surface(&praw, &pdesc, nn, kk);
                             // cpu-side update from the same step
                             let mut cupd = ev
                                 .param_updates()
@@ -619,6 +659,22 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                                 .find(|(p, _)| p == pname)
                                 .map(|(_, v)| v.clone())
                                 .unwrap_or_default();
+                            let mut wnew = match rt.as_mut() {
+                                Some(rt) => {
+                                    let pidx = rt
+                                        .out_node(mname)
+                                        .ok_or_else(|| format!("update node {mname} missing"))?;
+                                    let pdesc = rt.out_desc(pidx);
+                                    let praw = rt.output(pidx).to_vec();
+                                    read_surface(&praw, &pdesc, nn, kk)
+                                }
+                                None if cupd.is_empty() => {
+                                    return Err(format!(
+                                        "--cpu: evaluator produced no update for param {pname}"
+                                    ));
+                                }
+                                None => cupd.clone(),
+                            };
                             if let Some(&(_, lr)) = out.adam_lrs.iter().find(|(p, _)| p == pname) {
                                 let g_ane = wnew;
                                 let mut w_cur = ane_w.get(pname).cloned().unwrap_or_default();
@@ -666,19 +722,29 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                         }
                         // state fields — same loop, row-major [T, D]
                         for (port, mname, cty) in &out.state_outs {
-                            let pidx = rt
-                                .out_node(mname)
-                                .ok_or_else(|| format!("state node {mname} missing"))?;
-                            let pdesc = rt.out_desc(pidx);
-                            let praw = rt.output(pidx).to_vec();
                             let (t, d) = (cty.dims[0] as usize, cty.dims[1] as usize);
-                            let snew = read_surface(&praw, &pdesc, t, d);
                             let cupd = ev
                                 .param_updates()
                                 .iter()
                                 .find(|(p, _)| p == port)
                                 .map(|(_, v)| v.clone())
                                 .unwrap_or_default();
+                            let snew = match rt.as_mut() {
+                                Some(rt) => {
+                                    let pidx = rt
+                                        .out_node(mname)
+                                        .ok_or_else(|| format!("state node {mname} missing"))?;
+                                    let pdesc = rt.out_desc(pidx);
+                                    let praw = rt.output(pidx).to_vec();
+                                    read_surface(&praw, &pdesc, t, d)
+                                }
+                                None if cupd.is_empty() => {
+                                    return Err(format!(
+                                        "--cpu: evaluator produced no update for state {port}"
+                                    ));
+                                }
+                                None => cupd.clone(),
+                            };
                             if !cupd.is_empty() {
                                 let d2 = snew
                                     .iter()
@@ -708,7 +774,11 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                             .values()
                             .map(|v| v.iter().map(|x| x.abs()).sum::<f32>())
                             .sum();
-                        if ane_s.is_empty() {
+                        if cpu_only && ane_s.is_empty() {
+                            println!("  step {step:>3}  mse {mse:.6}  (cpu)");
+                        } else if cpu_only {
+                            println!("  step {step:>3}  |kv| {kvnorm:.3}  (cpu)");
+                        } else if ane_s.is_empty() {
                             println!(
                                 "  step {step:>3}  mse {mse:.6}  |ane−cpu| pred {maxdiff:.6}  w {wdiff:.6}"
                             );
@@ -717,6 +787,9 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                                 "  step {step:>3}  |ane−cpu| pred {maxdiff:.6}  kv {wdiff:.6}  |kv| {kvnorm:.3}"
                             );
                         }
+                    } else if cpu_only {
+                        println!("✓ executed on cpu (reference evaluator) — {} outputs", n);
+                        println!("  out[:8]  cpu: {:?}", &cpu[..cpu.len().min(8)]);
                     } else {
                         println!("✓ executed on ANE — {} outputs", n);
                         println!("  out[:8]  ane: {:?}", &ane[..ane.len().min(8)]);
@@ -729,7 +802,9 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
                         }
                     }
                 }
-                if training {
+                if training && cpu_only {
+                    println!("✓ {nsteps} steps on cpu — weights fed back each step");
+                } else if training {
                     println!("✓ {nsteps} steps — weights live on-chip, fed back each step");
                 }
                 Ok(())
@@ -739,6 +814,9 @@ pub fn run(argv: &[String]) -> Result<(), i32> {
     })();
     if let Err(e) = r {
         eprintln!("✗ {e}");
+        if let Some(h) = crate::ane_error_hint(&e) {
+            eprintln!("  {h}");
+        }
         return Err(1);
     }
     Ok(())
