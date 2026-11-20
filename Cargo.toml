@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "bare-metal language for sovereign computation — source to silicon"
+repository = "https://github.com/savageAZfck/coyote"
+homepage = "https://github.com/savageAZfck/coyote"
+documentation = "https://github.com/savageAZfck/coyote"
 
 [lib]
 name = "coyote"
