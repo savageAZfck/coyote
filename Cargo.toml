@@ -16,5 +16,10 @@ path = "src/main.rs"
 
 [dependencies]
 mil_infer = { git = "https://github.com/savageAZfck/mil_spec", version = "0.6" }
+haruspex = { package = "haruspex-macho", version = "0.3" }
 half = "2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+capstone = "0.13"
+rusqlite = { version = "0.37", features = ["bundled"] }

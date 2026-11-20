@@ -468,6 +468,50 @@ impl<'a> Evaluator<'a> {
                         let r = (ms + 1e-5).sqrt().recip();
                         Ok(Val::V(x.iter().zip(&w).map(|(&a, &b)| a * r * b).collect()))
                     }
+                    "decide" => {
+                        // pointer-head verdict: q = hq @ wq,
+                        // s_i = (hos_i @ wk)·q / √P, probs = softmax(s).
+                        let d = args[0].ty.dims[0] as usize;
+                        let k_ = args[1].ty.dims[0] as usize;
+                        let p_ = args[2].ty.dims[1] as usize;
+                        let aval = |i: usize, n2: usize, ev: &mut Self| -> CResult<Vec<f32>> {
+                            match &args[i].e {
+                                TExpr::Ident(s) if ev.lookup(s).is_none() => {
+                                    Ok(ev.param_val(s)?.vec(n2))
+                                }
+                                _ => Ok(ev.expr(&args[i])?.vec(n2)),
+                            }
+                        };
+                        let hq = aval(0, d, self)?;
+                        let hos = aval(1, k_ * d, self)?;
+                        let wq = aval(2, d * p_, self)?;
+                        let wk = aval(3, d * p_, self)?;
+                        // wq/wk declared [D,P] but param storage is
+                        // transposed [P,D]: flat[p*D+d] = logical[d,p].
+                        let mut q = vec![0f32; p_];
+                        for j in 0..p_ {
+                            for i in 0..d {
+                                q[j] += hq[i] * wq[j * d + i];
+                            }
+                        }
+                        let scale = 1.0 / (p_ as f32).sqrt();
+                        let mut s = vec![0f32; k_];
+                        for i in 0..k_ {
+                            let mut acc = 0f32;
+                            for j in 0..p_ {
+                                let mut kv = 0f32;
+                                for m in 0..d {
+                                    kv += hos[i * d + m] * wk[j * d + m];
+                                }
+                                acc += kv * q[j];
+                            }
+                            s[i] = acc * scale;
+                        }
+                        let m = s.iter().cloned().fold(f32::MIN, f32::max);
+                        let ex: Vec<f32> = s.iter().map(|&v| (v - m).exp()).collect();
+                        let sum: f32 = ex.iter().sum();
+                        Ok(Val::V(ex.iter().map(|&v| v / sum).collect()))
+                    }
                     "outer" => {
                         // [T,D] row-major: out[t,d] = a_t · b_d
                         let a = self.expr(&args[0])?.vec(args[0].ty.numel() as usize);
@@ -942,6 +986,100 @@ impl<'a> Evaluator<'a> {
                         }
                         if self.needs_grad(&args[1]) {
                             self.back(&args[1], &adj[k1..])?;
+                        }
+                    }
+                    "decide" => {
+                        // softmax jacobian → pointer-head adjoints:
+                        //   ds_i = p_i(adj_i − Σ adj·p); d_dot = ds·scale
+                        //   dq = Σ d_dot_i·k_i ; dk_i = d_dot_i·q
+                        //   dhq = dq@wq.T ; dwq = hq⊗dq
+                        //   dhos_i = dk_i@wk.T ; dwk = Σ hos_i⊗dk_i
+                        let d = args[0].ty.dims[0] as usize;
+                        let k_ = args[1].ty.dims[0] as usize;
+                        let p_ = args[2].ty.dims[1] as usize;
+                        let pval = |i: usize, n2: usize, ev: &mut Self| -> CResult<Vec<f32>> {
+                            match &args[i].e {
+                                TExpr::Ident(s) if ev.lookup(s).is_none() => {
+                                    Ok(ev.param_val(s)?.vec(n2))
+                                }
+                                _ => Ok(ev.fwd(&args[i])?.vec(n2)),
+                            }
+                        };
+                        let hq = pval(0, d, self)?;
+                        let hos = pval(1, k_ * d, self)?;
+                        let wq = pval(2, d * p_, self)?;
+                        let wk = pval(3, d * p_, self)?;
+                        let pr = self.fwd(e)?.vec(k_);
+                        let dot: f32 = adj.iter().zip(&pr).map(|(a, s)| a * s).sum();
+                        let scale = 1.0 / (p_ as f32).sqrt();
+                        // same storage convention as fwd: w*[j*d+m]
+                        // is logical[d=m, p=j].
+                        let mut q = vec![0f32; p_];
+                        for j in 0..p_ {
+                            for m in 0..d {
+                                q[j] += hq[m] * wq[j * d + m];
+                            }
+                        }
+                        let mut keys = vec![0f32; k_ * p_];
+                        for i in 0..k_ {
+                            for j in 0..p_ {
+                                for m in 0..d {
+                                    keys[i * p_ + j] += hos[i * d + m] * wk[j * d + m];
+                                }
+                            }
+                        }
+                        let mut dq = vec![0f32; p_];
+                        let mut dk = vec![0f32; k_ * p_];
+                        for i in 0..k_ {
+                            let dd = pr[i] * (adj[i] - dot) * scale;
+                            for j in 0..p_ {
+                                dq[j] += dd * keys[i * p_ + j];
+                                dk[i * p_ + j] = dd * q[j];
+                            }
+                        }
+                        if self.needs_grad(&args[0]) {
+                            let mut dhq = vec![0f32; d];
+                            for m in 0..d {
+                                for j in 0..p_ {
+                                    dhq[m] += dq[j] * wq[j * d + m];
+                                }
+                            }
+                            self.back(&args[0], &dhq)?;
+                        }
+                        if self.needs_grad(&args[1]) {
+                            let mut dhos = vec![0f32; k_ * d];
+                            for i in 0..k_ {
+                                for m in 0..d {
+                                    for j in 0..p_ {
+                                        dhos[i * d + m] += dk[i * p_ + j] * wk[j * d + m];
+                                    }
+                                }
+                            }
+                            self.back(&args[1], &dhos)?;
+                        }
+                        if self.needs_grad(&args[2]) {
+                            // param-grad layout follows the [P,D]
+                            // storage of wq: grad[p*D+d] = dq[p]·hq[d].
+                            let mut dwq = vec![0f32; d * p_];
+                            for m in 0..d {
+                                for j in 0..p_ {
+                                    dwq[j * d + m] = hq[m] * dq[j];
+                                }
+                            }
+                            self.back(&args[2], &dwq)?;
+                        }
+                        if self.needs_grad(&args[3]) {
+                            let mut dwk = vec![0f32; d * p_];
+                            for m in 0..d {
+                                for j in 0..p_ {
+                                    let mut acc = 0f32;
+                                    for i in 0..k_ {
+                                        acc += hos[i * d + m] * dk[i * p_ + j];
+                                    }
+                                    dwk[j * d + m] = acc;
+                                }
+                            }
+                            self.back(&args[3], &dwk)?;
                         }
                     }
                     "gather" | "embed" => {

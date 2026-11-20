@@ -97,18 +97,30 @@ pub const NATIVE_NAMES: &[&str] = &[
     "cortex_ask", // (str prompt) -> str — SLICKS bridge (cap `cortex`, stoch)
     "sha256", // (str) -> str — hex sha-256, det (firing chain, dedupe fingerprints)
     "parse_num", // (str) -> f64 — NaN on non-numeric, det (threshold triggers)
-    "ckpt",     // (str path) -> unit — streaming safetensors param checkpoint
+    "ckpt",  // (str path) -> unit — streaming safetensors param checkpoint
+    "inspect", // (str path) -> str — universal format evidence JSON (cap `dissect`)
+    "dissect", // (str path) -> str — haruspex Mach-O/dyld audit JSON (cap `dissect`)
+    "mach_strings", // (str path, i64 min) -> [str] — offset+text strings (cap `dissect`)
+    "hunt",  // (str path, str needle) -> [str] — string→xref→disasm context (cap `dissect`)
+    "dyld_list", // (str grep) -> [str] — shared-cache image paths (cap `dissect`)
+    "dyld_carve", // (str name, str out) -> str — carve cached image to disk (cap `dissect`+`fs`)
+    "bin_diff", // (str old, str new) -> str — evidence diff JSON (cap `dissect`)
+    "disasm_at", // (str path, str addr) -> [str] — linear disasm at vaddr (cap `dissect`)
 ];
 
-/// Capability required by a native, if any.
-pub fn native_cap(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "propose_patch" => "patch",
-        "erase" => "erase",
-        "read_file" | "write_file" | "ckpt" => "fs",
-        "cortex_ask" => "cortex",
-        _ => return None,
-    })
+/// Capabilities required by a native — a native may need more than one
+/// (e.g. `dyld_carve` reads the dyld cache AND writes to disk).
+pub fn native_caps(name: &str) -> &'static [&'static str] {
+    match name {
+        "propose_patch" => &["patch"],
+        "erase" => &["erase"],
+        "read_file" | "write_file" | "ckpt" => &["fs"],
+        "cortex_ask" => &["cortex"],
+        "inspect" | "dissect" | "mach_strings" | "hunt" | "dyld_list" | "bin_diff"
+        | "disasm_at" => &["dissect"],
+        "dyld_carve" => &["dissect", "fs"],
+        _ => &[],
+    }
 }
 
 /// Whether a native is intrinsically stochastic (`stoch`).
@@ -1020,7 +1032,7 @@ impl Hk {
             for a in pos {
                 targs.push(self.expr(a, env, loops)?);
             }
-            if let Some(cap) = native_cap(name) {
+            for cap in native_caps(name) {
                 self.direct_caps[self.cur_fn].push((cap.to_string(), l, c));
             }
             if native_is_stoch(name) && self.direct_stoch[self.cur_fn].is_none() {
@@ -1324,6 +1336,48 @@ impl Hk {
                     return diag("write_file(path: str, content: str) expected", l, c);
                 }
                 Ok(RTy::Unit)
+            }
+            "inspect" | "dissect" => {
+                arity(1)?;
+                if args[0].ty != RTy::Str {
+                    return diag(format!("{name}(path: str) expected"), l, c);
+                }
+                Ok(RTy::Str)
+            }
+            "mach_strings" => {
+                arity(2)?;
+                if args[0].ty != RTy::Str || args[1].ty != RTy::I64 {
+                    return diag("mach_strings(path: str, min: i64) expected", l, c);
+                }
+                Ok(RTy::Vec(Box::new(RTy::Str)))
+            }
+            "hunt" | "disasm_at" => {
+                arity(2)?;
+                if args[0].ty != RTy::Str || args[1].ty != RTy::Str {
+                    return diag(format!("{name}(path: str, arg: str) expected"), l, c);
+                }
+                Ok(RTy::Vec(Box::new(RTy::Str)))
+            }
+            "dyld_list" => {
+                arity(1)?;
+                if args[0].ty != RTy::Str {
+                    return diag("dyld_list(grep: str) expected", l, c);
+                }
+                Ok(RTy::Vec(Box::new(RTy::Str)))
+            }
+            "dyld_carve" => {
+                arity(2)?;
+                if args[0].ty != RTy::Str || args[1].ty != RTy::Str {
+                    return diag("dyld_carve(name: str, out: str) expected", l, c);
+                }
+                Ok(RTy::Str)
+            }
+            "bin_diff" => {
+                arity(2)?;
+                if args[0].ty != RTy::Str || args[1].ty != RTy::Str {
+                    return diag("bin_diff(old: str, new: str) expected", l, c);
+                }
+                Ok(RTy::Str)
             }
             _ => diag(format!("unknown native {name}"), l, c),
         }

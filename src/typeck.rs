@@ -749,6 +749,34 @@ impl Ck {
                 }
                 Ok(args[0].ty.clone())
             }
+            // pointer-head decision: `decide(hq[D], hos[K,D], wq[D,P],
+            // wk[D,P]) -> [K]` — scores each option's hidden state
+            // against the query hidden through the q/k projections,
+            // softmaxes into a verdict distribution.
+            "decide" => {
+                arity(4)?;
+                let (hq, hos, wq, wk) =
+                    (&args[0].ty, &args[1].ty, &args[2].ty, &args[3].ty);
+                if hq.dims.len() != 1
+                    || hos.dims.len() != 2
+                    || wq.dims.len() != 2
+                    || wk.dims.len() != 2
+                    || hos.dims[1] != hq.dims[0]
+                    || wq.dims[0] != hq.dims[0]
+                    || wk.dims[0] != hq.dims[0]
+                    || wq.dims[1] != wk.dims[1]
+                {
+                    return diag(
+                        "decide(hq[D], hos[K,D], wq[D,P], wk[D,P]) expected",
+                        l,
+                        c,
+                    );
+                }
+                Ok(CTy {
+                    dt: args[0].ty.dt,
+                    dims: vec![hos.dims[0]],
+                })
+            }
             // scalar loss — only meaningful as a `grad` target; the scalar
             // itself never materializes on-chip.
             "mse" => {
@@ -775,7 +803,7 @@ impl Ck {
                 Ok(args[0].ty.clone())
             }
             _ => diag(
-                format!("unknown function {name:?} — builtins: relu sigmoid tanh silu gelu softmax rmsnorm concat gather embed mse outer"),
+                format!("unknown function {name:?} — builtins: relu sigmoid tanh silu gelu softmax rmsnorm concat gather embed mse outer decide"),
                 l,
                 c,
             ),

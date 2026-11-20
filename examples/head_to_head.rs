@@ -191,6 +191,7 @@ host fn main() -> i64 {
         trainable: Vec::new(),
         states: Vec::new(),
         param_outs: Vec::new(),
+        adam_lrs: Vec::new(),
         state_outs: Vec::new(),
         output: mlp_out.output.clone(),
     };

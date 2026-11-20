@@ -9,6 +9,8 @@ pub mod backend;
 pub mod cli;
 pub mod eval;
 pub mod hostck;
+pub mod inspect;
+pub mod inspect_fmt;
 pub mod lexer;
 pub mod lower;
 pub mod parser;
@@ -307,7 +309,7 @@ pub fn load_vm(
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(0)
-                > 0;
+                    > 0;
             // plan fields cloned up front so the lazy path can move the
             // whole emit payload into its reload closure — emit runs
             // once per program per `run`, not once per eviction cycle.

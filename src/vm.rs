@@ -868,8 +868,7 @@ impl Vm {
         let mut gtensor = HashMap::new();
         let mut globals = Vec::new();
         let lazy_params = std::env::var_os("CYO_LAZY_PARAMS").is_some();
-        let mut pending_params: HashMap<u32, (String, Vec<usize>, Option<String>)> =
-            HashMap::new();
+        let mut pending_params: HashMap<u32, (String, Vec<usize>, Option<String>)> = HashMap::new();
         for (_name, gv, _) in &h.globals {
             let v = match gv {
                 GVal::Prog { idx } => Val::Ane(*idx),
@@ -893,10 +892,7 @@ impl Vm {
                         // their own runtime and never touch this.
                         tensors.push((ty.clone(), Vec::new()));
                         gtensor.insert(name.clone(), idx);
-                        pending_params.insert(
-                            idx,
-                            (name.clone(), expect, src.clone()),
-                        );
+                        pending_params.insert(idx, (name.clone(), expect, src.clone()));
                         globals.push(Val::T(idx));
                         continue;
                     }
@@ -1003,13 +999,9 @@ impl Vm {
             return Ok(());
         };
         let ty = self.tensors[tidx as usize].0.clone();
-        let mut data = crate::weights::resolve(
-            &name,
-            Some(&expect),
-            src.as_deref(),
-            init_weight_dims,
-        )
-        .map_err(|e| e.to_string())?;
+        let mut data =
+            crate::weights::resolve(&name, Some(&expect), src.as_deref(), init_weight_dims)
+                .map_err(|e| e.to_string())?;
         for v in data.iter_mut() {
             *v = half::f16::from_f32(*v).to_f32();
         }
@@ -1169,21 +1161,20 @@ impl Vm {
                 continue;
             };
             let decl = dims_usize(ty);
-            let data: Vec<f32> = if self.tensors[h as usize].1.is_empty()
-                && self.pending_params.contains_key(&h)
-            {
-                // trained-on-device values were read back per-program
-                // above; a param no runtime claims keeps its init.
-                match dev_params.get(name) {
-                    Some(d) => d.clone(),
-                    None => {
-                        self.materialize_param(h)?;
-                        self.tensors[h as usize].1.clone()
+            let data: Vec<f32> =
+                if self.tensors[h as usize].1.is_empty() && self.pending_params.contains_key(&h) {
+                    // trained-on-device values were read back per-program
+                    // above; a param no runtime claims keeps its init.
+                    match dev_params.get(name) {
+                        Some(d) => d.clone(),
+                        None => {
+                            self.materialize_param(h)?;
+                            self.tensors[h as usize].1.clone()
+                        }
                     }
-                }
-            } else {
-                self.tensors[h as usize].1.clone()
-            };
+                } else {
+                    self.tensors[h as usize].1.clone()
+                };
             let f16 = matches!(ty.dt, DType::F16);
             if ty.dims.len() == 2 {
                 let (k, n) = (decl[0], decl[1]);
@@ -1229,8 +1220,7 @@ impl Vm {
         // params are shared across programs — every train_blk
         // forwards the whole model, so param_outs overlap heavily.
         // first owner wins; values are identical mid-export anyway.
-        let mut seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         // device-authoritative params first, preferring already-resident
         // Ext programs so `ckpt` reads from the active trainer instead
         // of compiling/loading a second program (`forward`) on top of it.
@@ -1254,8 +1244,7 @@ impl Vm {
                     {
                         continue;
                     }
-                    let pd: Vec<usize> =
-                        pty.dims.iter().map(|&x| x as usize).collect();
+                    let pd: Vec<usize> = pty.dims.iter().map(|&x| x as usize).collect();
                     plan.push(ParamExport {
                         name: pn.clone(),
                         dims: export_dims(&pd),
@@ -1278,13 +1267,12 @@ impl Vm {
             };
             let decl = dims_usize(ty);
             let f16 = matches!(ty.dt, DType::F16);
-            let src = if self.tensors[h as usize].1.is_empty()
-                && self.pending_params.contains_key(&h)
-            {
-                PExportSrc::Pending { h }
-            } else {
-                PExportSrc::Host { h }
-            };
+            let src =
+                if self.tensors[h as usize].1.is_empty() && self.pending_params.contains_key(&h) {
+                    PExportSrc::Pending { h }
+                } else {
+                    PExportSrc::Host { h }
+                };
             plan.push(ParamExport {
                 name: name.clone(),
                 dims: export_dims(&decl),
@@ -1302,11 +1290,7 @@ impl Vm {
     /// surface: the snapshot's surf→declared→exported transpose pair
     /// cancels exactly (verified index-for-index), so the surface IS
     /// the exported tensor under reversed dims.
-    pub fn param_export_emit<F>(
-        &mut self,
-        plan: &[ParamExport],
-        mut f: F,
-    ) -> Result<(), String>
+    pub fn param_export_emit<F>(&mut self, plan: &[ParamExport], mut f: F) -> Result<(), String>
     where
         F: FnMut(&str, &[usize], &[f32], bool) -> Result<(), String>,
     {
@@ -1321,8 +1305,7 @@ impl Vm {
                 } => {
                     if *prog as i64 != cur_prog {
                         if cur_prog >= 0 && !cur_was_resident {
-                            if let ProgBackend::Ext(rt) =
-                                &mut self.progs[cur_prog as usize].backend
+                            if let ProgBackend::Ext(rt) = &mut self.progs[cur_prog as usize].backend
                             {
                                 rt.evict();
                             }
@@ -1337,10 +1320,7 @@ impl Vm {
                         continue;
                     };
                     let Some(surf) = rt.read_for_export(mname) else {
-                        return Err(format!(
-                            "param export: {} unreadable",
-                            item.name
-                        ));
+                        return Err(format!("param export: {} unreadable", item.name));
                     };
                     // exported tensor == raw surface under reversed
                     // dims for 2-D (the old double-transpose cancels);
@@ -1356,9 +1336,7 @@ impl Vm {
                     // frozen param straight from its resident buffer so
                     // we never re-open a multi-GB safetensors file mid-run.
                     if cur_prog >= 0 {
-                        if let ProgBackend::Ext(rt) =
-                            &mut self.progs[cur_prog as usize].backend
-                        {
+                        if let ProgBackend::Ext(rt) = &mut self.progs[cur_prog as usize].backend {
                             if let Some(surf) = rt.read_for_export(&item.name) {
                                 f(&item.name, &item.dims, &surf, item.f16)?;
                                 continue;
@@ -1368,9 +1346,7 @@ impl Vm {
                     // Otherwise resolve into a temporary vec that drops
                     // immediately — do NOT call `self.materialize_param(*h)`,
                     // which permanently stores f32 weights in `self.tensors`.
-                    let Some((name, expect, src)) =
-                        self.pending_params.get(h).cloned()
-                    else {
+                    let Some((name, expect, src)) = self.pending_params.get(h).cloned() else {
                         return Err(format!("param export: missing pending slot {h}"));
                     };
                     let mut data = crate::weights::resolve(
@@ -1406,11 +1382,7 @@ impl Vm {
     /// leaves any previous checkpoint untouched — and rotates the
     /// outgoing file to `path.prev` before installing the new one, so
     /// a divergent run can never destroy the last good weights.
-    pub fn export_safetensors(
-        &mut self,
-        path: &str,
-        checkpoint: bool,
-    ) -> Result<usize, String> {
+    pub fn export_safetensors(&mut self, path: &str, checkpoint: bool) -> Result<usize, String> {
         let plan = self.param_export_plan()?;
         let mut hdr = String::from("{");
         let mut off = 0u64;
@@ -1440,9 +1412,8 @@ impl Vm {
         let pad = (8 - (hdr.len() % 8)) % 8;
         hdr.push_str(&" ".repeat(pad));
         let tmp = format!("{path}.tmp");
-        let mut file = std::io::BufWriter::new(
-            std::fs::File::create(&tmp).map_err(|e| e.to_string())?,
-        );
+        let mut file =
+            std::io::BufWriter::new(std::fs::File::create(&tmp).map_err(|e| e.to_string())?);
         use std::io::Write;
         file.write_all(&(hdr.len() as u64).to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -2515,8 +2486,7 @@ impl Vm {
                     // runtime already staged init values at load and
                     // readback keeps the device authoritative; staging
                     // an empty slot would clobber them.
-                    if self.tensors[h as usize].1.is_empty()
-                        && self.pending_params.contains_key(&h)
+                    if self.tensors[h as usize].1.is_empty() && self.pending_params.contains_key(&h)
                     {
                         continue;
                     }
@@ -2773,9 +2743,7 @@ impl Vm {
     /// `staged_ext` entries forces host-mirrored state to restage on
     /// the next dispatch.
     fn evict_gpu_for(&mut self, pi: usize) {
-        if self.gpu_capacity == 0
-            || !matches!(self.progs[pi].backend, ProgBackend::Ext(_))
-        {
+        if self.gpu_capacity == 0 || !matches!(self.progs[pi].backend, ProgBackend::Ext(_)) {
             return;
         }
         self.gpu_lru.retain(|&x| x != pi);
@@ -2795,8 +2763,7 @@ impl Vm {
                 break;
             }
             let cand = self.gpu_lru.iter().copied().find(|&c| {
-                c != pi
-                    && matches!(&self.progs[c].backend, ProgBackend::Ext(rt) if rt.resident())
+                c != pi && matches!(&self.progs[c].backend, ProgBackend::Ext(rt) if rt.resident())
             });
             let mut evicted = false;
             if let Some(c) = cand {
@@ -2954,12 +2921,7 @@ impl Vm {
             "ckpt" => {
                 let path = match &args[0] {
                     Val::S(s) => s.to_string(),
-                    v => {
-                        return Err(format!(
-                            "ckpt path must be str, found {}",
-                            self.kind(v)
-                        ))
-                    }
+                    v => return Err(format!("ckpt path must be str, found {}", self.kind(v))),
                 };
                 let n = self.export_safetensors(&path, true)?;
                 if n == 0 {
@@ -3215,6 +3177,84 @@ impl Vm {
                 let reply = ask_slicks_or_local(&prompt, &self.sha);
                 self.wit("cortex", &format!("q={}B|a={}B", prompt.len(), reply.len()));
                 Ok(Val::S(Rc::from(reply.as_str())))
+            }
+            "inspect" => {
+                let path = self.stringify(&args[0]);
+                let out =
+                    crate::inspect::inspect_path(&path).map_err(|e| format!("inspect: {e}"))?;
+                self.wit(
+                    "inspect",
+                    &format!("{path} sha={}", &out.sha[..16.min(out.sha.len())]),
+                );
+                Ok(Val::S(Rc::from(out.payload.as_str())))
+            }
+            "dissect" => {
+                let path = self.stringify(&args[0]);
+                let out =
+                    crate::inspect::dissect_path(&path).map_err(|e| format!("dissect: {e}"))?;
+                self.wit(
+                    "dissect",
+                    &format!("{path} sha={}", &out.sha[..16.min(out.sha.len())]),
+                );
+                Ok(Val::S(Rc::from(out.payload.as_str())))
+            }
+            "mach_strings" => {
+                let path = self.stringify(&args[0]);
+                let min = args[1].as_i().unwrap_or(5).max(1) as usize;
+                let (sha, lines) = crate::inspect::mach_strings(&path, min)
+                    .map_err(|e| format!("mach_strings: {e}"))?;
+                self.wit(
+                    "mach_strings",
+                    &format!("{path} sha={} n={}", &sha[..16], lines.len()),
+                );
+                Ok(Val::V(Rc::new(RefCell::new(
+                    lines.iter().map(|l| Val::S(Rc::from(l.as_str()))).collect(),
+                ))))
+            }
+            "hunt" => {
+                let path = self.stringify(&args[0]);
+                let needle = self.stringify(&args[1]);
+                let (sha, lines) =
+                    crate::inspect::hunt(&path, &needle).map_err(|e| format!("hunt: {e}"))?;
+                self.wit("hunt", &format!("{path} {needle:?} sha={}", &sha[..16]));
+                Ok(Val::V(Rc::new(RefCell::new(
+                    lines.iter().map(|l| Val::S(Rc::from(l.as_str()))).collect(),
+                ))))
+            }
+            "dyld_list" => {
+                let grep = self.stringify(&args[0]);
+                let imgs =
+                    crate::inspect::dyld_list(&grep).map_err(|e| format!("dyld_list: {e}"))?;
+                self.wit("dyld_list", &format!("grep={grep:?} n={}", imgs.len()));
+                Ok(Val::V(Rc::new(RefCell::new(
+                    imgs.iter().map(|l| Val::S(Rc::from(l.as_str()))).collect(),
+                ))))
+            }
+            "dyld_carve" => {
+                let name = self.stringify(&args[0]);
+                let out = self.stringify(&args[1]);
+                let msg = crate::inspect::dyld_carve(&name, &out)
+                    .map_err(|e| format!("dyld_carve: {e}"))?;
+                self.wit("dyld_carve", &msg);
+                Ok(Val::S(Rc::from(msg.as_str())))
+            }
+            "bin_diff" => {
+                let old = self.stringify(&args[0]);
+                let new = self.stringify(&args[1]);
+                let payload =
+                    crate::inspect::bin_diff(&old, &new).map_err(|e| format!("bin_diff: {e}"))?;
+                self.wit("bin_diff", &format!("{old} -> {new}"));
+                Ok(Val::S(Rc::from(payload.as_str())))
+            }
+            "disasm_at" => {
+                let path = self.stringify(&args[0]);
+                let addr = self.stringify(&args[1]);
+                let lines = crate::inspect::disasm_at(&path, &addr)
+                    .map_err(|e| format!("disasm_at: {e}"))?;
+                self.wit("disasm_at", &format!("{path}@{addr} n={}", lines.len()));
+                Ok(Val::V(Rc::new(RefCell::new(
+                    lines.iter().map(|l| Val::S(Rc::from(l.as_str()))).collect(),
+                ))))
             }
             other => Err(format!("unimplemented native {other}")),
         }

@@ -260,6 +260,24 @@ impl Lo {
         Ok(self.named(v, &ty)?.0)
     }
 
+    /// storage-order `[P, D]` values of a decide weight param — the
+    /// `[N, K]` file layout `weights::resolve` returns for a param
+    /// declared `[D, P]`.
+    fn decide_wstor(&self, name: &str, p: usize, d: usize) -> CResult<Vec<f32>> {
+        let (_, _ty, src) = self.params.get(name).cloned().ok_or(()).map_err(|_| Diag {
+            msg: format!("{name} is not a param"),
+            line: 0,
+            col: 0,
+        })?;
+        crate::weights::resolve(name, Some(&[p, d]), src.as_deref(), init_weight_dims).map_err(
+            |m| Diag {
+                msg: m,
+                line: 0,
+                col: 0,
+            },
+        )
+    }
+
     /// emit (or reuse) a param as a mil const; returns its mil name.
     fn param_ref(&mut self, name: &str, role: &'static str) -> CResult<(String, CTy, bool)> {
         let (qual, ty, src) = self.params.get(name).cloned().ok_or(()).map_err(|_| Diag {
@@ -278,12 +296,13 @@ impl Lo {
         // real weights via `@ "file::tensor"`; deterministic init otherwise
         let is_q4 = ty.dt == DType::Q4;
         let init = |expect: &[usize]| -> CResult<Vec<f32>> {
-            let mut v = crate::weights::resolve(name, Some(expect), src.as_deref(), init_weight_dims)
-                .map_err(|m| Diag {
-                    msg: m,
-                    line: 0,
-                    col: 0,
-                })?;
+            let mut v =
+                crate::weights::resolve(name, Some(expect), src.as_deref(), init_weight_dims)
+                    .map_err(|m| Diag {
+                        msg: m,
+                        line: 0,
+                        col: 0,
+                    })?;
             if is_q4 {
                 v = q4_quantize(&v);
             }
@@ -650,13 +669,17 @@ impl Lo {
                                 col: 0,
                             })?;
                     let expect = if is_trans { vec![k, n] } else { vec![n, k] };
-                    let mut w =
-                        crate::weights::resolve(&pname, Some(&expect), src.as_deref(), init_weight_dims)
-                            .map_err(|e| Diag {
-                                msg: e,
-                                line: 0,
-                                col: 0,
-                            })?;
+                    let mut w = crate::weights::resolve(
+                        &pname,
+                        Some(&expect),
+                        src.as_deref(),
+                        init_weight_dims,
+                    )
+                    .map_err(|e| Diag {
+                        msg: e,
+                        line: 0,
+                        col: 0,
+                    })?;
                     if pty.dt == DType::Q4 {
                         w = q4_quantize(&w);
                     }
@@ -938,6 +961,118 @@ impl Lo {
                 0,
                 0,
             ),
+            // pointer-head verdict on the hwx route table:
+            //   q = hq @ wq            vec@param const matvec (n=P>=32)
+            //   t = q @ wk^T           proj_matmul, wk storage [P,D]
+            //                          transposed to a [D,P] const
+            //   s = t · hos            avw broadcast matvec — hos [K,D]
+            //                          is already the [1,K,1,D] frame
+            //   out = softmax(s/√P)    emit_softmax skeleton: K∈{64,256,1024}
+            "decide" => {
+                let d = args[0].ty.dims[0] as usize;
+                let k_ = args[1].ty.dims[0] as usize;
+                let p_ = args[2].ty.dims[1] as usize;
+                if !matches!(k_, 64 | 256 | 1024) {
+                    return diag(
+                        "decide ANE: K must be 64/256/1024 (emit_softmax skeleton table)",
+                        0,
+                        0,
+                    );
+                }
+                if d < 32 || p_ < 32 {
+                    return diag(
+                        "decide ANE: D and P must be >= 32 (matvec template floor)",
+                        0,
+                        0,
+                    );
+                }
+                // emit_avw lane mask: (r/64 + k/64 + min(r,k)/128) < 32
+                if (k_ / 64 + d / 64 + k_.min(d) / 128).max(1) >= 32 {
+                    return diag("decide ANE: K+D too large for the avw lane mask", 0, 0);
+                }
+                // rank-2 param storage is transposed [D,K]; the packed
+                // reframe needs logical [K,D] row-major — only io or
+                // computed activations carry that layout on-surface.
+                if let TExpr::Ident(s) = &args[1].e {
+                    if self.params.contains_key(s) {
+                        return diag(
+                            "decide ANE: hos must be io/computed, not a param (param storage is transposed)",
+                            0,
+                            0,
+                        );
+                    }
+                }
+                let dt = args[0].ty.dt.clone();
+                let qty = CTy {
+                    dt: dt.clone(),
+                    dims: vec![p_ as i64],
+                };
+                let dty = CTy {
+                    dt: dt.clone(),
+                    dims: vec![d as i64],
+                };
+                let st = CTy {
+                    dt: dt.clone(),
+                    dims: vec![k_ as i64],
+                };
+                let q = self.binop(BinOp::MatMul, &args[0], &args[2], &qty)?;
+                let (qn, qt_) = self.named(q, &qty)?;
+                let wkname = match &args[3].e {
+                    TExpr::Ident(s) => s.clone(),
+                    _ => {
+                        return diag("decide ANE: wk must be a param", 0, 0);
+                    }
+                };
+                let wkstor = self.decide_wstor(&wkname, p_, d)?;
+                let mut wt = vec![0.0f32; d * p_];
+                for j in 0..p_ {
+                    for m in 0..d {
+                        wt[m * p_ + j] = wkstor[j * d + m];
+                    }
+                }
+                let wk_taint = self
+                    .params
+                    .get(&wkname)
+                    .map(|(q, _, _)| *q == Qual::Sealed)
+                    .unwrap_or(false);
+                let tv = self.proj_matmul(&qn, d, p_, &wt, &dty, qt_ || wk_taint);
+                let (tn, tt_) = self.named(tv, &dty)?;
+                // io rank-2 args arrive flat [1,K*D,1,1]; an add4d-framed
+                // `add(hos, 0)` re-wraps them as Packed(K,D) — the flat
+                // row-major bytes are already the packed layout.
+                let hv = self.expr(&args[1])?;
+                let (hn, ht_) = self.named(hv, &args[1].ty)?;
+                let zvals = vec![0.0f32; k_ * d];
+                let zc = self.const_mat(k_, d, &zvals);
+                let hsty = CTy {
+                    dt: dt.clone(),
+                    dims: vec![k_ as i64, d as i64],
+                };
+                let hos4 = self
+                    .emit_shaped(
+                        &format!("[1, {k_}, 1, {d}]"),
+                        format!("add(x = {hn}, y = {zc})"),
+                        &hsty,
+                        ht_,
+                    )
+                    .name()
+                    .0;
+                let tt = tt_ || ht_;
+                let s = self
+                    .emit_op(
+                        &st,
+                        format!("matmul(x = {tn}, y = {hos4}, transpose_y = __bt)"),
+                        tt,
+                    )
+                    .name()
+                    .0;
+                let sc = self.bcast(1.0 / (p_ as f64).sqrt(), k_);
+                let s2 = self
+                    .emit_op(&st, format!("mul(x = {s}, y = {sc})"), tt)
+                    .name()
+                    .0;
+                Ok(self.emit_op(ty, format!("softmax(x = {s2})"), tt))
+            }
             "mse" => diag(
                 "mse produces a host scalar — it only lowers as a `grad` target",
                 0,
@@ -1622,6 +1757,260 @@ impl Lo {
                             let db = self.proj_matmul(adj, k2, n, &p2, &b.ty, false);
                             let dbn = self.named(db, &b.ty)?.0;
                             self.back(b, &dbn)?;
+                        }
+                    }
+                    "decide" => {
+                        // pointer-head adjoint on the hwx route table:
+                        //   dd   = pr·(adj − dotb)/√P     [K] elementwise;
+                        //          dotb = Σ adj·pr via ones-outer + attn_v
+                        //   u    = dd·hos      attn_v(K,D)      [D]
+                        //   dq   = u @ wk      const matvec     [P]
+                        //   dhos = dd ⊗ t      outer_t(K,D)     t = q·wkᵀ
+                        //   dwk  = q ⊗ u       outer_t(P,D)     [P,D] storage
+                        //   dwq  = dq ⊗ hq     outer_t(P,D)     [P,D] storage
+                        //   dhq  = dq @ wqᵀ    proj_matmul      [D]
+                        let d = args[0].ty.dims[0] as usize;
+                        let k_ = args[1].ty.dims[0] as usize;
+                        let p_ = args[2].ty.dims[1] as usize;
+                        if !matches!(k_, 64 | 256 | 1024) {
+                            return diag("decide ANE grad: K must be 64/256/1024", 0, 0);
+                        }
+                        if d < 32 || p_ < 32 {
+                            return diag("decide ANE grad: D and P must be >= 32", 0, 0);
+                        }
+                        if (k_ / 64 + d / 64 + k_.min(d) / 128).max(1) >= 32 {
+                            return diag("decide ANE grad: K+D too large for avw/attn_v", 0, 0);
+                        }
+                        if let TExpr::Ident(s) = &args[1].e {
+                            if self.params.contains_key(s) {
+                                return diag(
+                                    "decide ANE grad: hos must be io/computed, not a param (param storage is transposed)",
+                                    0,
+                                    0,
+                                );
+                            }
+                        }
+                        let dt = args[0].ty.dt.clone();
+                        let mk = |dims: Vec<i64>| CTy {
+                            dt: dt.clone(),
+                            dims,
+                        };
+                        let qty = mk(vec![p_ as i64]);
+                        let dty = mk(vec![d as i64]);
+                        let pty = mk(vec![p_ as i64]);
+                        let kty = mk(vec![k_ as i64, k_ as i64]);
+                        // dd = pr·(adj − Σ adj·pr)/√P over the K lanes.
+                        let (prn, _) = self.fwd_name(e)?;
+                        let prod = self
+                            .emit_op(&adjty, format!("mul(x = {adj}, y = {prn})"), false)
+                            .name()
+                            .0;
+                        let zeros = self
+                            .emit_op(&adjty, format!("sub(x = {prod}, y = {prod})"), false)
+                            .name()
+                            .0;
+                        let onec = self.bcast(1.0, k_);
+                        let ones = self
+                            .emit_op(&adjty, format!("add(x = {zeros}, y = {onec})"), false)
+                            .name()
+                            .0;
+                        // onesKK[i,j] = 1 — outer_t(64,64) skeleton.
+                        let oneskk = self
+                            .emit_shaped(
+                                &format!("[1, {k_}, 1, {k_}]"),
+                                format!("matmul(x = {ones}, y = {ones}, transpose_x = __bt)"),
+                                &kty,
+                                false,
+                            )
+                            .name()
+                            .0;
+                        // dotb[j] = Σ_i prod[i]·1 — attn_v(64,64) skeleton.
+                        let dotb = self
+                            .emit_op(
+                                &adjty,
+                                format!("matmul(x = {prod}, y = {oneskk}, transpose_x = __bt)"),
+                                false,
+                            )
+                            .name()
+                            .0;
+                        let dif = self
+                            .emit_op(&adjty, format!("sub(x = {adj}, y = {dotb})"), false)
+                            .name()
+                            .0;
+                        let dd = self
+                            .emit_op(&adjty, format!("mul(x = {dif}, y = {prn})"), false)
+                            .name()
+                            .0;
+                        let sc = self.bcast(1.0 / (p_ as f64).sqrt(), k_);
+                        let dd = self
+                            .emit_op(&adjty, format!("mul(x = {dd}, y = {sc})"), false)
+                            .name()
+                            .0;
+                        // u[m] = Σ_i dd[i]·hos[i,m] — attn·V route; hos is
+                        // re-framed flat→Packed(K,D) via the add4d trick.
+                        let hv = self.expr(&args[1])?;
+                        let (hn, ht_) = self.named(hv, &args[1].ty)?;
+                        let zvals = vec![0.0f32; k_ * d];
+                        let zc = self.const_mat(k_, d, &zvals);
+                        let hsty = mk(vec![k_ as i64, d as i64]);
+                        let hos4 = self
+                            .emit_shaped(
+                                &format!("[1, {k_}, 1, {d}]"),
+                                format!("add(x = {hn}, y = {zc})"),
+                                &hsty,
+                                ht_,
+                            )
+                            .name()
+                            .0;
+                        let un = self
+                            .emit_op(
+                                &dty,
+                                format!("matmul(x = {dd}, y = {hos4}, transpose_x = __bt)"),
+                                ht_,
+                            )
+                            .name()
+                            .0;
+                        // dq[p] = Σ_m u[m]·wk[m,p] — const vec@param matvec,
+                        // same route as the forward hq@wq.
+                        let wn = self.w_name(&args[3])?;
+                        let dqn = self.fresh();
+                        let _ = writeln!(
+                            self.ops,
+                            "        tensor<fp16, [1, 1, 1, {p_}]> {dqn} = matmul(x = {un}, y = {wn}, transpose_y = __bt)[name = string(\"{dqn}\")];"
+                        );
+                        // t[m] = Σ_p q[p]·wk[m,p] — only feeds dhos.
+                        if self.needs_grad(&args[1], 0) {
+                            let wkname = match &args[3].e {
+                                TExpr::Ident(s) => s.clone(),
+                                _ => {
+                                    return diag("decide ANE grad: wk must be a param", 0, 0);
+                                }
+                            };
+                            let wkstor = self.decide_wstor(&wkname, p_, d)?;
+                            let mut wt = vec![0.0f32; d * p_];
+                            for j in 0..p_ {
+                                for m in 0..d {
+                                    wt[m * p_ + j] = wkstor[j * d + m];
+                                }
+                            }
+                            let q = self.binop(BinOp::MatMul, &args[0], &args[2], &qty)?;
+                            let (qn, _) = self.named(q, &qty)?;
+                            let tv = self.proj_matmul(&qn, d, p_, &wt, &dty, false);
+                            let (tn, _) = self.named(tv, &dty)?;
+                            // dhos[i,m] = dd[i]·t[m] — outer_t(K,D).
+                            let hsty = mk(vec![k_ as i64, d as i64]);
+                            let dhos = self
+                                .emit_shaped(
+                                    &format!("[1, {k_}, 1, {d}]"),
+                                    format!("matmul(x = {dd}, y = {tn}, transpose_x = __bt)"),
+                                    &hsty,
+                                    false,
+                                )
+                                .name()
+                                .0;
+                            self.back(&args[1], &dhos)?;
+                        }
+                        // dwk[p,m] = q[p]·u[m] — outer_t(P,D), storage order.
+                        if self.needs_grad(&args[3], 0) {
+                            let wkname = match &args[3].e {
+                                TExpr::Ident(s) => s.clone(),
+                                _ => String::new(),
+                            };
+                            if !wkname.is_empty() {
+                                let q = self.binop(BinOp::MatMul, &args[0], &args[2], &qty)?;
+                                let (qn, _) = self.named(q, &qty)?;
+                                // matvec outputs spell [1,1,1,P]; outer_t
+                                // reads t from dims 1-2 — reshape aliases
+                                // the cursor to the strided [1,P,1,1] spell.
+                                let qn_s = self
+                                    .emit_shaped(
+                                        &format!("[1, {p_}, 1, 1]"),
+                                        format!("reshape(x = {qn})"),
+                                        &pty,
+                                        false,
+                                    )
+                                    .name()
+                                    .0;
+                                let dwkty = mk(vec![p_ as i64, d as i64]);
+                                let dwk = self
+                                    .emit_shaped(
+                                        &format!("[1, {p_}, 1, {d}]"),
+                                        format!("matmul(x = {qn_s}, y = {un}, transpose_x = __bt)"),
+                                        &dwkty,
+                                        false,
+                                    )
+                                    .name()
+                                    .0;
+                                self.acc(
+                                    &wkname,
+                                    V::Named {
+                                        name: dwk,
+                                        ty: dwkty,
+                                        taint: false,
+                                    },
+                                )?;
+                            }
+                        }
+                        // dwq[p,m] = dq[p]·hq[m] — outer_t(P,D), storage order.
+                        if self.needs_grad(&args[2], 0) {
+                            let wqname = match &args[2].e {
+                                TExpr::Ident(s) => s.clone(),
+                                _ => String::new(),
+                            };
+                            if !wqname.is_empty() {
+                                let (hqn, _) = self.fwd_name(&args[0])?;
+                                // dqn spells [1,1,1,P] — re-spell strided
+                                // for the outer_t x slot (cursor alias).
+                                let dqn_s = self
+                                    .emit_shaped(
+                                        &format!("[1, {p_}, 1, 1]"),
+                                        format!("reshape(x = {dqn})"),
+                                        &pty,
+                                        false,
+                                    )
+                                    .name()
+                                    .0;
+                                let dwqty = mk(vec![p_ as i64, d as i64]);
+                                let dwq = self
+                                    .emit_shaped(
+                                        &format!("[1, {p_}, 1, {d}]"),
+                                        format!(
+                                            "matmul(x = {dqn_s}, y = {hqn}, transpose_x = __bt)"
+                                        ),
+                                        &dwqty,
+                                        false,
+                                    )
+                                    .name()
+                                    .0;
+                                self.acc(
+                                    &wqname,
+                                    V::Named {
+                                        name: dwq,
+                                        ty: dwqty,
+                                        taint: false,
+                                    },
+                                )?;
+                            }
+                        }
+                        // dhq[m] = Σ_p dq[p]·wq[m,p] — proj_matmul on the
+                        // storage-transposed wq const.
+                        if self.needs_grad(&args[0], 0) {
+                            let wqname = match &args[2].e {
+                                TExpr::Ident(s) => s.clone(),
+                                _ => {
+                                    return diag("decide ANE grad: wq must be a param", 0, 0);
+                                }
+                            };
+                            let wqstor = self.decide_wstor(&wqname, p_, d)?;
+                            let mut wt = vec![0.0f32; d * p_];
+                            for j in 0..p_ {
+                                for m in 0..d {
+                                    wt[m * p_ + j] = wqstor[j * d + m];
+                                }
+                            }
+                            let hv = self.proj_matmul(&dqn, d, p_, &wt, &dty, false);
+                            let (hn, _) = self.named(hv, &dty)?;
+                            self.back(&args[0], &hn)?;
                         }
                     }
                     "gather" | "embed" => {
